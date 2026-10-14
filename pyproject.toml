@@ -1,0 +1,49 @@
+[project]
+name = "halley"
+version = "0.0.1"
+description = "Actuarial projection engine in Python: models are checked before they run and compiled when they do."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    # NumPy reference backend: the executable spec every other backend is tested against (D16).
+    "numpy>=2.0",
+    # Parquet / Arrow in and out (D20).
+    "pyarrow>=17",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    # Property-based tests over the model point schema (D24).
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    # Units are typed operator overloads; pyright flags mismatches in the editor before a build.
+    "pyright>=1.1.380",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "C4", "PT", "T20"]
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# --strict-markers: an unregistered marker is an error. -rs: every skip prints its reason.
+addopts = "--strict-markers -rs"
