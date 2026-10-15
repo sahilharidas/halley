@@ -8,6 +8,8 @@ policy and scenario. Every run writes a manifest so any result can be reproduced
 
 Status: prototype, milestone M0 (repository skeleton). Nothing runs a model yet.
 
+Documentation: <https://halley.kndra.co.za>. Install with `pip install halley` (Python 3.12+).
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-version`.
