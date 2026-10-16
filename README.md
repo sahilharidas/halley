@@ -6,9 +6,69 @@ A model is a Python class. Building it traces the formulas into a typed dependen
 units, time references and calculation order, then generates vectorised code that runs over every
 policy and scenario. Every run writes a manifest so any result can be reproduced exactly.
 
-Status: prototype, milestone M0 (repository skeleton). Nothing runs a model yet.
+Status: prototype. The engine core (milestone M2) and the term assurance reference model (M3) are
+in. `TermAssurance` reconciles to the term assurance spec's number script, column for column and
+scalar for scalar, under the spec's tolerance, and every deliberate mistake the spec lists for the
+checker fails the build the way the spec says. The spreadsheet and the reviewer's check of
+reference case 1 (M1) are still pending, so the reconciliation is against the spec's own script,
+not yet against a reviewed spreadsheet.
 
 Documentation: <https://halley.kndra.co.za>. Install with `pip install halley` (Python 3.12+).
+
+## Example
+
+```python
+from halley import RunSettings, build, run
+from halley.products.term_assurance import VALUATION_DATE, TermAssurance
+
+inputs = "docs/spec/term-assurance"
+compiled = build(TermAssurance)  # trace, check, schedule, generate the NumPy backend
+result = run(
+    compiled,
+    model_points=f"{inputs}/model_points.parquet",
+    tables={
+        name: f"{inputs}/{name}.parquet"
+        for name in ("mort_table", "lapse_table", "comm_table", "rates", "expenses")
+    },
+    settings=RunSettings(valuation_date=VALUATION_DATE),
+    run_dir="runs/term-reference",
+)
+result.lane("reserve", "P05")[0]  # 537.9608658387098, the spec's worked example
+```
+
+The run directory holds `manifest.json` (model source hash and git commit, IR hash, the hash and
+version of every input, backend versions, settings), a copy of every input, the generated backend
+source, the outputs keyed on `policy_id` with a versioned schema, and the invariant results.
+`halley.explain` shows any policy's value at any month with its formula and inputs; `halley.diff`
+compares two runs; `halley.load_run` reads a run back without the model.
+
+A model is written like this (an excerpt of `TermAssurance`):
+
+```python
+class TermAssurance(Product):
+    model_point = SCHEMA                      # typed fields, ranges, derived fields, rules
+    assumption_tables = (MORT_TABLE, LAPSE_TABLE, COMM_TABLE, RATES, EXPENSES)
+
+    @var
+    def q_m(self, t: Int) -> Prob[Monthly]:
+        return where(t <= self.mp.rem_m, to_monthly_prob(self.q_ann(t)), 0)
+
+    @var(role="decrement")
+    def deaths(self, t: Int) -> Count:
+        return self.pols_if(t - 1) * self.q_m(t)      # Count x Prob[Monthly] -> Count
+
+    @var(init=lambda mp: mp.pols_if_init, role="in_force")
+    def pols_if(self, t: Int) -> Count:
+        return self.pols_if(t - 1) - self.deaths(t) - self.lapses(t) - self.maturities(t)
+
+    @var(terminal=0, role="reserve")
+    def reserve(self, t: Int) -> Money:               # backward recursion
+        return (self.reserve(t + 1) + self.net_outgo(t + 1)) * self.v(t + 1)
+```
+
+Unit mismatches, data-dependent time offsets, missing boundary values, same-period cycles and
+mixed forward/backward loops are build errors that point at the model's own source line. The
+unit classes carry typed operator overloads, so pyright flags most unit mistakes in the editor.
 
 ## Development
 
@@ -21,18 +81,23 @@ uv run ruff check .
 uv run pyright
 ```
 
+`docs/spec/term_assurance_inputs.py` regenerates the reference Parquet inputs from the spec's
+formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spec prints.
+
 ## Layout
 
 | Path | Role |
 |---|---|
-| `src/halley/authoring` | `Product`, `@var`, `where()`, `Static[...]`, unit types |
+| `src/halley/authoring` | `Product`, `@var`, `where()`, `Static[...]`, unit types, data contracts |
 | `src/halley/tracing` | runs model methods once with symbolic `t` to capture the graph |
-| `src/halley/ir` | typed graph: variables, time offsets, dimensions, source locations |
-| `src/halley/checker` | units, time references, recursion direction, cycles, data contracts |
+| `src/halley/ir` | typed graph: variables, time offsets, dimensions, source locations; the unit rule table |
+| `src/halley/checker` | units, time references and domains, recursion direction, cycles |
 | `src/halley/scheduler` | orders strongly connected components, assigns time direction |
-| `src/halley/codegen` | NumPy reference backend, then Numba |
-| `src/halley/runtime` | data loading, batches, outputs, run manifest |
-| `src/halley/aggregation` | group-level stage; IFRS 17 CSM roll-forward first |
+| `src/halley/codegen` | NumPy reference backend by code generation, then Numba |
+| `src/halley/runtime` | data contracts at load, batches, outputs, run manifest, invariants, explain and diff |
+| `src/halley/aggregation` | group-level stage: portfolio totals now, the IFRS 17 CSM roll-forward next |
+| `src/halley/products` | reference models: `TermAssurance`, reference case 1 |
+| `docs/spec` | product specifications, their number scripts and the reference inputs |
 
 ## Licence
 

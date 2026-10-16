@@ -61,6 +61,8 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "C4", "PT", "T20"]
 # The spec's number generator prints its results as long report lines, and names the batch
 # horizon H as the spec does.
 "docs/spec/term_assurance_numbers.py" = ["T20", "E501", "N803", "N806"]
+# The input writer reports what it wrote.
+"docs/spec/term_assurance_inputs.py" = ["T20"]
 
 [tool.ruff.format]
 line-ending = "lf"
@@ -69,6 +71,7 @@ exclude = ["docs/**/*.md"]
 
 [tool.pyright]
 include = ["src", "tests"]
+extraPaths = ["src", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 
