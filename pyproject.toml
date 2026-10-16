@@ -38,6 +38,16 @@ dev = [
     # Units are typed operator overloads; pyright flags mismatches in the editor before a build.
     "pyright>=1.1.380",
 ]
+# Reference case 2 (D23) reconciles to lifelib's BasicTerm_ME. lifelib (MIT) runs on modelx
+# (GPL-3.0); neither is a dependency of halley or of the test suite, which reads the committed
+# fixtures under tests/data/lifelib. This group regenerates them (tests/data/lifelib/README.md)
+# and lets test_lifelib_basic_term.py check them against a live lifelib run.
+lifelib = [
+    "lifelib>=0.17.2",
+    "modelx>=0.33",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+]
 # The site at halley.kndra.co.za. MyST keeps the specs in Markdown; Furo is the theme.
 docs = [
     "sphinx>=8.1",
@@ -63,6 +73,11 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "C4", "PT", "T20"]
 "docs/spec/term_assurance_numbers.py" = ["T20", "E501", "N803", "N806"]
 # The input writer reports what it wrote.
 "docs/spec/term_assurance_inputs.py" = ["T20"]
+# The in-force group worked example prints its report the same way and names the horizon T,
+# the scenario count J and the IFRS 17 symbols as its document does.
+"docs/spec/in_force_group_numbers.py" = ["T20", "E501", "N803", "N806"]
+# The lifelib fixture generator reports what it wrote and the versions it ran.
+"tests/data/lifelib/make_reference.py" = ["T20"]
 
 [tool.ruff.format]
 line-ending = "lf"
