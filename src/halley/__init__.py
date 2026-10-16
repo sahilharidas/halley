@@ -49,7 +49,7 @@ from halley.errors import BuildError, BuildWarning, HalleyError, LoadError, RunE
 from halley.runtime import RunResult, RunSettings, diff, explain, load_run, run
 from halley.tracing.tracer import trace
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 
 def build(model: type[_Product], **statics: object) -> CompiledModel:
