@@ -1,4 +1,4 @@
-"""The aggregation stage's first use and its v2-shaped input contract."""
+"""The aggregation stage's first use and the input contract shaped for M9 to M12."""
 
 from __future__ import annotations
 

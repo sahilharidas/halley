@@ -2,8 +2,9 @@
 
 First use: the portfolio totals of the term assurance spec (section 11.3). The IFRS 17 CSM
 roll-forward for one group comes with the annuity (M7). The input contract already has the shape
-that v2 needs (Roadmap, doors v1 keeps open): it takes one or more projection runs, keeps the
-scenario dimension, and the one-scenario requirement of the v1 CSM stage is a single check,
+that the in-force groups of M11 and the scenario statistics of M12 need (Roadmap, doors kept open
+for M9 to M12): it takes one or more projection runs, keeps the scenario dimension, and the
+one-scenario requirement of the one-group CSM stage is a single check,
 :func:`require_deterministic`, not a shape assumption.
 """
 
@@ -26,19 +27,20 @@ def sequential_sum(values: NDArray[Any], axis: int) -> NDArray[Any]:
 
 
 def require_deterministic(result: RunResult) -> None:
-    """The v1 CSM stage reads a deterministic run (annuity spec, G6). One place, one check."""
+    """The one-group CSM stage reads a deterministic run (annuity spec, G6); M12 lifts the check.
+    One place, one check."""
     if result.n_scenarios != 1:
         raise RunError(
             f"this aggregation reads a deterministic run (J = 1); the run has J = "
             f"{result.n_scenarios} scenarios. Scenario statistics in the aggregation stage are "
-            "a v2 item"
+            "not built yet (roadmap milestone M12)"
         )
 
 
 @dataclass(frozen=True, slots=True)
 class AggregationInputs:
-    """The projection runs an aggregation reads. A remeasurement (v2) reads a new-basis and an
-    old-basis run of the same policies; the v1 stages read one."""
+    """The projection runs an aggregation reads. The remeasurement of an in-force group (M11)
+    reads a new-basis and an old-basis run of the same policies; the one-group stages read one."""
 
     runs: tuple[RunResult, ...]
 
