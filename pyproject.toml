@@ -81,8 +81,8 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "C4", "PT", "T20"]
 
 [tool.ruff.format]
 line-ending = "lf"
-# The spec's authoring sketch is laid out for reading, not formatted as source.
-exclude = ["docs/**/*.md"]
+# The spec's and README's authoring sketches are laid out for reading, not formatted as source.
+exclude = ["README.md", "docs/**/*.md"]
 
 [tool.pyright]
 include = ["src", "tests"]
