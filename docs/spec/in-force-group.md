@@ -1,4 +1,4 @@
-# Halley in-force group: IFRS 17 subsequent measurement, worked example (v2, M10)
+# Halley in-force group: IFRS 17 subsequent measurement, worked example (M10)
 
 Version 0.1, draft, 2026-10-16. Not yet reviewed.
 

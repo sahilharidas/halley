@@ -6,10 +6,15 @@ A model is a Python class. Building it traces the formulas into a typed dependen
 units, time references and calculation order, then generates vectorised code that runs over every
 policy and scenario. Every run writes a manifest so any result can be reproduced exactly.
 
-**Status:** prototype. The engine core and the term assurance reference model are in: the
-`TermAssurance` model reconciles to the term assurance specification's number script under the
-specification's tolerance, and the build errors the specification lists for the checker fire as it
-says. The spreadsheet and the reviewer's check of reference case 1 are still pending.
+**Status:** prototype. The engine core and both reference models are in. `TermAssurance`
+reconciles to the term assurance specification's number script under the specification's
+tolerance, and the build errors the specification lists for the checker fire as it says.
+`BasicTerm` reconciles to lifelib's `BasicTerm_ME` from lifelib's own inputs: every policy's
+present values, the sampled policies' monthly flows and the portfolio totals agree under the same
+tolerance. The IFRS 17 measurement of an in-force annuity group over a reporting period is part of
+v1, not a later version: its [worked example](spec/in-force-group.md) is specified, and its
+spreadsheet, reviewer's check and engine stage are pending, as are the spreadsheet and the
+reviewer's check of reference case 1.
 
 ## Install
 

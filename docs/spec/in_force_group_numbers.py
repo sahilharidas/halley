@@ -1,4 +1,4 @@
-"""Regenerate the printed numbers of docs/spec/in-force-group.md (Halley v2 worked example, v0.1).
+"""Regenerate the printed numbers of docs/spec/in-force-group.md (roadmap milestone M10, document version 0.1).
 
 Implements the document's formulas exactly as written, in plain float64 scalars with the standard
 library only. It prints every computed number the document quotes: the basis checkpoints of
