@@ -305,6 +305,46 @@ def test_recompute_follows_the_backend_scalar_ness_of_a_lookup_base(tmp_path: Pa
         assert recompute(res, "D0", "root", 0) == value
 
 
+POWER = Table("power", keys=(), columns=(Column("e", "Int"),))
+
+
+class KeylessExponent(Product):
+    """A constant-key lookup raised to a keyless table's Int value: the generated code holds a
+    NumPy scalar base and a 0-d exponent, ``T_rates__f[0] ** T_power__e``."""
+
+    model_point = MID_SCHEMA
+    assumption_tables = (RATES, POWER)
+
+    @var
+    def inv(self) -> Factor:
+        return self.tables.rates.f["a"] ** self.tables.power.e
+
+
+def test_recompute_takes_the_fast_path_for_a_zero_d_exponent(tmp_path: Path) -> None:
+    """A 0-d exponent takes NumPy's fast path against any base, a scalar one included, so a
+    constant-key lookup raised to a keyless Int column holding -1 is stored as the reciprocal,
+    not libm's pow, and the interpreter takes the same path."""
+    discs = _reciprocal_fast_path_values()
+    compiled = build(KeylessExponent)
+    assert "(T_rates__f[0] ** T_power__e)" in compiled.source
+    power = pa.table({"e": pa.array([-1], pa.int64())})
+    for i, d in enumerate(discs):
+        rates = pa.table(
+            {"name": pa.array(["a", "b", "c"]), "f": pa.array([d, 0.5, 0.5], pa.float64())}
+        )
+        res = run(
+            compiled,
+            model_points=_points(discs[:1]),
+            tables={"rates": rates, "power": power},
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / f"inverse-{i}",
+        )
+        value = res.lane("inv", "D0")[0]
+        assert value == 1.0 / d  # the reciprocal fast path
+        assert value != d**-1.0  # not libm's pow
+        assert recompute(res, "D0", "inv", 0) == value
+
+
 def _pow_mismatch_month(den: int = 1000, horizon: int = 12) -> tuple[int, int]:
     """``(k, t)`` with ``t`` in ``1..horizon`` such that ``(t + k) / den`` is a value whose
     ``** 0.5`` differs between sqrt and pow; skips when this libm offers none."""

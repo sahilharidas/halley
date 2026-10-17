@@ -652,8 +652,9 @@ def test_at_requires_an_integer_index(tmp_path: Path) -> None:
 
 
 def test_the_view_is_read_only(tmp_path: Path) -> None:
-    """``a.mp.<field>``, ``a.table`` and ``a.scen`` are views of the loaded inputs; writing into
-    one raises, and the inputs are untouched for the later batches and the run's result."""
+    """``a.mp.<field>``, ``a.table``, ``a.scen`` and ``a.scale`` are views of the loaded inputs
+    (the Money scale here is the premium column itself); writing into one raises, and the inputs
+    are untouched for the later batches and the run's result."""
     refused: list[str] = []
 
     def tamper(a: BatchView) -> Any:
@@ -662,6 +663,7 @@ def test_the_view_is_read_only(tmp_path: Path) -> None:
             "table": a.table("margin", "share"),
             "scen": a.scen("df", 1),
             "scen_range": a.scen_range("df", 0, 2),
+            "scale": a.scale("Money"),
         }
         for name, target in targets.items():
             try:
@@ -672,6 +674,7 @@ def test_the_view_is_read_only(tmp_path: Path) -> None:
 
     class Tampering(Margin):
         scenario_inputs = Indexed.scenario_inputs[:1]
+        tolerance_scales: ClassVar[dict[str, str]] = {"Money": "premium"}
         invariants = (Invariant("x >= 0", tamper, 0.0, kind="ge", tol=0),)
 
         @var
@@ -687,7 +690,7 @@ def test_the_view_is_read_only(tmp_path: Path) -> None:
         settings=RunSettings(valuation_date=VAL, batch_size=1),
         run_dir=tmp_path / "tamper",
     )
-    assert refused == ["mp", "table", "scen", "scen_range"] * 3
+    assert refused == ["mp", "table", "scen", "scen_range", "scale"] * 3
     assert res.invariants[-1].passed
     assert res.inputs is not None
     assert list(res.inputs.model_points.columns["premium"]) == [10.0, 20.0, 30.0]

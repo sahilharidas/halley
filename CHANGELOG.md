@@ -40,3 +40,25 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   must be boolean; an empty window (`months=(5, 2)`) is refused at declaration when its order is
   fixed and at the run otherwise; the first failing invariant is reported before any later one
   is evaluated.
+- The arrays an invariant's batch view takes from the loaded inputs (`a.mp.<field>`,
+  `a.table(...)`, `a.scen(...)`, `a.scen_range(...)` and `a.scale(...)`) are read-only views:
+  writing into one raises instead of changing the inputs of the later batches and of the run's
+  result.
+
+### Notes on determinism
+
+- A power whose exponent is not a literal, such as `x(t) ** self.mp.k`, can differ in the last
+  place between two batch compositions of the same run (`RunSettings.batch_size`) when the
+  exponent's value is 0.5, 2 or -1, because NumPy chooses its sqrt, square or reciprocal fast
+  path from the shapes of the batch. Reruns with the same batching stay bit-identical (D19) and
+  another batching agrees within 1e-12 relative (D5), which is what the annuity specification's
+  "Built-in invariants" promise. `recompute` and `explain` evaluate such a power as libm's pow,
+  so they agree with the stored value within the same tolerance, and bit for bit where the batch
+  took pow. A literal exponent (`x ** 0.5`, the mid-month `pv_month`) takes one path at every
+  batch size; the shipped products raise only to literals and to the month index (`v_m ** t`,
+  `(1 + i) ** (-t)`, the `-12 / t` of `ann_spot`), which took libm's pow at every batch shape
+  measured.
+- `recompute` and `explain` take NumPy's fast path where the generated code does for a 0-d
+  exponent (a keyless table's value) against a scalar base, as in
+  `self.tables.rates.f["a"] ** self.tables.power.e`, so they agree with the stored value bit for
+  bit there.

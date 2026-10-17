@@ -17,7 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
-from halley.codegen.numpy_backend import ARRAY, SCALAR, value_kind
+from halley.codegen.numpy_backend import ARRAY, SCALAR, ZERO_D, value_kind
 from halley.errors import HalleyError, Loc
 from halley.runtime.run import RunResult
 
@@ -150,11 +150,14 @@ class Lane:
 
 
 def _array_power(base: ir.Node, exponent: ir.Node, step: bool) -> bool:
-    """Whether the generated code's ``base ** exponent`` is NumPy's array power, with its fast
-    paths: the base is an array (a 0-d one included) and the exponent a scalar or a 0-d array
-    (:func:`~halley.codegen.numpy_backend.value_kind`). A scalar base is scalar power, an array
-    exponent the plain power loop; both are libm's pow, as Python's ``**`` is."""
-    return value_kind(base, step) != SCALAR and value_kind(exponent, step) != ARRAY
+    """Whether the generated code's ``base ** exponent`` is NumPy's power with a scalar-like
+    exponent, which takes the fast paths: an array base (a 0-d one included) with a scalar or 0-d
+    exponent, or a 0-d exponent against any base, a scalar one included
+    (:func:`~halley.codegen.numpy_backend.value_kind`). A scalar base with a scalar exponent is
+    scalar power, libm's pow as Python's ``**`` is; an array exponent is taken as libm's pow too
+    (:func:`_pow` says when the batch's shapes make NumPy decide otherwise)."""
+    kb, ke = value_kind(base, step), value_kind(exponent, step)
+    return ke != ARRAY and (kb != SCALAR or ke == ZERO_D)
 
 
 def _binary(op: str, a: Any, b: Any) -> Any:
@@ -199,18 +202,27 @@ def _binary(op: str, a: Any, b: Any) -> Any:
 def _pow(a: Any, b: Any, array_power: bool) -> Any:
     """``a ** b`` through the path the generated code takes for this base and exponent.
 
-    NumPy's array power (``ndarray ** k`` with ``k`` a scalar or a 0-d array) takes a fast path
-    for ``** 0.5``, ``** 2`` and ``** -1`` (sqrt, square, reciprocal) that differs from libm's
-    pow in the last place for about one value in a thousand; every other combination, a scalar
-    base (``T_mort__q[0, 3] ** 0.5`` for a constant-key lookup, ``(t / 12) ** 0.5`` inside a
-    recursive component) or an array exponent (``-12 / _t[1:H+1]`` in a whole-mode
-    ``ann_spot``), is libm's pow, as Python's ``**`` is. ``array_power`` says which
-    (:func:`_array_power`); the array form is run on a one-element array so NumPy decides the
-    fast path from the exponent's value exactly as it does for the batch.
+    NumPy's power takes a fast path for ``** 0.5``, ``** 2`` and ``** -1`` (sqrt, square,
+    reciprocal) that differs from libm's pow in the last place for about one value in a
+    thousand. ``array_power`` (:func:`_array_power`) says that the generated code raises with a
+    scalar-like exponent through NumPy: an array base with a scalar or 0-d exponent
+    (``ndarray ** 0.5``, a keyless table's 0-d value as the base included) or a 0-d exponent
+    against any base (``T_rates__f[0] ** T_power__e``); the array form is then run on a
+    one-element array so NumPy decides the fast path from the exponent's value exactly as it
+    does for the batch. Otherwise the power is Python's ``**``, libm's pow: a scalar base with a
+    scalar exponent (``T_mort__q[0, 3] ** 0.5`` for a constant-key lookup, ``(t / 12) ** 0.5``
+    inside a recursive component), and every array exponent.
 
-    Not mirrored: an exponent that is a size-one array with two or more axes (a scalar variable
-    read as an exponent, ``x ** alpha()``) takes the fast path in the generated code when its
-    value is exactly 0.5, 2 or -1, and is treated as an array exponent here.
+    An array exponent is libm's pow in the generated code only when the batch's shapes do not
+    broadcast it into the power loop (:func:`~halley.codegen.numpy_backend.value_kind`). An
+    exponent built from the month column alone (``v_m ** t``, ``-12 / _t[1:H+1]`` in a
+    whole-mode ``ann_spot``) is pow at every shape measured, but a model point field exponent
+    (``x(t) ** self.mp.k``) whose value is 0.5, 2 or -1 takes the fast path in a batch of one
+    policy and not in a batch of three, and a scalar variable read as an exponent
+    (``x ** alpha()``) takes it at almost every shape. Not mirrored: such a result depends on
+    the batch composition in the last place, two batchings agree within 1e-12 relative (D5),
+    and this interpreter agrees with the backend to the same tolerance, bit for bit only with a
+    batch that took pow.
     """
     if array_power:
         with np.errstate(all="ignore"):  # the generated code runs under the same errstate

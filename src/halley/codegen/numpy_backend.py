@@ -213,11 +213,24 @@ def value_kind(node: ir.Node, step: bool) -> str:
     is the month column ``_t[first:last]``.
 
     Nothing in the generator reads this; it is the contract the ``explain`` interpreter mirrors
-    for ``**``. NumPy's array power takes a fast path for the exponents 0.5, 2 and -1 (sqrt,
-    square, reciprocal) that differs from libm's pow in the last place, and takes it whenever
-    the base is an array, a 0-d one included, and the exponent a scalar or a 0-d array; a scalar
-    base goes through scalar power (libm's pow), and an array exponent through the plain power
-    loop (libm's pow element by element). Measured on NumPy 2.5 for every one of those forms.
+    for ``**``. NumPy's power takes a fast path for the exponents 0.5, 2 and -1 (sqrt, square,
+    reciprocal) that differs from libm's pow in the last place. Measured on NumPy 2.5: a scalar
+    exponent takes it when the base is an array, a 0-d one included, while a scalar base with a
+    scalar exponent is scalar power (libm's pow); a 0-d exponent takes it against any base, a
+    scalar one included. An array exponent takes it when its values reach the power loop
+    broadcast, which the batch's shapes decide, not the formula: a model point field
+    (``V_x[1:H+1] ** M_k``, or ``V_x[t] ** m_k`` in a recursive component) takes it in a batch of
+    one policy and not in a batch of three; a scenario value read inside a recursive component
+    takes it for several policies and one scenario; a scalar variable read as an exponent takes
+    it at almost every shape; an exponent built from the month column alone (``v ** _t[0:H+1]``,
+    ``-12 / _t[1:H+1]`` in a whole-mode ``ann_spot``) took it in none of the shapes measured.
+
+    A scalar or 0-d exponent (a literal, ``t`` inside a recursive component, a keyless table's
+    value) is therefore on one path at every batch size. An array exponent whose value is 0.5, 2
+    or -1 may not be: its results are bit-identical between reruns of the same batching (D19)
+    and agree within 1e-12 relative with another batching (D5), which is what the annuity
+    specification's "Built-in invariants" promise. The interpreter takes libm's pow for every
+    array exponent.
     """
     if isinstance(node, (ir.Const, ir.RunConst)):
         return SCALAR

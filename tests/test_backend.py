@@ -36,15 +36,18 @@ from halley import (
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
 from halley.runtime import recompute, within
 from models import (
+    POWER_DEN,
     SIMPLE_SCHEMA,
     VAL,
     Expensed,
     Growth,
     Indexed,
     Margin,
+    Powered,
     closed_form_expensed,
     closed_form_growth,
     margin_table,
+    powered_model_points,
     run_growth,
     scenario_file,
     simple_model_points,
@@ -103,6 +106,51 @@ def test_batches_do_not_change_results(tmp_path: Path) -> None:
     single = run_growth(tmp_path / "single", batch_size=1)
     for name in whole.arrays:
         assert within(single.var(name), whole.var(name), 1.0).all(), name
+
+
+def _power_offset(k: int, lo: int, horizon: int = 12) -> int:
+    """The first offset ``j >= lo`` for which a month value ``(t + j) / POWER_DEN``, t in
+    ``1..horizon``, raised to ``k`` differs in the last place between NumPy's fast path and
+    libm's pow; skips when this libm offers none."""
+    for j in range(lo, lo + 200_000):
+        for t in range(1, horizon + 1):
+            x = (t + j) / POWER_DEN
+            if (np.array([x]) ** float(k)).item() != x ** float(k):
+                return j
+    pytest.skip(f"this libm's pow(x, {k}) equals NumPy's fast path on every probed month value")
+
+
+def test_a_non_literal_exponent_agrees_across_batchings_d5(tmp_path: Path) -> None:
+    """``x(t) ** self.mp.k`` with k = -1 and 2, outside a recursive component and inside one.
+    NumPy decides its fast path for an array exponent from the shapes of the batch (see
+    ``value_kind``), so a batch of one policy and a batch of three may differ in the last place.
+    Each of those policies has a month value on which the fast path and libm's pow differ, so
+    the comparison is not vacuous. The rule is the annuity specification's: reruns of the same
+    batching are bit-identical (D19), another batching agrees within 1e-12 relative (D5)."""
+    ks = [-1, 2, 3]
+    js = [_power_offset(-1, 60_000), _power_offset(2, 70_000), 80_000]
+    compiled = build(Powered)
+    assert "(V_x[1:H+1] ** M_k)" in compiled.source
+    assert "(V_x[t] ** m_k)" in compiled.source
+    runs: dict[tuple[int, int], Any] = {}
+    for batch_size in (1, 3):
+        for rerun in (0, 1):
+            runs[batch_size, rerun] = run(
+                compiled,
+                model_points=powered_model_points(js, ks),
+                settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+                run_dir=tmp_path / f"batch-{batch_size}-{rerun}",
+            )
+    for batch_size in (1, 3):
+        a, b = runs[batch_size, 0], runs[batch_size, 1]
+        assert a.run_id == b.run_id
+        assert a.manifest["outputs"]["monthly_sha256"] == b.manifest["outputs"]["monthly_sha256"]
+        for name in a.arrays:
+            assert np.array_equal(a.arrays[name], b.arrays[name]), (batch_size, name)
+    one, three = runs[1, 0], runs[3, 0]
+    assert set(one.arrays) == {"x", "whole", "acc", "term"}
+    for name in one.arrays:
+        np.testing.assert_allclose(one.var(name), three.var(name), rtol=1e-12, atol=0, err_msg=name)
 
 
 def test_run_directory_holds_inputs_code_outputs_and_manifest(tmp_path: Path) -> None:

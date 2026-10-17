@@ -579,7 +579,10 @@ def test_two_scenarios_share_the_history_and_split_the_path(
 
 def test_the_interpreter_agrees_with_the_generated_code(runs: dict[str, RunResult]) -> None:
     level, cpi = runs["level"], runs["cpi"]
-    for name, t in (("bel", 0), ("q_mth", 7), ("df", 120), ("v_be", 100), ("ra", 0)):
+    # spot_ann(12) raises df(12) to the array exponent -12 / t, exactly -1.0 there: the
+    # interpreter takes libm's pow for an array exponent, as the backend does for this shape
+    months = (("bel", 0), ("q_mth", 7), ("df", 120), ("v_be", 100), ("ra", 0))
+    for name, t in (*months, ("spot_ann", 12), ("fwd_ann", 13)):
         assert recompute(level, 1, name, t) == level.lane(name, 1)[t], name
     assert recompute(cpi, 3, "esc_factor", 13) == cpi.lane("esc_factor", 3)[13]
     assert recompute(cpi, 3, "exp_pp", 13) == cpi.lane("exp_pp", 3)[13]

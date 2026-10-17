@@ -490,3 +490,58 @@ def group_model_points(n: int = 2, rem_m: int = 6) -> Any:
             "rem_m": pa.array([rem_m] * n, pa.int32()),
         }
     )
+
+
+# ------------------------------------------------------------ a non-literal exponent (B0r)
+
+POWER_DEN = 100_000
+"""The denominator of ``Powered.x``: month values ``(t + j) / POWER_DEN``."""
+
+POWER_SCHEMA = Schema(
+    fields=(
+        Field("policy_id", "string", unique=True),
+        int_field("k", ge=-1, le=3),
+        int_field("j", ge=1, le=100 * POWER_DEN),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+)
+
+
+class Powered(Product):
+    """A model point field as an exponent, ``x(t) ** self.mp.k``, outside a recursive component
+    (``whole``, emitted ``V_x[1:H+1] ** M_k``) and inside one (``term``, emitted
+    ``V_x[t] ** m_k``, summed by ``acc``). Whether NumPy takes its reciprocal or square fast
+    path for k = -1 or 2 there depends on the shapes of the batch, not on the formula."""
+
+    model_point = POWER_SCHEMA
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return (t + self.mp.j) / POWER_DEN
+
+    @var
+    def whole(self, t: Int) -> Factor:
+        return self.x(t) ** self.mp.k
+
+    @var(init=0.0)
+    def acc(self, t: Int) -> Factor:
+        return self.acc(t - 1) + self.term(t)
+
+    @var
+    def term(self, t: Int) -> Factor:
+        # a member of acc's component: the power is evaluated month by month
+        return where(self.acc(t - 1) >= 0, self.x(t) ** self.mp.k, 0.0)
+
+
+def powered_model_points(js: list[int], ks: list[int], rem_m: int = 12) -> Any:
+    """``POWER_SCHEMA`` model points ``K0, K1, ...``, one per offset ``j`` and exponent ``k``."""
+    n = len(js)
+    return pa.table(
+        {
+            "policy_id": pa.array([f"K{i}" for i in range(n)], pa.string()),
+            "k": pa.array(ks, pa.int32()),
+            "j": pa.array(js, pa.int32()),
+            "rem_m": pa.array([rem_m] * n, pa.int32()),
+        }
+    )

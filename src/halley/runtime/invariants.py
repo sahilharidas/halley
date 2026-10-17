@@ -310,7 +310,7 @@ class BatchView:
                 f"a.scale({unit!r}): the model declares no tolerance scale for {unit} "
                 "(tolerance_scales)"
             )
-        return np.asarray(s, dtype=np.float64).reshape(1, -1, 1)
+        return _read_only(np.asarray(s, dtype=np.float64).reshape(1, -1, 1))
 
 
 def _as_array(value: Any, dtype: Any) -> NDArray[Any]:
