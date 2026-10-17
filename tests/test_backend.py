@@ -119,7 +119,21 @@ def test_run_directory_holds_inputs_code_outputs_and_manifest(tmp_path: Path) ->
     assert manifest["ir_sha256"] == res.compiled.ir_hash  # type: ignore[union-attr]
     copied = hashlib.sha256((d / "inputs/model_points.parquet").read_bytes()).hexdigest()
     assert manifest["inputs"]["model_points"]["sha256"] == copied
+    assert manifest["inputs"]["model_points"]["path"] is None  # given in memory
+    assert manifest["inputs"]["model_points"]["metadata"] == {}
     assert manifest["dimensions"] == {"policies": 3, "scenarios": 1, "months": 13, "horizon": 12}
+    assert manifest["outputs"]["kind"] == "projection"
+    assert manifest["outputs"]["id_field"] == "policy_id"
+    assert manifest["outputs"]["variables"]["x"] == {
+        "time": True,
+        "unit": "Count",
+        "start": 0,
+        "role": "in_force",
+    }
+    assert manifest["outputs"]["variables"]["cf"]["start"] == 1
+    for name in ("monthly", "scalars"):
+        digest = hashlib.sha256((d / f"outputs/{name}.parquet").read_bytes()).hexdigest()
+        assert manifest["outputs"][f"{name}_sha256"] == digest
     assert "def run_batch(inp, H):" in (d / "generated/numpy_backend.py").read_text()
     back = load_run(d)
     assert back.run_id == res.run_id

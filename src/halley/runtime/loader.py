@@ -2,9 +2,11 @@
 """Loader: read and validate model points, assumption tables and scenario files.
 
 Everything is checked against the contracts the model declares before a batch runs: field types
-and ranges, cross-field rules, derived fields, table key coverage and value ranges, scenario
-coverage of every month the model reads. A failure is a :class:`~halley.errors.LoadError` that
-names the file, the row or policy and the rule. Nothing is adjusted silently.
+and ranges, cross-field rules, derived fields, table key coverage, value ranges, metadata and
+rules, scenario coverage of every month the model reads, value ranges and rules, and the
+product's input rules once everything is loaded. A failure is a
+:class:`~halley.errors.LoadError` that names the file, the row or policy and the rule. Nothing
+is adjusted silently.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,23 +25,55 @@ import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
 from halley import ir
-from halley.authoring.contracts import LoadContext, Schema
+from halley.authoring.contracts import (
+    InputRule,
+    InputView,
+    LoadContext,
+    ScenarioInput,
+    ScenarioView,
+    Schema,
+    Table,
+    TableView,
+    resolve_month,
+)
 from halley.errors import LoadError
 from halley.ir import units
 
 Source = str | Path | Any
 """A Parquet file path or an in-memory ``pyarrow.Table``."""
 
+METADATA_PREFIX = "halley."
+
 
 @dataclass(slots=True)
 class ReadFile:
-    """An input as read: the Arrow table, its bytes' hash and, when given as a file, its path."""
+    """An input as read: the Arrow table, its bytes' hash, its ``halley.*`` schema metadata (and
+    a bare ``version``) as strings without the prefix and, when given as a file, its path."""
 
     table: pa.Table
     sha256: str
     path: Path | None
     raw: bytes | None  # the Parquet bytes of an in-memory table, for the run directory copy
     label: str
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def where(self) -> str:
+        """The label with the file's path, for messages."""
+        return f"{self.label} ({self.path})" if self.path is not None else self.label
+
+
+def _schema_metadata(table: pa.Table) -> dict[str, str]:
+    meta = table.schema.metadata or {}
+    out: dict[str, str] = {}
+    for k, v in meta.items():
+        if k.decode(errors="replace") == "version":
+            out["version"] = v.decode(errors="replace")
+    for k, v in meta.items():
+        key = k.decode(errors="replace")
+        if key.startswith(METADATA_PREFIX):
+            out[key[len(METADATA_PREFIX) :]] = v.decode(errors="replace")
+    return out
 
 
 def read_source(source: Source, label: str) -> ReadFile:
@@ -46,7 +81,9 @@ def read_source(source: Source, label: str) -> ReadFile:
         buf = io.BytesIO()
         pq.write_table(source, buf)
         raw = buf.getvalue()
-        return ReadFile(source, hashlib.sha256(raw).hexdigest(), None, raw, label)
+        return ReadFile(
+            source, hashlib.sha256(raw).hexdigest(), None, raw, label, _schema_metadata(source)
+        )
     path = Path(source)
     if not path.exists():
         raise LoadError(f"{label}: no such file {path}")
@@ -55,7 +92,9 @@ def read_source(source: Source, label: str) -> ReadFile:
         table = pq.read_table(path)
     except (pa.ArrowException, OSError) as exc:
         raise LoadError(f"{label}: {path} is not a Parquet file: {exc}") from exc
-    return ReadFile(table, hashlib.sha256(data).hexdigest(), path, None, label)
+    return ReadFile(
+        table, hashlib.sha256(data).hexdigest(), path, None, label, _schema_metadata(table)
+    )
 
 
 def _ids(values: NDArray[Any], mask: NDArray[np.bool_], limit: int = 5) -> str:
@@ -63,6 +102,22 @@ def _ids(values: NDArray[Any], mask: NDArray[np.bool_], limit: int = 5) -> str:
     shown = ", ".join(bad[:limit])
     more = f" and {len(bad) - limit} more" if len(bad) > limit else ""
     return f"{shown}{more}"
+
+
+def _run_check(check: Callable[[Any], Any], view: Any, what: str) -> NDArray[np.bool_]:
+    """A rule's result as a boolean array; the rule's own exception is a LoadError."""
+    try:
+        result = check(view)
+    except Exception as exc:  # the rule's own failure
+        raise LoadError(f"{what} raised {type(exc).__name__}: {exc}") from exc
+    arr = np.asarray(result)
+    if arr.dtype != np.bool_:
+        raise LoadError(f"{what} must return booleans, not {arr.dtype}")
+    return arr
+
+
+def _doc(doc: str) -> str:
+    return f" ({doc})" if doc else ""
 
 
 # ------------------------------------------------------------------------------ model points
@@ -105,7 +160,9 @@ def _as_numpy(col: pa.ChunkedArray, decl: ir.FieldDecl, label: str) -> NDArray[A
         if pa.types.is_date(t) or pa.types.is_timestamp(t):
             return np.asarray(col.cast(pa.date32()).to_numpy(), dtype="datetime64[D]")
         raise LoadError(f"{label}: date field {decl.name} must be date32, not {t}")
-    if not (pa.types.is_string(t) or pa.types.is_large_string(t)):
+    if pa.types.is_dictionary(t):  # a dictionary-encoded string column reads as its strings
+        col = col.cast(pa.string())
+    elif not (pa.types.is_string(t) or pa.types.is_large_string(t)):
         raise LoadError(f"{label}: field {decl.name} must be a string type, not {t}")
     return np.asarray(col.to_pylist(), dtype=object)
 
@@ -136,8 +193,8 @@ def _check_range(values: NDArray[Any], decl: ir.FieldDecl, ids: NDArray[Any], la
 def load_model_points(
     graph: ir.Graph, schema: Schema, source: Source, valuation_date: dt.date
 ) -> ModelPoints:
-    label = "model points"
-    f = read_source(source, label)
+    f = read_source(source, "model points")
+    label = f.where
     if schema.valuation_date_rule is not None:
         message = schema.valuation_date_rule(valuation_date)
         if message:
@@ -189,8 +246,7 @@ def load_model_points(
             raise LoadError(f"{label}: rule {rule.name} must give one boolean per row")
         if not ok.all():
             raise LoadError(
-                f"{label}: rule {rule.name} fails for policies {_ids(ids, ~ok)}"
-                + (f" ({rule.doc})" if rule.doc else "")
+                f"{label}: rule {rule.name} fails for policies {_ids(ids, ~ok)}{_doc(rule.doc)}"
             )
     order = np.argsort(ids, kind="stable")
     columns = {k: v[order] for k, v in columns.items()}
@@ -215,19 +271,34 @@ class LoadedTable:
     version: str | None
     file: ReadFile
 
-
-def _metadata(table: pa.Table, key: str) -> str | None:
-    meta = table.schema.metadata or {}
-    for k in (f"halley.{key}", key):
-        v = meta.get(k.encode())
-        if v is not None:
-            return v.decode()
-    return None
+    def view(self) -> TableView:
+        return TableView(self.decl.name, self.decl.keys, self.values, self.file.metadata)
 
 
-def load_table(decl: ir.TableDecl, source: Source) -> LoadedTable:
-    label = f"table {decl.name}"
-    f = read_source(source, label)
+def _first_failing_key(view: TableView, ok: NDArray[np.bool_]) -> str:
+    """``at sex = F, age = 120`` for the first False of a rule's result, when the result lines
+    up with the table's dense shape (an axis of length 1 names no key); otherwise its position."""
+    shape = view.shape
+    if ok.ndim == 0:
+        return ""
+    if ok.ndim == len(shape) and all(
+        n in (1, full) for n, full in zip(ok.shape, shape, strict=True)
+    ):
+        idx = np.argwhere(~ok)[0]
+        parts = [
+            f"{name} = {view.key_values(name)[int(i)]}"
+            for name, i, n in zip(view.keys, idx, ok.shape, strict=True)
+            if n > 1
+        ]
+        return f" at {', '.join(parts)}" if parts else ""
+    return f" at element {int(np.flatnonzero(~ok.reshape(-1))[0])} of the rule's result"
+
+
+def load_table(decl: ir.TableDecl, source: Source, contract: Table | None = None) -> LoadedTable:
+    """Read and validate one assumption table against its IR declaration and, when given, the
+    authoring contract's required metadata and rules."""
+    f = read_source(source, f"table {decl.name}")
+    label = f.where
     table = f.table
     n = table.num_rows
     sizes: list[int] = []
@@ -298,7 +369,21 @@ def load_table(decl: ir.TableDecl, source: Source) -> LoadedTable:
         dense = np.zeros(sizes, dtype=dtype) if sizes else np.zeros((), dtype=dtype)
         dense.reshape(-1)[flat] = vals
         values[colspec.name] = dense
-    return LoadedTable(decl, values, _metadata(table, "version"), f)
+    loaded = LoadedTable(decl, values, f.metadata.get("version"), f)
+    if contract is not None:
+        for key in contract.metadata:
+            if key not in f.metadata:
+                raise LoadError(
+                    f"{label}: the file carries no schema metadata {METADATA_PREFIX}{key}"
+                )
+        view = loaded.view()
+        for rule in contract.rules:
+            ok = _run_check(rule.check, view, f"{label}: rule {rule.name}")
+            if not ok.all():
+                raise LoadError(
+                    f"{label}: rule {rule.name} fails{_first_failing_key(view, ok)}{_doc(rule.doc)}"
+                )
+    return loaded
 
 
 # -------------------------------------------------------------------------------- scenarios
@@ -319,6 +404,9 @@ class LoadedScenario:
     @property
     def u_max(self) -> int:
         return self.u0 + int(self.values.shape[0]) - 1
+
+    def view(self) -> ScenarioView:
+        return ScenarioView(self.decl.name, self.values[:, 0, :], self.u0)
 
 
 def scenario_requirements(graph: ir.Graph, horizon: int) -> dict[str, tuple[int, int]]:
@@ -350,18 +438,69 @@ def scenario_requirements(graph: ir.Graph, horizon: int) -> dict[str, tuple[int,
     return req
 
 
-def load_scenario(decl: ir.ScenarioDecl, source: Source, lo: int, hi: int) -> LoadedScenario:
-    label = f"scenario input {decl.name}"
-    f = read_source(source, label)
+def _first_failing_row(view: ScenarioView, ok: NDArray[np.bool_]) -> str:
+    """``for scenario 2, month -3`` for the first False of a rule's result, when its shape is the
+    view's ``(months, scenarios)``, ``(scenarios,)`` or ``(months,)``."""
+    n_months, n_scen = view.values.shape
+    if ok.shape == (n_months, n_scen):
+        i, s = (int(x) for x in np.argwhere(~ok)[0])
+        return f" for scenario {s}, month {view.u0 + i}"
+    if ok.shape == (n_scen,):
+        return f" for scenario {int(np.flatnonzero(~ok)[0])}"
+    if ok.shape == (n_months,):
+        return f" for month {view.u0 + int(np.flatnonzero(~ok)[0])}"
+    return ""
+
+
+def _check_scenario_range(
+    label: str, contract: ScenarioInput, view: ScenarioView, dense: NDArray[np.float64]
+) -> None:
+    checks = (
+        (">", contract.gt, dense > contract.gt if contract.gt is not None else None),
+        (">=", contract.ge, dense >= contract.ge if contract.ge is not None else None),
+        ("<", contract.lt, dense < contract.lt if contract.lt is not None else None),
+        ("<=", contract.le, dense <= contract.le if contract.le is not None else None),
+    )
+    for symbol, bound, ok in checks:
+        if ok is None:
+            continue
+        ok = np.asarray(ok)
+        if not ok.all():
+            i, s = (int(x) for x in np.argwhere(~ok)[0])
+            raise LoadError(
+                f"{label}: values must be {symbol} {bound}; scenario {s}, month {view.u0 + i} "
+                f"has {dense[i, s]}"
+            )
+
+
+def load_scenario(
+    decl: ir.ScenarioDecl, source: Source, lo: int, hi: int, contract: ScenarioInput | None = None
+) -> LoadedScenario:
+    """Read and validate one scenario file, which must cover months ``lo..hi`` for every
+    scenario, against its IR declaration and, when given, the authoring contract's value column
+    name, bounds and rules."""
+    f = read_source(source, f"scenario input {decl.name}")
+    label = f.where
     table = f.table
-    for col in ("scenario", "t", decl.name):
+    value_column = contract.file_column if contract is not None else decl.name
+    month_columns = [c for c in ("t", "u") if c in table.column_names]
+    if len(month_columns) == 2:
+        raise LoadError(f"{label}: the month column is named t or u, not both")
+    if not month_columns:
+        raise LoadError(
+            f"{label}: the month column t (or u) is missing (needs scenario, t, {value_column})"
+        )
+    month_column = month_columns[0]
+    for col in ("scenario", month_column, value_column):
         if col not in table.column_names:
-            raise LoadError(f"{label}: column {col} is missing (needs scenario, t, {decl.name})")
+            raise LoadError(
+                f"{label}: column {col} is missing (needs scenario, {month_column}, {value_column})"
+            )
         if table.column(col).null_count:
             raise LoadError(f"{label}: column {col} has null values")
     s = np.asarray(table.column("scenario").to_numpy(), dtype=np.int64)
-    u = np.asarray(table.column("t").to_numpy(), dtype=np.int64)
-    x = np.asarray(table.column(decl.name).to_numpy(), dtype=np.float64)
+    u = np.asarray(table.column(month_column).to_numpy(), dtype=np.int64)
+    x = np.asarray(table.column(value_column).to_numpy(), dtype=np.float64)
     if len(s) == 0:
         raise LoadError(f"{label}: no rows")
     n_scen = int(s.max()) + 1
@@ -371,7 +510,9 @@ def load_scenario(decl: ir.ScenarioDecl, source: Source, lo: int, hi: int) -> Lo
     nu = u1 - u0 + 1
     flat = (u - u0) * n_scen + s
     if len(np.unique(flat)) != len(flat) or len(flat) != nu * n_scen:
-        raise LoadError(f"{label}: every (scenario, t) in the file's range must appear once")
+        raise LoadError(
+            f"{label}: every (scenario, {month_column}) in the file's range must appear once"
+        )
     if u0 > lo or u1 < hi:
         raise LoadError(
             f"{label}: the model reads months {lo} to {hi} but the file covers {u0} to {u1}"
@@ -380,7 +521,17 @@ def load_scenario(decl: ir.ScenarioDecl, source: Source, lo: int, hi: int) -> Lo
         raise LoadError(f"{label}: non-finite values")
     dense = np.zeros((nu, 1, n_scen), dtype=np.float64)
     dense.reshape(-1)[flat] = x
-    return LoadedScenario(decl, dense, u0, f)
+    loaded = LoadedScenario(decl, dense, u0, f)
+    if contract is not None:
+        view = loaded.view()
+        _check_scenario_range(label, contract, view, view.values)
+        for rule in contract.rules:
+            ok = _run_check(rule.check, view, f"{label}: rule {rule.name}")
+            if not ok.all():
+                raise LoadError(
+                    f"{label}: rule {rule.name} fails{_first_failing_row(view, ok)}{_doc(rule.doc)}"
+                )
+    return loaded
 
 
 # ----------------------------------------------------------------------------------- inputs
@@ -416,6 +567,18 @@ class Inputs:
         for unit, name in graph.scale_fields.items():
             out[unit] = np.asarray(self.model_points.columns[name], dtype=np.float64)
         return out
+
+    def view(self, valuation_date: dt.date) -> InputView:
+        """Every input as the product's input rules see it."""
+        mp = self.model_points
+        return InputView(
+            tables={name: t.view() for name, t in self.tables.items()},
+            model_points=LoadContext(mp.columns, valuation_date),
+            scenarios={name: s.view() for name, s in self.scenarios.items()},
+            valuation_date=valuation_date,
+            valuation_month=self.run["m_val"],
+            horizon=self.H,
+        )
 
     def batch(self, graph: ir.Graph, lo: int, hi: int) -> dict[str, Any]:
         """The arrays the generated code reads for policies ``lo:hi``."""
@@ -456,14 +619,23 @@ def load_inputs(
     scenarios: dict[str, Source] | None,
     valuation_date: dt.date,
     horizon: int | None,
+    table_contracts: Mapping[str, Table] | None = None,
+    scenario_contracts: Mapping[str, ScenarioInput] | None = None,
+    input_rules: Sequence[InputRule] = (),
 ) -> Inputs:
+    """Load every input the model reads, in order: model points, tables, the horizon, scenario
+    files, then the product's input rules over all of them. The contracts, when given, add the
+    tables' required metadata and rules, the scenario inputs' column names, bounds, coverage and
+    rules."""
+    table_contracts = table_contracts or {}
+    scenario_contracts = scenario_contracts or {}
     mp = load_model_points(graph, schema, model_points, valuation_date)
     tables = tables or {}
     loaded_tables: dict[str, LoadedTable] = {}
     for name, decl in graph.tables.items():
         if name not in tables:
             raise LoadError(f"the model reads assumption table {name!r}, which was not given")
-        loaded_tables[name] = load_table(decl, tables[name])
+        loaded_tables[name] = load_table(decl, tables[name], table_contracts.get(name))
     for name in tables:
         if name not in graph.tables:
             raise LoadError(f"table {name!r} was given but the model declares no such table")
@@ -480,7 +652,11 @@ def load_inputs(
         if name not in scenarios:
             raise LoadError(f"the model reads scenario input {name!r}, which was not given")
         lo, hi = req[name]
-        loaded_scen[name] = load_scenario(decl, scenarios[name], lo, hi)
+        contract = scenario_contracts.get(name)
+        if contract is not None and contract.covers is not None:
+            lo = min(lo, resolve_month(contract.covers[0], horizon))
+            hi = max(hi, resolve_month(contract.covers[1], horizon))
+        loaded_scen[name] = load_scenario(decl, scenarios[name], lo, hi, contract)
     for name in scenarios:
         if name not in graph.scenarios:
             raise LoadError(f"scenario input {name!r} was given but the model declares none")
@@ -488,6 +664,14 @@ def load_inputs(
     if len(counts) > 1:
         raise LoadError(f"scenario inputs disagree on the number of scenarios: {sorted(counts)}")
     n_scenarios = counts.pop() if counts else 1
-    return Inputs(
+    inputs = Inputs(
         mp, loaded_tables, loaded_scen, n_scenarios, horizon, run_constants(valuation_date, horizon)
     )
+    if input_rules:
+        view = inputs.view(valuation_date)
+        for rule in input_rules:
+            ok = _run_check(rule.check, view, f"input rule {rule.name}")
+            if not ok.all():
+                count = f" for {int((~ok).sum())} of {ok.size} values" if ok.ndim else ""
+                raise LoadError(f"input rule {rule.name} fails{count}{_doc(rule.doc)}")
+    return inputs

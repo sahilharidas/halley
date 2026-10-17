@@ -3,13 +3,17 @@
 
 A run directory holds everything needed to reproduce the run and to read it back later without
 the model: ``manifest.json``, a copy of every input under ``inputs/``, the generated backend
-source under ``generated/``, the outputs under ``outputs/`` keyed on ``policy_id`` with a
+source under ``generated/``, the outputs under ``outputs/`` keyed on the schema's id field with a
 versioned schema, and the invariant results. The manifest records the model source hash and git
-commit, the IR hash, every input's hash, the backend and its versions, and the settings.
+commit, the IR hash, every input's hash and ``halley.*`` metadata, the backend and its versions,
+the settings, and per stored variable its unit, domain start and role. The run id is a hash of
+the IR, the inputs' hashes (not their paths, so the same bytes anywhere give the same id), the
+settings and the backend.
 """
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import importlib.metadata
@@ -31,7 +35,13 @@ from halley import ir
 from halley.codegen import CompiledModel
 from halley.codegen.numpy_backend import run_batch
 from halley.errors import LoadError
-from halley.runtime.invariants import InvariantResult, check_builtin
+from halley.runtime.invariants import (
+    BatchView,
+    InvariantResult,
+    check_builtin,
+    check_declared,
+    merge_results,
+)
 from halley.runtime.loader import Inputs, ReadFile, Source, load_inputs
 
 OUTPUT_SCHEMA_VERSION = 1
@@ -81,6 +91,7 @@ class RunResult:
     compiled: CompiledModel | None = None
     inputs: Inputs | None = None
     invariants: list[InvariantResult] = field(default_factory=list)
+    """The built-in invariants then the product's, each merged over every batch."""
 
     @property
     def n_policies(self) -> int:
@@ -148,6 +159,31 @@ def _copy_input(f: ReadFile, dest: Path) -> None:
         dest.write_bytes(f.raw)
 
 
+def _input_entry(f: ReadFile, copy_to: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "path": str(f.path) if f.path is not None else None,
+        "copy": copy_to,
+        "sha256": f.sha256,
+        "metadata": dict(f.metadata),
+        **extra,
+    }
+
+
+def _without_paths(inputs: dict[str, Any]) -> dict[str, Any]:
+    """The manifest's inputs block without the original ``path`` strings: a run is addressed by
+    what it read, not where the files were."""
+    block = copy.deepcopy(inputs)
+
+    def strip(node: Any) -> None:
+        if isinstance(node, dict):
+            node.pop("path", None)
+            for v in node.values():
+                strip(v)
+
+    strip(block)
+    return block
+
+
 def run(
     compiled: CompiledModel,
     *,
@@ -157,9 +193,10 @@ def run(
     settings: RunSettings,
     run_dir: str | Path,
 ) -> RunResult:
-    """Load and validate the inputs, project every policy in batches, check the built-in
-    invariants, and write the run directory."""
+    """Load and validate the inputs, project every policy in batches, check the built-in and
+    the product's invariants on every batch, and write the run directory."""
     graph = compiled.graph
+    model = compiled.model
     run_path = Path(run_dir)
     if (run_path / "manifest.json").exists():
         raise LoadError(f"{run_path} already holds a run; use a new directory for each run")
@@ -171,6 +208,9 @@ def run(
         scenarios=scenarios,
         valuation_date=settings.valuation_date,
         horizon=settings.horizon,
+        table_contracts={t.name: t for t in model.assumption_tables},
+        scenario_contracts={s.name: s for s in model.scenario_inputs},
+        input_rules=model.input_rules,
     )
     horizon = inputs.H
     n_pol = len(inputs.ids)
@@ -178,16 +218,20 @@ def run(
     scales = inputs.scales(graph)
     needed = sorted(compiled.schedule.needed)
     parts: dict[str, list[NDArray[Any]]] = {name: [] for name in needed}
-    invariants: list[InvariantResult] = []
+    batches: list[list[InvariantResult]] = []
     bs = max(1, settings.batch_size)
     for lo in range(0, n_pol, bs):
         hi = min(lo + bs, n_pol)
         inp = inputs.batch(graph, lo, hi)
         out = run_batch(compiled.fn, graph, inp, horizon)
         batch_scales = {u: s[lo:hi] for u, s in scales.items()}
-        invariants = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales)
+        results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales)
+        view = BatchView(graph, out, inputs, lo, hi, batch_scales)
+        results.extend(check_declared(model.invariants, view))
+        batches.append(results)
         for name in needed:
             parts[name].append(out[name])
+    invariants = merge_results(batches)
     arrays: dict[str, NDArray[Any]] = {}
     for name in needed:
         v = graph.variables[name]
@@ -214,6 +258,7 @@ def run(
         _copy_input(s.file, run_path / "inputs" / "scenarios" / f"{name}.parquet")
 
     source_path = Path(graph.source_file)
+    id_field = compiled.schema.id_field
     manifest: dict[str, Any] = {
         "halley": _halley_version(),
         "output_schema": OUTPUT_SCHEMA_VERSION,
@@ -240,44 +285,43 @@ def run(
             "horizon": horizon,
         },
         "inputs": {
-            "model_points": {
-                "path": (
-                    str(inputs.model_points.file.path) if inputs.model_points.file.path else None
-                ),
-                "copy": "inputs/model_points.parquet",
-                "sha256": inputs.model_points.file.sha256,
-                "rows": n_pol,
-            },
+            "model_points": _input_entry(
+                inputs.model_points.file, "inputs/model_points.parquet", rows=n_pol
+            ),
             "tables": {
-                name: {
-                    "path": str(t.file.path) if t.file.path else None,
-                    "copy": f"inputs/tables/{name}.parquet",
-                    "sha256": t.file.sha256,
-                    "version": t.version,
-                }
+                name: _input_entry(t.file, f"inputs/tables/{name}.parquet", version=t.version)
                 for name, t in inputs.tables.items()
             },
             "scenarios": {
-                name: {
-                    "path": str(s.file.path) if s.file.path else None,
-                    "copy": f"inputs/scenarios/{name}.parquet",
-                    "sha256": s.file.sha256,
-                    "scenarios": s.n_scenarios,
-                    "months": [s.u0, s.u_max],
-                }
+                name: _input_entry(
+                    s.file,
+                    f"inputs/scenarios/{name}.parquet",
+                    scenarios=s.n_scenarios,
+                    months=[s.u0, s.u_max],
+                )
                 for name, s in inputs.scenarios.items()
             },
         },
         "outputs": {
+            "kind": "projection",
+            "id_field": id_field,
             "monthly": "outputs/monthly.parquet",
             "scalars": "outputs/scalars.parquet",
-            "variables": {name: {"time": has_time[name]} for name in stored},
+            "variables": {
+                name: {
+                    "time": has_time[name],
+                    "unit": graph.variables[name].declared_unit.name,
+                    "start": graph.variables[name].start,
+                    "role": graph.variables[name].role,
+                }
+                for name in stored
+            },
         },
         "invariants": "invariants.json",
     }
     identity = {
         "ir_sha256": manifest["ir_sha256"],
-        "inputs": manifest["inputs"],
+        "inputs": _without_paths(manifest["inputs"]),
         "settings": {k: v for k, v in settings.as_dict().items() if k != "label"},
         "backend": {"name": compiled.backend, "numpy": np.__version__},
         "horizon": horizon,
@@ -287,7 +331,11 @@ def run(
     manifest["run_id"] = run_id
     manifest["created_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
-    _write_outputs(run_path, manifest, inputs.ids, arrays, has_time, stored, horizon, n_scen)
+    _write_outputs(
+        run_path, manifest, id_field, inputs.ids, arrays, has_time, stored, horizon, n_scen
+    )
+    manifest["outputs"]["monthly_sha256"] = _sha256_file(run_path / "outputs" / "monthly.parquet")
+    manifest["outputs"]["scalars_sha256"] = _sha256_file(run_path / "outputs" / "scalars.parquet")
     (run_path / "invariants.json").write_text(
         json.dumps([r.as_dict() for r in invariants], indent=2), encoding="utf-8"
     )
@@ -313,6 +361,7 @@ def run(
 def _write_outputs(
     run_path: Path,
     manifest: dict[str, Any],
+    id_field: str,
     ids: NDArray[Any],
     arrays: dict[str, NDArray[Any]],
     has_time: dict[str, bool],
@@ -331,12 +380,12 @@ def _write_outputs(
         b"halley.ir_sha256": str(manifest["ir_sha256"]).encode(),
     }
     monthly: dict[str, Any] = {
-        "policy_id": np.repeat(ids, n_months * n_scen),
+        id_field: np.repeat(ids, n_months * n_scen),
         "scenario": np.tile(np.arange(n_scen, dtype=np.int32), n_pol * n_months),
         "t": np.tile(np.repeat(np.arange(n_months, dtype=np.int32), n_scen), n_pol),
     }
     scalars: dict[str, Any] = {
-        "policy_id": np.repeat(ids, n_scen),
+        id_field: np.repeat(ids, n_scen),
         "scenario": np.tile(np.arange(n_scen, dtype=np.int32), n_pol),
     }
     for name in stored:
@@ -366,12 +415,14 @@ def load_run(run_dir: str | Path) -> RunResult:
     n_pol, n_scen = int(dims["policies"]), int(dims["scenarios"])
     horizon = int(dims["horizon"])
     n_months = horizon + 1
-    monthly = pq.read_table(run_path / manifest["outputs"]["monthly"])
-    scalars = pq.read_table(run_path / manifest["outputs"]["scalars"])
-    ids = np.asarray(scalars.column("policy_id").to_numpy(zero_copy_only=False))[::n_scen]
+    outputs = manifest["outputs"]
+    id_field = outputs.get("id_field", "policy_id")
+    monthly = pq.read_table(run_path / outputs["monthly"])
+    scalars = pq.read_table(run_path / outputs["scalars"])
+    ids = np.asarray(scalars.column(id_field).to_numpy(zero_copy_only=False))[::n_scen]
     arrays: dict[str, NDArray[Any]] = {}
     has_time: dict[str, bool] = {}
-    for name, info in manifest["outputs"]["variables"].items():
+    for name, info in outputs["variables"].items():
         if info["time"]:
             col = np.asarray(monthly.column(name).to_numpy(zero_copy_only=False))
             arrays[name] = np.ascontiguousarray(

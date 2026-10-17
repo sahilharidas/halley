@@ -15,7 +15,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar, cast, overload
 
 from halley import ir
-from halley.authoring.contracts import ScenarioInput, Schema, Table
+from halley.authoring.contracts import InputRule, Invariant, ScenarioInput, Schema, Table
 from halley.authoring.units import Int, unit_from_annotation
 from halley.errors import BuildError, Loc
 from halley.ir.units import Unit
@@ -366,8 +366,12 @@ class Product:
     * ``model_point``: the :class:`~halley.authoring.contracts.Schema` of its model points;
     * ``assumption_tables``: the :class:`~halley.authoring.contracts.Table` contracts it reads;
     * ``scenario_inputs``: the :class:`~halley.authoring.contracts.ScenarioInput` contracts;
+    * ``input_rules``: the :class:`~halley.authoring.contracts.InputRule` checks across inputs,
+      evaluated once every input is loaded;
     * ``outputs``: the variables a run stores (``None`` stores them all);
     * ``tolerance_scales``: per unit, the model point field that scales invariant tolerances;
+    * ``invariants``: the :class:`~halley.authoring.contracts.Invariant` checks run on every
+      batch after the built-in ones, in declaration order;
     * ``abstract``: ``True`` on a class that only exists to be subclassed; ``build()`` refuses
       it. The flag is not inherited: a class is abstract only when it sets it itself.
     """
@@ -375,8 +379,10 @@ class Product:
     model_point: ClassVar[Schema | None] = None
     assumption_tables: ClassVar[tuple[Table, ...]] = ()
     scenario_inputs: ClassVar[tuple[ScenarioInput, ...]] = ()
+    input_rules: ClassVar[tuple[InputRule, ...]] = ()
     outputs: ClassVar[tuple[str, ...] | None] = None
     tolerance_scales: ClassVar[dict[str, str]] = {}
+    invariants: ClassVar[tuple[Invariant, ...]] = ()
     abstract: ClassVar[bool] = False
 
     mp: ModelPoint

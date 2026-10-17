@@ -6,27 +6,34 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 
 import numpy as np
 import pyarrow as pa
 
 from halley import (
+    Annual,
     Column,
     Count,
     Factor,
     Field,
+    InputRule,
     Int,
+    Key,
     Money,
     MoneyPerPolicy,
     Monthly,
+    Prob,
     Product,
     Rate,
     RunResult,
     RunSettings,
     ScenarioInput,
+    ScenarioRule,
     Schema,
     Table,
+    TableRule,
     at,
     build,
     pv_month,
@@ -215,8 +222,15 @@ def margin_table(share: float = 0.5) -> Any:
 
 
 def scenario_file(
-    name: str, u_lo: int, u_hi: int, n_scen: int, fn: Callable[[int, int], float]
+    name: str,
+    u_lo: int,
+    u_hi: int,
+    n_scen: int,
+    fn: Callable[[int, int], float],
+    month_column: str = "t",
 ) -> Any:
+    """A long-format scenario file: ``scenario``, the month column (``t`` or ``u``) and the
+    value column ``name``, covering months ``u_lo..u_hi`` for every scenario."""
     rows_s: list[int] = []
     rows_u: list[int] = []
     rows_x: list[float] = []
@@ -228,7 +242,7 @@ def scenario_file(
     return pa.table(
         {
             "scenario": pa.array(rows_s, pa.int32()),
-            "t": pa.array(rows_u, pa.int32()),
+            month_column: pa.array(rows_u, pa.int32()),
             name: pa.array(rows_x, pa.float64()),
         }
     )
@@ -274,3 +288,201 @@ def closed_form_expensed(x0: float, premium: float, horizon: int) -> dict[str, n
         if t >= 1:
             inv_exp[t] = ie * bel[t]
     return {"x": x, "cf": cf, "bel": bel, "inv_exp": inv_exp}
+
+
+# ------------------------------------------------------------------- input contracts (A3)
+
+MORT_RULED = Table(
+    "mort",
+    keys=(Key("sex", enum=("M", "F")), Key("age", lo=20, hi=25)),
+    columns=(Column("q", "Prob[Annual]"),),
+    doc="A mortality table that must close at its last age",
+    metadata=("base_year",),
+    rules=(
+        TableRule("q(., 25) = 1", lambda v: v.at("q", age=25) == 1.0, "the table closes at 25"),
+    ),
+)
+PARAMS = Table(
+    "params",
+    keys=(),
+    columns=(Column("alpha", "Factor", ge=0.5, le=1), Column("z_alpha", "Factor")),
+    rules=(
+        TableRule(
+            "z_alpha = inv_cdf(alpha)",
+            lambda v: abs(float(v.z_alpha) - NormalDist().inv_cdf(float(v.alpha))) <= 1e-12,
+        ),
+    ),
+)
+DF_INPUT = ScenarioInput(
+    "df",
+    "Factor",
+    gt=0,
+    le=2,
+    column="rf_df",
+    covers=(0, "H"),
+    rules=(
+        ScenarioRule("df(s, 0) = 1", lambda v: v.at(0) == 1.0, "a discount factor starts at 1"),
+    ),
+)
+CPI_INPUT = ScenarioInput(
+    "cpi",
+    "Index",
+    gt=0,
+    covers=(-14, "H"),
+    rules=(
+        ScenarioRule(
+            "history identical across scenarios",
+            lambda v: np.where(v.months[:, None] <= 0, v.values == v.values[:, :1], True),
+        ),
+    ),
+)
+
+
+class Ruled(Product):
+    """Tables with required metadata and rules (one keyed, one keyless), scenario inputs with a
+    renamed value column, bounds, coverage beyond the months read and rules, and input rules
+    across all of them."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (MORT_RULED, PARAMS)
+    scenario_inputs = (DF_INPUT, CPI_INPUT)
+    input_rules = (
+        InputRule(
+            "base_year is the valuation year",
+            lambda v: int(v.tables["mort"].metadata["base_year"]) == v.valuation_date.year,
+        ),
+        InputRule(
+            "q * alpha <= 1 on the grid",
+            lambda v: v.tables["mort"].q * v.tables["params"].alpha <= 1,
+        ),
+        InputRule(
+            "the cpi file reaches the horizon",
+            lambda v: v.scenarios["cpi"].u_max >= v.horizon,
+        ),
+        InputRule(
+            "every k is at most the horizon",
+            lambda v: v.model_points.k <= v.horizon,
+            "a fixed month read at k",
+        ),
+        InputRule(
+            "the valuation month is the run constant",
+            lambda v: v.valuation_month == 12 * v.valuation_date.year + v.valuation_date.month - 1,
+        ),
+    )
+
+    @var
+    def q(self, t: Int) -> Prob[Annual]:
+        return self.tables.mort["M", where(t < 5, 20 + t, 25)]
+
+    @var
+    def alpha(self) -> Factor:
+        return self.tables.params.alpha
+
+    @var(domain="state")
+    def df(self, t: Int) -> Factor:
+        return self.scen.df(t)
+
+    @var
+    def esc(self, t: Int) -> Factor:
+        return self.scen.cpi(t - 3) / self.scen.cpi(t - 15)
+
+    @var
+    def x(self, t: Int) -> Money:
+        return self.mp.premium * self.mp.pols_if_init * self.df(t) * self.esc(t) * self.alpha()
+
+
+def ruled_tables(
+    base_year: str | None = "2027", q_last: float = 1.0, z_alpha: float | None = None
+) -> dict[str, Any]:
+    """The tables ``Ruled`` reads, with ``halley.*`` metadata on the mortality table and a bare
+    ``version`` on the parameter table."""
+    rows = [
+        {"sex": s, "age": a, "q": q_last if a == 25 else 0.01 * (a - 19)}
+        for s in ("M", "F")
+        for a in range(20, 26)
+    ]
+    meta = {b"halley.version": b"ruled-0.1"}
+    if base_year is not None:
+        meta[b"halley.base_year"] = base_year.encode()
+    mort = pa.Table.from_pylist(rows).replace_schema_metadata(meta)
+    z = NormalDist().inv_cdf(0.75) if z_alpha is None else z_alpha
+    params = pa.table(
+        {"alpha": pa.array([0.75], pa.float64()), "z_alpha": pa.array([z], pa.float64())}
+    ).replace_schema_metadata({b"version": b"params-7"})
+    return {"mort": mort, "params": params}
+
+
+def ruled_scenarios(
+    horizon: int = 12,
+    n_scen: int = 2,
+    df0: float = 1.0,
+    cpi_lo: int = -14,
+    cpi_hi: int | None = None,
+    history_shift: float = 0.0,
+) -> dict[str, Any]:
+    """The scenario files ``Ruled`` reads: the discount file with a ``t`` month column and the
+    value column ``rf_df``, the CPI file with a ``u`` month column."""
+    df = scenario_file(
+        "rf_df", 0, horizon, n_scen, lambda s, u: df0 if u == 0 else (0.99 - 0.01 * s) ** u
+    )
+
+    def cpi_at(s: int, u: int) -> float:
+        if u > 0:
+            return 100.0 * (1.002 + 0.001 * s) ** u
+        return 100.0 * 1.002**u + history_shift * s
+
+    cpi = scenario_file(
+        "cpi", cpi_lo, horizon if cpi_hi is None else cpi_hi, n_scen, cpi_at, month_column="u"
+    )
+    return {"df": df, "cpi": cpi}
+
+
+def run_ruled(
+    tmp_path: Path,
+    tables: dict[str, Any] | None = None,
+    scenarios: dict[str, Any] | None = None,
+    **settings: Any,
+) -> RunResult:
+    return run(
+        build(Ruled),
+        model_points=simple_model_points(),
+        tables=ruled_tables() if tables is None else tables,
+        scenarios=ruled_scenarios() if scenarios is None else scenarios,
+        settings=RunSettings(valuation_date=VAL, **settings),
+        run_dir=tmp_path / "ruled",
+    )
+
+
+GROUP_SCHEMA = Schema(
+    fields=(
+        Field("group_id", "string", unique=True),
+        Field("pols_if_init", "number", "Count", gt=0),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+    id_field="group_id",
+)
+
+
+class Grouped(Product):
+    """A schema whose id field is not ``policy_id``: the outputs are keyed on it."""
+
+    model_point = GROUP_SCHEMA
+
+    @var(init=lambda mp: mp.pols_if_init, role="in_force")
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.9
+
+    @var
+    def total(self) -> Count:
+        return sum_t(self.x)
+
+
+def group_model_points(n: int = 2, rem_m: int = 6) -> Any:
+    return pa.table(
+        {
+            "group_id": pa.array([f"G{i}" for i in range(n)], pa.string()),
+            "pols_if_init": pa.array([10.0 * (i + 1) for i in range(n)], pa.float64()),
+            "rem_m": pa.array([rem_m] * n, pa.int32()),
+        }
+    )

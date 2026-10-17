@@ -2,15 +2,23 @@
 data contracts a model declares."""
 
 from halley.authoring.contracts import (
+    BatchView,
     Column,
     Derived,
     Field,
+    InputRule,
+    InputView,
+    Invariant,
     Key,
     LoadContext,
     Rule,
     ScenarioInput,
+    ScenarioRule,
+    ScenarioView,
     Schema,
     Table,
+    TableRule,
+    TableView,
     int_field,
 )
 from halley.authoring.functions import (
@@ -58,6 +66,7 @@ from halley.authoring.units import (
 
 __all__ = [
     "Annual",
+    "BatchView",
     "Bool",
     "Column",
     "Continuous",
@@ -69,7 +78,10 @@ __all__ = [
     "Field",
     "Fraction",
     "Index",
+    "InputRule",
+    "InputView",
     "Int",
+    "Invariant",
     "Key",
     "LoadContext",
     "Money",
@@ -81,9 +93,13 @@ __all__ = [
     "Rate",
     "Rule",
     "ScenarioInput",
+    "ScenarioRule",
+    "ScenarioView",
     "Schema",
     "Static",
     "Table",
+    "TableRule",
+    "TableView",
     "ann_fwd",
     "ann_spot",
     "annual_step",

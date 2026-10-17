@@ -17,6 +17,7 @@ from numpy.typing import NDArray
 
 from halley.authoring import (
     Annual,
+    BatchView,
     Column,
     Count,
     Derived,
@@ -24,6 +25,7 @@ from halley.authoring import (
     Field,
     Fraction,
     Int,
+    Invariant,
     Key,
     LoadContext,
     Money,
@@ -159,6 +161,88 @@ EXPENSES = Table(
     doc="Maintenance expense per policy per month and claim expense per death, time-0 prices",
 )
 
+# ------------------------------------------------------------------------- invariants (12)
+# H4 and H5 in the spec's own form, on the engine's outputs; H1 to H3 are the built-in checks
+# on the roles below. The tolerance is the spec's (section 1, C33): 1e-9 of
+# max(|lhs|, |rhs|, sum_assured * pols_if_init).
+
+
+def _money_scale(a: BatchView, lhs: NDArray[Any], rhs: NDArray[Any]) -> NDArray[Any]:
+    return np.maximum(np.maximum(np.abs(lhs), np.abs(rhs)), a.scale("Money"))
+
+
+def _h4_lhs(a: BatchView) -> NDArray[Any]:
+    """The opening reserve and the net premium, accumulated a month at i_m, less the
+    end-of-month outgo: months 1..H."""
+    lhs = (a.var("reserve")[:-1] + a.var("premium_income")[1:] - a.var("commission")[1:]) * (
+        1 + a.var("i_m")
+    )
+    return lhs - a.var("maint_expense")[1:] - a.var("death_outgo")[1:] - a.var("claim_expense")[1:]
+
+
+def _h4_rhs(a: BatchView) -> NDArray[Any]:
+    return a.var("reserve")[1:]
+
+
+def _h5a_lhs(a: BatchView) -> NDArray[Any]:
+    return a.at("reserve", 0)
+
+
+def _h5a_rhs(a: BatchView) -> NDArray[Any]:
+    return -a.var("pv_net_cf")
+
+
+def _h5b_lhs(a: BatchView) -> NDArray[Any]:
+    """The reserve discounted to time 0, months 0..H-1."""
+    return (a.var("reserve") * a.var("disc"))[:-1]
+
+
+def _h5b_rhs(a: BatchView) -> NDArray[Any]:
+    """The discounted net outgo of months u+1..H, for u = 0..H-1: month s contributes
+    outgo(s) disc(s) - income(s) disc(s-1), summed from H downwards (a fixed order)."""
+    disc = a.var("disc")
+    outgo = (a.var("death_outgo") + a.var("claim_expense") + a.var("maint_expense")) * disc
+    income = np.zeros_like(outgo)
+    income[1:] = (a.var("premium_income")[1:] - a.var("commission")[1:]) * disc[:-1]
+    term = outgo - income
+    tail = np.cumsum(term[::-1], axis=0)[::-1]  # tail[u] = sum over s = u..H
+    return tail[1:]
+
+
+_FLOWS = ("premium_income", "commission", "maint_expense", "death_outgo", "claim_expense")
+
+INVARIANTS = (
+    Invariant(
+        "H4 reserve roll-forward",
+        _h4_lhs,
+        _h4_rhs,
+        tol=1e-9,
+        scale=_money_scale,
+        months=(1, "H"),
+        reads=("reserve", "i_m", *_FLOWS),
+        doc="reserve(t) = (reserve(t-1) + premium_income(t) - commission(t)) (1 + i_m) - "
+        "maint_expense(t) - death_outgo(t) - claim_expense(t)",
+    ),
+    Invariant(
+        "H5a reserve(0) = -pv_net_cf",
+        _h5a_lhs,
+        _h5a_rhs,
+        tol=1e-9,
+        scale=_money_scale,
+        months=(0, 0),
+        reads=("reserve", "pv_net_cf"),
+    ),
+    Invariant(
+        "H5b reserve(t) disc(t) = PV of the net outgo of months t+1..H",
+        _h5b_lhs,
+        _h5b_rhs,
+        tol=1e-9,
+        scale=_money_scale,
+        months=(0, "H-1"),
+        reads=("reserve", "disc", *_FLOWS),
+    ),
+)
+
 
 # --------------------------------------------------------------------------- the model (15.2)
 
@@ -200,6 +284,7 @@ class TermAssurance(Product):
         "MoneyPerPolicy": "sum_assured",
         "Count": "pols_if_init",
     }
+    invariants = INVARIANTS
 
     # ---- basis constants (section 6) --------------------------------------------------
     @var

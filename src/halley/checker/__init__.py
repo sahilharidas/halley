@@ -604,9 +604,11 @@ def _same_period_order(scc: _Scc) -> list[str]:
 
 
 def needed_variables(graph: ir.Graph) -> set[str]:
-    """Outputs, role variables and everything they read, transitively."""
+    """Outputs, role variables, the variables the product's invariants read, and everything they
+    read, transitively."""
     wanted: set[str] = set(graph.outputs) if graph.outputs is not None else set(graph.variables)
     wanted |= {v.name for v in graph.variables.values() if v.role is not None}
+    wanted |= graph.invariant_reads
     stack = list(wanted)
     while stack:
         name = stack.pop()

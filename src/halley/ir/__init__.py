@@ -301,6 +301,8 @@ class Graph:
     """Per-unit tolerance scales for invariants, as model point fields (open question 25)."""
     components: list[list[str]] = field(default_factory=lambda: [])
     """Checked: the variables of each component, in schedule order."""
+    invariant_reads: frozenset[str] = frozenset()
+    """Variables the product's invariants read; kept generated, not part of the hash."""
 
     def reads(self, var: Variable) -> Iterator[tuple[Node, str, int | None]]:
         """Every variable read in ``var``'s formula and boundary values: ``(node, name,

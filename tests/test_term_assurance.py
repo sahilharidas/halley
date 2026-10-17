@@ -10,6 +10,8 @@ portfolio total must agree under the spec's tolerance (section 1), and the invar
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -118,6 +120,28 @@ def test_horizon_and_dimensions(term_run: RunResult) -> None:
     assert term_run.n_scenarios == 1
     assert list(term_run.ids) == [f"P{i:02d}" for i in range(1, 11)]
     assert all(r.passed for r in term_run.invariants)
+
+
+def test_the_product_declares_h4_and_h5_and_they_hold(term_run: RunResult) -> None:
+    """H4 and H5 are the product's invariants (section 12), evaluated by the runtime on every
+    batch after the built-in H1 to H3, with the spec's tolerance (section 1, C33)."""
+    names = [r.name for r in term_run.invariants]
+    assert names == [
+        "H1 in force never negative, never increasing",
+        "H2 decrements never exceed the opening in-force count",
+        "H2 probabilities in [0, 1]",
+        "H3 reserve reaches its terminal value at t = 480",
+        "H4 reserve roll-forward",
+        "H5a reserve(0) = -pv_net_cf",
+        "H5b reserve(t) disc(t) = PV of the net outgo of months t+1..H",
+    ]
+    by_name = {r.name: r for r in term_run.invariants}
+    for name in ("H4 reserve roll-forward", "H5a reserve(0) = -pv_net_cf"):
+        assert by_name[name].passed
+        assert by_name[name].worst < 1e-9 * 3_970_000  # the money scale of the portfolio
+    assert by_name["H5b reserve(t) disc(t) = PV of the net outgo of months t+1..H"].passed
+    on_disk = json.loads((term_run.run_dir / "invariants.json").read_text(encoding="utf-8"))
+    assert [r["name"] for r in on_disk] == names
 
 
 def test_every_monthly_column_reconciles(
@@ -348,6 +372,48 @@ def test_rerun_is_bit_identical_and_the_manifest_cites_the_inputs(
     for name, info in manifest["inputs"]["tables"].items():
         copy = term_run.run_dir / info["copy"]
         assert hashlib.sha256(copy.read_bytes()).hexdigest() == info["sha256"], name
+    # every halley.* metadata entry of every input, keys without the prefix
+    assert manifest["inputs"]["tables"]["mort_table"]["metadata"] == {
+        "version": "term-mort-0.1",
+        "basis": "term-ref-basis-0.1",
+        "source": "Gompertz-Makeham, spec 6.1",
+    }
+    assert manifest["inputs"]["tables"]["rates"]["metadata"] == {
+        "version": "term-rates-0.1",
+        "basis": "term-ref-basis-0.1",
+    }
+    assert manifest["inputs"]["model_points"]["metadata"] == {
+        "version": "term-mp-0.1",
+        "basis": "term-ref-basis-0.1",
+        "valuation_date": "2027-01-01",
+    }
+    # the stored variables carry their unit, domain start and role
+    variables = manifest["outputs"]["variables"]
+    assert variables["reserve"] == {"time": True, "unit": "Money", "start": 0, "role": "reserve"}
+    assert variables["deaths"] == {"time": True, "unit": "Count", "start": 1, "role": "decrement"}
+    assert variables["pv_net_cf"] == {"time": False, "unit": "Money", "start": 0, "role": None}
+    assert manifest["outputs"]["kind"] == "projection"
+    assert manifest["outputs"]["id_field"] == "policy_id"
+    monthly = term_run.run_dir / "outputs" / "monthly.parquet"
+    assert manifest["outputs"]["monthly_sha256"] == hashlib.sha256(monthly.read_bytes()).hexdigest()
+    # the same bytes under another name give the same run id: the identity holds no paths
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for name, src in tables.items():
+        shutil.copyfile(src, elsewhere / f"{name}-copy.parquet")
+    shutil.copyfile(REFERENCE_INPUTS / "model_points.parquet", elsewhere / "mp-copy.parquet")
+    moved = run(
+        compiled_term,
+        model_points=elsewhere / "mp-copy.parquet",
+        tables={name: elsewhere / f"{name}-copy.parquet" for name in tables},
+        settings=RunSettings(valuation_date=VALUATION_DATE),
+        run_dir=tmp_path / "moved",
+    )
+    assert moved.run_id == term_run.run_id
+    assert (
+        moved.manifest["inputs"]["model_points"]["path"]
+        != manifest["inputs"]["model_points"]["path"]
+    )
 
 
 def test_outputs_are_keyed_on_policy_id_with_a_schema_version(term_run: RunResult) -> None:

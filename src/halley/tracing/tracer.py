@@ -77,6 +77,16 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
                 f"tolerance_scales names {field_name!r}, which is not a model point field"
             )
         scales[unit_from_name(unit_name)] = field_name
+    invariant_reads: set[str] = set()
+    for inv in model.invariants:
+        for name in inv.reads:
+            if name not in variables:
+                raise BuildError(
+                    f"invariant {inv.name} reads {name!r}, which is not a variable of "
+                    f"{model.__qualname__}",
+                    inv.loc,
+                )
+            invariant_reads.add(name)
 
     source_file = inspect.getsourcefile(model) or "<unknown>"
     return ir.Graph(
@@ -90,6 +100,7 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
         horizon_field=schema.horizon,
         outputs=outputs,
         scale_fields=scales,
+        invariant_reads=frozenset(invariant_reads),
     )
 
 
@@ -134,8 +145,10 @@ _RESERVED_NAMES = {
     "model_point": "a Product class attribute",
     "assumption_tables": "a Product class attribute",
     "scenario_inputs": "a Product class attribute",
+    "input_rules": "a Product class attribute",
     "outputs": "a Product class attribute",
     "tolerance_scales": "a Product class attribute",
+    "invariants": "a Product class attribute",
     "abstract": "a Product class attribute",
 }
 """Names a variable may not take: the tracer sets the accessors on the instance, where they would
