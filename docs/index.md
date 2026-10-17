@@ -54,5 +54,6 @@ outputs keyed on `policy_id`, and the invariant results. `halley.explain(result,
 
 spec/README
 spec/term-assurance
+spec/annuity
 spec/in-force-group
 ```
