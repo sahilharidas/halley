@@ -142,7 +142,9 @@ class Expensed(Product):
     """A backward component of two members, the annuity's ``{bel, inv_exp}``: the reserve reads
     next month's investment expense, which is charged on the closing reserve of its own month.
     ``inv_exp`` carries no terminal; its formula reaches ``H``, where the backend evaluates it
-    before the loop steps both members back together."""
+    before the loop steps both members back together. The reserve's terminal is a year's premium
+    per life, not zero, so that ``inv_exp(H)`` is non-zero and ``bel(H - 1)`` depends on the
+    pre-loop having run."""
 
     model_point = SIMPLE_SCHEMA
 
@@ -166,7 +168,7 @@ class Expensed(Product):
     def ie_m(self) -> Rate[Monthly]:
         return to_monthly(0.012)
 
-    @var(terminal=0)
+    @var(terminal=lambda mp: mp.pols_if_init * mp.premium)
     def bel(self, t: Int) -> Money:
         return (pv_month(self.cf, t + 1, self.v) + pv_month(self.inv_exp, t + 1, self.v)) + (
             self.v(t + 1) * self.bel(t + 1)
@@ -271,9 +273,10 @@ def closed_form_growth(x0: float, premium: float, horizon: int) -> dict[str, np.
 
 
 def closed_form_expensed(x0: float, premium: float, horizon: int) -> dict[str, np.ndarray]:
-    """What ``Expensed`` computes, written independently with plain floats: the investment
-    expense at ``H`` is its formula on the terminal reserve, then both recursions step back,
-    the reserve first because the expense of a month is charged on that month's reserve."""
+    """What ``Expensed`` computes, written independently with plain floats: the reserve ends at
+    a year's premium per life, the investment expense at ``H`` is its formula on that terminal,
+    then both recursions step back, the reserve first because the expense of a month is charged
+    on that month's reserve."""
     v = 1.04 ** (-1 / 12)
     ie = ((1 + 0.012) ** (1 / 12)) - 1
     x = np.array([x0 * 0.99**t for t in range(horizon + 1)])
@@ -282,6 +285,7 @@ def closed_form_expensed(x0: float, premium: float, horizon: int) -> dict[str, n
         cf[t] = x[t - 1] * premium
     bel = np.zeros(horizon + 1)
     inv_exp = np.zeros(horizon + 1)
+    bel[horizon] = x0 * premium
     inv_exp[horizon] = ie * bel[horizon]
     for t in range(horizon - 1, -1, -1):
         bel[t] = (cf[t + 1] + inv_exp[t + 1] * v) + v * bel[t + 1]

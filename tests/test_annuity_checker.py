@@ -393,34 +393,85 @@ def test_the_horizon_must_cover_every_run_off_month(
         r"values, first for policy 1 \(a run shorter than t_end truncates the valuation\)",
     ):
         _load(compiled_annuity["level"], tmp_path, rows=rows, horizon=600)
-    with pytest.raises(LoadError, match=r"input rule the horizon covers every policy's run-off"):
+    # one policy, one scenario: the (1,) result still names the policy, not an element position
+    with pytest.raises(
+        LoadError,
+        match=r"input rule the horizon covers every policy's run-off month fails for policy 1 "
+        r"\(a run shorter",
+    ):
         _load(compiled_annuity["level"], tmp_path, horizon=300)
     assert _load(compiled_annuity["level"], tmp_path, rows=rows, horizon=655).H == 655
 
 
-def test_cif_at_the_limiting_age_is_one(
-    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
-) -> None:
+def _cif_table_with(age: int, year: int, value: float) -> Any:
+    """The reference ``mort_cif`` with one cell changed, its metadata kept."""
     full = data.mort_cif_table()
     cols = full.to_pydict()
     i = next(
         k
         for k, (x, y) in enumerate(zip(cols["age"], cols["year"], strict=True))
-        if (x, y) == (120, 2030)
+        if (x, y) == (age, year)
     )
-    cols["cif"][i] = 0.9
-    bad = pa.table(
+    cols["cif"][i] = value
+    return pa.table(
         {
             "age": pa.array(cols["age"], pa.int16()),
             "year": pa.array(cols["year"], pa.int16()),
             "cif": pa.array(cols["cif"], pa.float64()),
         }
     ).replace_schema_metadata(full.schema.metadata)
+
+
+def test_cif_at_the_limiting_age_is_one(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
     with pytest.raises(
         LoadError,
         match=r"table mort_cif: rule cif\(120, y\) = 1 fails at year = 2030 \(the limiting",
     ):
-        _load(compiled_annuity["level"], tmp_path, tables={"mort_cif": bad})
+        _load(
+            compiled_annuity["level"],
+            tmp_path,
+            tables={"mort_cif": _cif_table_with(120, 2030, 0.9)},
+        )
+
+
+def test_q_base_times_cif_must_stay_a_probability(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
+    """The cross-table check names the ``mort_cif`` row (spec, "Assumption tables"): cif(119,
+    2030) = 1.1 passes every per-table rule (below 3, above 0, neither the base year nor age 120)
+    and fails the grid check through the male q at 119, so the failure is reported at that age
+    and year of ``mort_cif``, one cell of its 101 x 126 grid."""
+    with pytest.raises(
+        LoadError,
+        match=r"input rule q_base \* cif <= 1 on the key grid fails for 1 of 12726 values, first "
+        r"at age = 119, year = 2030 of table mort_cif \(q_ann stays a probability\)",
+    ):
+        _load(
+            compiled_annuity["level"],
+            tmp_path,
+            tables={"mort_cif": _cif_table_with(119, 2030, 1.1)},
+        )
+
+
+def test_the_money_scale_is_floored_at_a_year_of_payments(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
+    """An in-force policy may carry no premium (``single_premium = 0`` is allowed before V); its
+    Money tolerance scale is then a year of payments, never 0, while a policy with a premium
+    keeps the premium as its scale."""
+    in_force = _row(
+        policy_id=9,
+        issue_date=dt.date(2015, 12, 31),
+        cohort=2015,
+        annuity_start_date=dt.date(2016, 1, 1),
+        single_premium=0.0,
+    )
+    res = _load(compiled_annuity["level"], tmp_path, rows=[_row(), in_force])
+    assert res.inputs is not None
+    scale = res.inputs.model_points.columns["scale_money"]
+    assert list(scale) == [190_000.0, 1_000.0 * 12]  # policy 1 its premium, policy 9 the floor
 
 
 def test_sigma_e_must_not_exceed_z_alpha(

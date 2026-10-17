@@ -104,7 +104,9 @@ def _t_end(c: LoadContext) -> NDArray[Any]:
 
 
 def _scale_money(c: LoadContext) -> NDArray[Any]:
-    return c.pols_if_init * c.single_premium
+    """The Money tolerance scale: the premium, floored at a year of payments so that an in-force
+    policy whose file carries no premium (allowed before V) still has a positive scale."""
+    return np.maximum(c.pols_if_init * c.single_premium, c.pols_if_init * c.instalment_pm * 12)
 
 
 def _month_end(d: dt.date) -> str | None:
@@ -147,7 +149,14 @@ SCHEMA = Schema(
         Derived("a0", "Int", _a0, ge=600, le=1320, doc="age at V in months: 50 to 110 years"),
         Derived("m_c", "Int", _m_c, doc="at most 1: the annuity is in payment by month 1"),
         Derived("t_end", "Int", _t_end, doc="the first month at the limiting age"),
-        Derived("scale_money", "Money", _scale_money, kind="number", ge=0),
+        Derived(
+            "scale_money",
+            "Money",
+            _scale_money,
+            kind="number",
+            ge=0,
+            doc="max(pols_if_init x single_premium, pols_if_init x instalment_pm x 12)",
+        ),
     ),
     rules=(
         Rule("portfolio non-empty", lambda c: c.portfolio != "", "group key"),
@@ -325,10 +334,18 @@ def _horizon_covers_every_run_off(v: InputView) -> NDArray[Any]:
     return v.horizon >= v.model_points.t_end
 
 
+def _q_ann_stays_a_probability(v: InputView) -> NDArray[Any]:
+    """``q_base(sex, age) x cif(age, year) <= 1`` over the whole key grid, reduced over sex so
+    the result has ``mort_cif``'s dense shape and a failure names ``age = ..., year = ...`` of
+    that table, as the spec asks (either sex failing fails the cell)."""
+    product = v.tables["mort_base"].q[:, :, None] * v.tables["mort_cif"].cif[None, :, :]
+    return (product <= 1).all(axis=0)
+
+
 INPUT_RULES = (
     InputRule(
         "q_base * cif <= 1 on the key grid",
-        lambda v: v.tables["mort_base"].q[:, :, None] * v.tables["mort_cif"].cif[None, :, :] <= 1,
+        _q_ann_stays_a_probability,
         "q_ann stays a probability",
     ),
     InputRule(

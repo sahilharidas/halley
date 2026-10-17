@@ -10,9 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from halley import (
+    Column,
     Count,
     Factor,
     Int,
@@ -23,6 +26,7 @@ from halley import (
     Product,
     RunError,
     RunSettings,
+    Table,
     at,
     build,
     load_run,
@@ -263,6 +267,47 @@ def test_fixed_month_outside_the_horizon_fails(tmp_path: Path) -> None:
         )
 
 
+def test_a_table_named_path_stays_in_the_run_identity(tmp_path: Path) -> None:
+    """The run identity drops each input's own ``path`` string and nothing else (D21: a run is
+    addressed by what it read): a table named ``path`` keeps its hash in the identity, so
+    different bytes give different run ids and the same bytes at two paths give one."""
+    share = Table("path", keys=(), columns=(Column("share", "Factor", ge=0, le=1),))
+
+    class Pathed(Growth):
+        assumption_tables = (share,)
+
+        @var
+        def shared(self) -> Money:
+            return self.total() * self.tables.path.share
+
+    compiled = build(Pathed)
+
+    def go(name: str, value: float, where: str = "a") -> Any:
+        d = tmp_path / where
+        d.mkdir(exist_ok=True)
+        pq.write_table(pa.table({"share": pa.array([value], pa.float64())}), d / f"{name}.parquet")
+        return run(
+            compiled,
+            model_points=simple_model_points(),
+            tables={"path": d / f"{name}.parquet"},
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / f"run-{name}-{where}",
+        )
+
+    half, seventy = go("half", 0.5), go("seventy", 0.7)
+    assert half.run_id != seventy.run_id
+    assert (
+        half.manifest["inputs"]["tables"]["path"]["sha256"]
+        != seventy.manifest["inputs"]["tables"]["path"]["sha256"]
+    )
+    moved = go("half", 0.5, where="b")
+    assert moved.run_id == half.run_id
+    assert (
+        moved.manifest["inputs"]["tables"]["path"]["path"]
+        != half.manifest["inputs"]["tables"]["path"]["path"]
+    )
+
+
 def test_run_constants_come_from_the_valuation_date_and_horizon(tmp_path: Path) -> None:
     class Dated(Growth):
         @var
@@ -309,7 +354,7 @@ def test_a_backward_component_of_two_members_steps_from_the_horizon(tmp_path: Pa
     both members then step back together with the existing start guards."""
     compiled = build(Expensed)
     source = compiled.source
-    terminal = source.index("V_bel[H] = 0")
+    terminal = source.index("V_bel[H] = (M_pols_if_init * M_premium)")
     pre = source.index("V_inv_exp[H] = (V_ie_m[0] * V_bel[t])")
     loop = source.index("for t in range(H - 1, -1, -1):")
     assert terminal < pre < loop
@@ -327,13 +372,17 @@ def test_a_backward_component_of_two_members_steps_from_the_horizon(tmp_path: Pa
     )
     for i, pid in enumerate(res.ids):
         want = closed_form_expensed(1.0 + i, 10.0 * (i + 1), res.H)
-        bel, inv_exp = res.lane("bel", pid), res.lane("inv_exp", pid)
+        bel, inv_exp, cf = res.lane("bel", pid), res.lane("inv_exp", pid), res.lane("cf", pid)
+        ie, v = res.lane("ie_m", pid)[0], res.lane("v", pid)[res.H]
         np.testing.assert_allclose(bel, want["bel"], rtol=1e-12, atol=0)
         np.testing.assert_allclose(inv_exp, want["inv_exp"], rtol=1e-12, atol=0)
-        assert bel[res.H] == 0.0  # the terminal
-        assert inv_exp[res.H] == 0.0  # the formula at H, on the terminal reserve
+        assert bel[res.H] == (1.0 + i) * (10.0 * (i + 1))  # the terminal: a year's premium
+        assert inv_exp[res.H] == ie * bel[res.H] != 0.0  # the formula at H, on the terminal
+        # the pre-loop value feeds the last step; had it not run, bel(H-1) would be cf + v bel
+        assert bel[res.H - 1] == (cf[res.H] + inv_exp[res.H] * v) + v * bel[res.H]
+        assert bel[res.H - 1] != cf[res.H] + v * bel[res.H]
         assert inv_exp[0] == 0.0  # a month quantity
-        assert inv_exp[1] == res.lane("ie_m", pid)[0] * bel[1]
+        assert inv_exp[1] == ie * bel[1]
         for name in ("bel", "inv_exp"):
             for t in range(res.H + 1):
                 assert recompute(res, pid, name, t) == res.lane(name, pid)[t], (name, t)

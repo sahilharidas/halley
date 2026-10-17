@@ -13,7 +13,6 @@ settings and the backend.
 
 from __future__ import annotations
 
-import copy
 import datetime as dt
 import hashlib
 import importlib.metadata
@@ -170,18 +169,19 @@ def _input_entry(f: ReadFile, copy_to: str, **extra: Any) -> dict[str, Any]:
 
 
 def _without_paths(inputs: dict[str, Any]) -> dict[str, Any]:
-    """The manifest's inputs block without the original ``path`` strings: a run is addressed by
-    what it read, not where the files were."""
-    block = copy.deepcopy(inputs)
+    """The manifest's inputs block without each input's own ``path`` string: a run is addressed
+    by what it read, not where the files were. Only the entry level is stripped
+    (``model_points``, ``tables.<name>``, ``scenarios.<name>``), never anything below or beside
+    it, so a table or scenario input named ``path`` stays in the identity, hash and all."""
 
-    def strip(node: Any) -> None:
-        if isinstance(node, dict):
-            node.pop("path", None)
-            for v in node.values():
-                strip(v)
+    def entry(e: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in e.items() if k != "path"}
 
-    strip(block)
-    return block
+    return {
+        "model_points": entry(inputs["model_points"]),
+        "tables": {name: entry(e) for name, e in inputs["tables"].items()},
+        "scenarios": {name: entry(e) for name, e in inputs["scenarios"].items()},
+    }
 
 
 def run(

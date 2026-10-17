@@ -168,8 +168,17 @@ def check_builtin(
 # ------------------------------------------------------------------------- product invariants
 
 
+def _read_only(values: NDArray[Any]) -> NDArray[Any]:
+    """A read-only view of ``values`` (no copy): what an invariant sees of the loaded inputs,
+    so a slip such as ``a.mp.premium[...] = x`` raises instead of corrupting the model points
+    for every later batch and for the run's result."""
+    view = values.view()
+    view.flags.writeable = False
+    return view
+
+
 class _Fields:
-    """``a.mp``: a model point field of the batch, shaped ``(1, P, 1)``."""
+    """``a.mp``: a model point field of the batch, shaped ``(1, P, 1)``, read-only."""
 
     def __init__(self, columns: dict[str, NDArray[Any]], lo: int, hi: int) -> None:
         self._columns = columns
@@ -185,7 +194,7 @@ class _Fields:
                 f"a.mp.{name}: the model point schema has no field {name!r}; it has "
                 f"{', '.join(sorted(self._columns))}"
             )
-        return np.asarray(col[self._lo : self._hi]).reshape(1, -1, 1)
+        return _read_only(np.asarray(col[self._lo : self._hi]).reshape(1, -1, 1))
 
 
 class _Run:
@@ -257,7 +266,11 @@ class BatchView:
             if i < 0 or i > self.H:
                 raise RunError(f"a.at({name!r}, {i}): month {i} is outside 0..{self.H}")
             return values[i : i + 1]
-        idx = np.asarray(index, dtype=np.int64).reshape(1, -1, 1)
+        given = np.asarray(index)
+        if not np.issubdtype(given.dtype, np.integer):
+            # the model's at() takes an Int index (D11); a float here would be truncated silently
+            raise RunError(f"a.at({name!r}, index): the index is {given.dtype}, not an integer")
+        idx = given.astype(np.int64).reshape(1, -1, 1)
         if idx.shape[1] != self.P:
             raise RunError(
                 f"a.at({name!r}, index): the index has {idx.shape[1]} policies, the batch {self.P}"
@@ -274,7 +287,7 @@ class BatchView:
             raise RunError(
                 f"scenario input {name} covers months {sc.u0} to {sc.u_max}, not {lo} to {hi}"
             )
-        return sc.values[lo - sc.u0 : hi - sc.u0 + 1]
+        return _read_only(sc.values[lo - sc.u0 : hi - sc.u0 + 1])
 
     def scen(self, name: str, u: int) -> NDArray[np.float64]:
         return self._scenario(name, u, u)
@@ -288,7 +301,7 @@ class BatchView:
             raise RunError(f"the model declares no assumption table {name!r}")
         if column not in t.values:
             raise RunError(f"table {name} has no column {column!r}")
-        return t.values[column]
+        return _read_only(t.values[column])
 
     def scale(self, unit: str) -> NDArray[np.float64]:
         s = self._scales.get(unit_from_name(unit))
@@ -391,8 +404,11 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
     parts: list[str] = []
     if shape[1] == a.P:
         parts.append(f"policy {a.ids[p]}")
-    if n_time > 1 or inv.months is not None:
+    if n_time > 1 or n_window == 1:
         parts.append(f"t = {first + i}")
+    elif inv.months is not None:
+        # a one-row result under a longer window is one month of it, which one is not known
+        parts.append(f"one month of {first}..{last}")
     if shape[2] > 1:
         parts.append(f"scenario {s}")
     where = ", ".join(parts) or "the batch"

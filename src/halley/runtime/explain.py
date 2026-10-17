@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
+from halley.codegen.numpy_backend import ARRAY, SCALAR, value_kind
 from halley.errors import HalleyError, Loc
 from halley.runtime.run import RunResult
 
@@ -72,7 +73,10 @@ class Lane:
         si = self.s if a.shape[2] > 1 else 0
         return a[ti, pi, si].item()
 
-    def eval(self, node: ir.Node, t: int | None) -> Any:
+    def eval(self, node: ir.Node, t: int | None, step: bool = False) -> Any:
+        """The value of ``node`` for this lane at month ``t``. ``step`` says whether the reader
+        is a member of a recursive component, which decides the path a power takes in the
+        generated code (:func:`_pow`); the arithmetic itself is the same either way."""
         if isinstance(node, ir.Const):
             return node.value
         if isinstance(node, ir.TimeIndex):
@@ -87,7 +91,7 @@ class Lane:
                 raise HalleyError(f"{node.name}(t) read without a month")
             return self.value_at(node.name, t + node.offset)
         if isinstance(node, ir.VarAt):
-            return self.value_at(node.name, int(self.eval(node.index, t)))
+            return self.value_at(node.name, int(self.eval(node.index, t, step)))
         if isinstance(node, ir.SumT):
             v = self.graph.variables[node.name]
             total = 0.0
@@ -103,7 +107,7 @@ class Lane:
             table = self.inputs.tables[node.table]
             idx: list[int] = []
             for key, key_node in zip(table.decl.keys, node.keys, strict=True):
-                value = self.eval(key_node, t)
+                value = self.eval(key_node, t, step)
                 if key.enum is not None:
                     idx.append(key.enum.index(str(value)))
                 else:
@@ -122,34 +126,40 @@ class Lane:
             return sc.values[t + node.offset - sc.u0, 0, self.s].item()
         if isinstance(node, ir.ScenAt):
             sc = self.inputs.scenarios[node.name]
-            return sc.values[int(self.eval(node.index, t)) - sc.u0, 0, self.s].item()
+            return sc.values[int(self.eval(node.index, t, step)) - sc.u0, 0, self.s].item()
         if isinstance(node, ir.RunConst):
             return self.inputs.run[node.name]
         if isinstance(node, ir.Unary):
-            a = self.eval(node.a, t)
+            a = self.eval(node.a, t, step)
             return -a if node.op == "neg" else (not a)
         if isinstance(node, ir.Binary):
-            a = self.eval(node.a, t)
-            if (
-                node.op == "pow"
-                and isinstance(node.b, ir.Const)
-                and not isinstance(node.a, ir.Const)
-            ):
-                return _pow_const(a, node.b.value)
-            return _binary(node.op, a, self.eval(node.b, t))
+            a = self.eval(node.a, t, step)
+            b = self.eval(node.b, t, step)
+            if node.op == "pow":
+                return _pow(a, b, _array_power(node.a, node.b, step))
+            return _binary(node.op, a, b)
         if isinstance(node, ir.Where):
-            a = self.eval(node.a, t)
-            b = self.eval(node.b, t)
-            return a if self.eval(node.cond, t) else b
+            a = self.eval(node.a, t, step)
+            b = self.eval(node.b, t, step)
+            return a if self.eval(node.cond, t, step) else b
         if isinstance(node, ir.Call):
-            args = [self.eval(a, t) for a in node.args]
-            return _call(node.fn, args)
+            args = [self.eval(a, t, step) for a in node.args]
+            kinds = [value_kind(a, step) for a in node.args]
+            return _call(node.fn, args, kinds)
         raise HalleyError(f"unknown node {type(node).__name__}")
+
+
+def _array_power(base: ir.Node, exponent: ir.Node, step: bool) -> bool:
+    """Whether the generated code's ``base ** exponent`` is NumPy's array power, with its fast
+    paths: the base is an array (a 0-d one included) and the exponent a scalar or a 0-d array
+    (:func:`~halley.codegen.numpy_backend.value_kind`). A scalar base is scalar power, an array
+    exponent the plain power loop; both are libm's pow, as Python's ``**`` is."""
+    return value_kind(base, step) != SCALAR and value_kind(exponent, step) != ARRAY
 
 
 def _binary(op: str, a: Any, b: Any) -> Any:
     """A binary operator on two lane values in Python arithmetic, which agrees with NumPy's
-    element loops bit for bit except for the power fast paths :func:`_pow_const` mirrors."""
+    element loops bit for bit except for the power fast paths :func:`_pow` mirrors."""
     try:
         if op == "add":
             return a + b
@@ -186,28 +196,26 @@ def _binary(op: str, a: Any, b: Any) -> Any:
     raise HalleyError(f"unknown operator {op}")
 
 
-def _pow_const(a: Any, exponent: Any) -> Any:
-    """``a ** exponent`` for a constant exponent, through the NumPy loop the generated code runs.
+def _pow(a: Any, b: Any, array_power: bool) -> Any:
+    """``a ** b`` through the path the generated code takes for this base and exponent.
 
-    The emitted exponent of ``x ** 0.5`` is the Python literal in whole and step mode alike, and
-    its base is an array (a variable slice, a model point column, ``_t``), so NumPy evaluates
-    ``ndarray ** scalar``, which takes a fast path for ``** 0.5``, ``** 2`` and ``** -1``
-    (sqrt, square, reciprocal) that differs from libm's pow in the last place for about one
-    value in a thousand. Python's ``a ** b`` is libm's pow, so the interpreter mirrors the
-    array form; the exponent itself is kept a Python scalar as emitted (``np.float64(a) ** b``
-    and ``np.power`` of two scalars take no fast path and would not match).
+    NumPy's array power (``ndarray ** k`` with ``k`` a scalar or a 0-d array) takes a fast path
+    for ``** 0.5``, ``** 2`` and ``** -1`` (sqrt, square, reciprocal) that differs from libm's
+    pow in the last place for about one value in a thousand; every other combination, a scalar
+    base (``T_mort__q[0, 3] ** 0.5`` for a constant-key lookup, ``(t / 12) ** 0.5`` inside a
+    recursive component) or an array exponent (``-12 / _t[1:H+1]`` in a whole-mode
+    ``ann_spot``), is libm's pow, as Python's ``**`` is. ``array_power`` says which
+    (:func:`_array_power`); the array form is run on a one-element array so NumPy decides the
+    fast path from the exponent's value exactly as it does for the batch.
 
-    Not mirrored: a non-constant exponent is evaluated with Python's ``**`` (see
-    :func:`_binary`). In whole mode the emitted exponent is then an array (``-12 / _t[1:H+1]``
-    in ``ann_spot``), which takes no fast path either, so the two agree; inside a step
-    component the same exponent is a Python float (``ann_spot(df(t), t)`` at ``t = 12`` is
-    ``** -1.0``), and a base built from ``t`` alone (``(t / 12) ** 0.5``) is a Python float
-    there too, so a recursive component that writes either goes through libm's pow in the
-    generated code and would need the reader's direction here to match bit for bit. Neither
-    appears in the shipped products.
+    Not mirrored: an exponent that is a size-one array with two or more axes (a scalar variable
+    read as an exponent, ``x ** alpha()``) takes the fast path in the generated code when its
+    value is exactly 0.5, 2 or -1, and is treated as an array exponent here.
     """
-    with np.errstate(all="ignore"):  # the generated code runs under the same errstate
-        return (np.array([a]) ** exponent).item()
+    if array_power:
+        with np.errstate(all="ignore"):  # the generated code runs under the same errstate
+            return (np.array([a]) ** b).item()
+    return _binary("pow", a, b)
 
 
 def _ufunc(fn: str, x: Any) -> Any:
@@ -217,14 +225,18 @@ def _ufunc(fn: str, x: Any) -> Any:
     return getattr(np, fn)(np.float64(x)).item()
 
 
-def _call(fn: str, args: list[Any]) -> Any:
+def _call(fn: str, args: list[Any], kinds: list[str]) -> Any:
     """Each formula function in the emitted form of the backend (``_Generator.call``), written
-    with the same grouping so the two agree bit for bit (D19)."""
+    with the same grouping so the two agree bit for bit (D19). ``kinds`` is what the generated
+    code holds for each argument (:func:`~halley.codegen.numpy_backend.value_kind`), which
+    routes the powers inside the helpers as :func:`_pow` routes ``**``: the base ``(1 + q)``,
+    ``(1 - q)`` or ``(p0 / p1)`` is an array exactly when an argument is, and ``ann_spot``'s
+    exponent ``(-12 / m)`` is a scalar unless ``m`` is an array."""
     try:
         if fn == "to_monthly":
-            return ((1 + args[0]) ** (1 / 12)) - 1
+            return _pow(1 + args[0], 1 / 12, kinds[0] == ARRAY) - 1
         if fn == "to_monthly_prob":
-            return 1 - ((1 - args[0]) ** (1 / 12))
+            return 1 - _pow(1 - args[0], 1 / 12, kinds[0] == ARRAY)
         if fn == "to_monthly_cf":
             q = args[0]
             inner = 0.0 if q >= 1 else q
@@ -236,9 +248,9 @@ def _call(fn: str, args: list[Any]) -> Any:
         if fn == "fwd_rate":
             return (args[0] / args[1]) - 1
         if fn == "ann_fwd":
-            return ((args[0] / args[1]) ** 12) - 1
+            return _pow(args[0] / args[1], 12, ARRAY in kinds[:2]) - 1
         if fn == "ann_spot":
-            return (args[0] ** (-12 / args[1])) - 1
+            return _pow(args[0], -12 / args[1], kinds[0] != SCALAR and kinds[1] != ARRAY) - 1
         if fn == "as_cu":
             return args[0]
         if fn in ("exp", "log", "expm1", "log1p", "sqrt"):
@@ -287,13 +299,14 @@ def explain(
         t = None
     lane = Lane(result, policy_id, scenario)
     value = lane.value_at(variable, t or 0)
+    step = v.direction != ir.NONE
     seen: dict[str, Any] = {}
     for leaf in _leaves(v.expr):
         text = ir.render(leaf)
         if text in seen:
             continue
         try:
-            seen[text] = lane.eval(leaf, t)
+            seen[text] = lane.eval(leaf, t, step)
         except HalleyError as exc:
             seen[text] = f"<{exc}>"
     return Explanation(
@@ -313,20 +326,23 @@ def recompute(
     result: RunResult, policy_id: object, variable: str, t: int, scenario: int = 0
 ) -> Any:
     """Evaluate a variable's formula for one lane from the stored inputs, independently of the
-    generated code. For boundary months the stored init or terminal is evaluated instead."""
+    generated code. For boundary months the stored init or terminal is evaluated instead. The
+    variable's direction says whether its formula runs inside a recursive component, which the
+    interpreter needs only to take the same power path as the generated code."""
     if result.graph is None:
         raise HalleyError("recompute needs a run made in this session")
     v = result.graph.variables[variable]
     lane = Lane(result, policy_id, scenario)
+    step = v.direction != ir.NONE
     if v.has_time:
         if t == 0 and v.init is not None:
-            return lane.eval(v.init, None)
+            return lane.eval(v.init, None)  # a boundary is evaluated once, outside the loop
         if t == result.H and v.terminal is not None:
             return lane.eval(v.terminal, None)
         first, _last = v.formula_range
         if t < first:
             return 0.0
-        return lane.eval(v.expr, t)
+        return lane.eval(v.expr, t, step)
     return lane.eval(v.expr, None)
 
 

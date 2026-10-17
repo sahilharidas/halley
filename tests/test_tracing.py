@@ -6,7 +6,20 @@ from typing import Any, cast
 
 import pytest
 
-from halley import BuildError, Count, Int, Money, Product, Static, build, trace, var, where
+from halley import (
+    BuildError,
+    Count,
+    InputRule,
+    Int,
+    Invariant,
+    Money,
+    Product,
+    Static,
+    build,
+    trace,
+    var,
+    where,
+)
 from halley.ir import MpField, RunConst, VarRead, graph_hash, render, walk
 from halley.products.lifelib_basic_term import BasicTerm
 from halley.products.term_assurance import TermAssurance
@@ -208,12 +221,29 @@ def test_run_constants_are_read_as_self_run() -> None:
     assert info.value.loc.function.endswith("Unknown.x")
 
 
-@pytest.mark.parametrize("name", ["mp", "tables", "scen", "run", "outputs"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mp",
+        "tables",
+        "scen",
+        "run",
+        "model_point",
+        "assumption_tables",
+        "scenario_inputs",
+        "input_rules",
+        "outputs",
+        "tolerance_scales",
+        "invariants",
+        "abstract",
+    ],
+)
 def test_a_variable_may_not_take_an_accessor_or_class_attribute_name(name: str) -> None:
     """The tracer sets ``self.mp``, ``self.tables``, ``self.scen`` and ``self.run`` on the
     instance, where they would silently shadow a ``@var`` of the same name (``VarDef`` is a
     non-data descriptor), and ``Product`` reads ``outputs`` and its other class attributes by
-    name; a variable so named is a build error at its definition."""
+    name; a variable so named is a build error at its definition. ``abstract`` too: the flag is
+    tested with ``is True``, so a ``@var`` of that name is not mistaken for an abstract class."""
 
     @var
     def shadow(self: Product, t: Int) -> Int:
@@ -243,11 +273,59 @@ def test_abstract_classes_are_refused_and_the_flag_is_not_inherited() -> None:
     class AbstractAgain(Concrete):
         abstract = True
 
-    with pytest.raises(BuildError, match="Base is abstract"):
+    with pytest.raises(BuildError, match="Base is abstract") as info:
         build(Base)
+    assert info.value.loc is not None  # the error points at the class itself
+    assert info.value.loc.file.endswith("test_tracing.py")
+    assert info.value.loc.function.endswith("Base")
     assert render(build(Concrete).graph.variables["x"].expr) == "(mp.premium * mp.pols_if_init)"
     with pytest.raises(BuildError, match="AbstractAgain is abstract"):
         trace(AbstractAgain)
+
+
+def test_invariants_and_input_rules_are_tuples_of_their_class() -> None:
+    """A one-element tuple written without its comma arrives as the element itself; the build
+    says so at the class rather than failing with a TypeError at the first iteration."""
+
+    class NoComma(Product):
+        model_point = SIMPLE_SCHEMA
+        invariants = Invariant("x is x", lambda a: a.var("x"))  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(
+        BuildError,
+        match=r"NoComma\.invariants must be a tuple of Invariant \(a one-element tuple needs a "
+        r"trailing comma\)",
+    ) as info:
+        trace(NoComma)
+    assert info.value.loc is not None
+    assert info.value.loc.file.endswith("test_tracing.py")
+    assert info.value.loc.function.endswith("NoComma")
+
+    class NoCommaRule(Product):
+        model_point = SIMPLE_SCHEMA
+        input_rules = InputRule("a horizon", lambda v: v.horizon > 0)  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(BuildError, match=r"NoCommaRule\.input_rules must be a tuple of InputRule"):
+        trace(NoCommaRule)
+
+    class WrongClass(Product):
+        model_point = SIMPLE_SCHEMA
+        invariants = (InputRule("a horizon", lambda v: v.horizon > 0),)  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(BuildError, match=r"WrongClass\.invariants must be a tuple of Invariant"):
+        trace(WrongClass)
 
 
 def test_unknown_and_unreadable_fields() -> None:

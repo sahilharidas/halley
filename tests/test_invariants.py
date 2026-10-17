@@ -16,6 +16,7 @@ import pytest
 from halley import (
     BuildError,
     BuildWarning,
+    Factor,
     Int,
     Invariant,
     Money,
@@ -108,6 +109,12 @@ def _run(model: type[Any], tmp_path: Path, name: str = "run", **settings: Any) -
         settings=RunSettings(valuation_date=VAL, **settings),
         run_dir=tmp_path / name,
     )
+
+
+def _declared_here(exc: RunError) -> None:
+    """A run-time error of an invariant points at its declaration in this file."""
+    assert exc.loc is not None
+    assert Path(exc.loc.file) == Path(__file__)
 
 
 def test_every_kind_and_view_accessor(tmp_path: Path) -> None:
@@ -317,14 +324,16 @@ def test_declaration_errors(tmp_path: Path) -> None:
             Invariant("sliced without a window", lambda a: a.var("cf")[1:], 0.0, kind="ge"),
         )
 
-    with pytest.raises(RunError, match=r"arrays have 12 months, not 13; declare months="):
+    with pytest.raises(RunError, match=r"arrays have 12 months, not 13; declare months=") as info:
         _run(Misshapen, tmp_path, "misshapen")
+    _declared_here(info.value)
 
     class Unscaled(Growth):
         invariants = (Invariant("needs a scale", lambda a: a.var("cf"), 0.0, scale=_money),)
 
-    with pytest.raises(RunError, match="declares no tolerance scale for Money"):
+    with pytest.raises(RunError, match="declares no tolerance scale for Money") as info:
         _run(Unscaled, tmp_path, "unscaled")
+    _declared_here(info.value)
 
     class Reserved(Growth):
         @var
@@ -339,8 +348,9 @@ def test_declaration_errors(tmp_path: Path) -> None:
             Invariant("too many axes", lambda a: a.var("x")[None], 0.0, kind="ge", tol=0),
         )
 
-    with pytest.raises(RunError, match="has 4 axes"):
+    with pytest.raises(RunError, match="has 4 axes") as info:
         _run(Wide, tmp_path, "wide")
+    _declared_here(info.value)
 
     class Mixed(Growth):
         invariants = (
@@ -615,6 +625,99 @@ def test_an_empty_or_misplaced_window_is_an_error(tmp_path: Path) -> None:
 
     with pytest.raises(RunError, match=r"months \(-1, 12\) is outside 0\.\.12 at H = 12"):
         _run(Outside, tmp_path, "outside")
+
+
+def test_at_requires_an_integer_index(tmp_path: Path) -> None:
+    """The model's ``at()`` takes an Int index (D11); the view is no laxer, so a float index is
+    refused instead of being truncated silently."""
+
+    class FloatIndex(Growth):
+        invariants = (
+            Invariant(
+                "x at a float month",
+                lambda a: a.at("x", a.mp.premium / 10),
+                0.0,
+                kind="ge",
+                tol=0,
+            ),
+        )
+
+    with pytest.raises(
+        RunError,
+        match=r"invariant x at a float month: a\.at\('x', index\): the index is float64, not an "
+        "integer",
+    ) as info:
+        _run(FloatIndex, tmp_path)
+    _declared_here(info.value)
+
+
+def test_the_view_is_read_only(tmp_path: Path) -> None:
+    """``a.mp.<field>``, ``a.table`` and ``a.scen`` are views of the loaded inputs; writing into
+    one raises, and the inputs are untouched for the later batches and the run's result."""
+    refused: list[str] = []
+
+    def tamper(a: BatchView) -> Any:
+        targets = {
+            "mp": a.mp.premium,
+            "table": a.table("margin", "share"),
+            "scen": a.scen("df", 1),
+            "scen_range": a.scen_range("df", 0, 2),
+        }
+        for name, target in targets.items():
+            try:
+                target[...] = 999.0
+            except ValueError:
+                refused.append(name)
+        return a.var("x")
+
+    class Tampering(Margin):
+        scenario_inputs = Indexed.scenario_inputs[:1]
+        invariants = (Invariant("x >= 0", tamper, 0.0, kind="ge", tol=0),)
+
+        @var
+        def disc(self, t: Int) -> Factor:
+            return self.scen.df(t)
+
+    df = scenario_file("df", 0, 12, 1, lambda s, u: 0.99**u)
+    res = run(
+        build(Tampering),
+        model_points=simple_model_points(),
+        tables={"margin": margin_table(0.5)},
+        scenarios={"df": df},
+        settings=RunSettings(valuation_date=VAL, batch_size=1),
+        run_dir=tmp_path / "tamper",
+    )
+    assert refused == ["mp", "table", "scen", "scen_range"] * 3
+    assert res.invariants[-1].passed
+    assert res.inputs is not None
+    assert list(res.inputs.model_points.columns["premium"]) == [10.0, 20.0, 30.0]
+    assert res.inputs.tables["margin"].values["share"][()] == 0.5
+    assert res.inputs.scenarios["df"].values[1, 0, 0] == 0.99
+    assert res.inputs.scenarios["df"].values[2, 0, 0] == 0.99**2
+
+
+def test_a_one_row_result_under_a_window_names_the_window(tmp_path: Path) -> None:
+    """A one-row result is one month of its window, which one is not known; the report says so
+    instead of naming the window's first month. A one-month window names the month."""
+
+    class Point(Growth):
+        invariants = (
+            Invariant("x at 5 is zero", lambda a: a.at("x", 5), 0.0, tol=0, months=(1, "H")),
+        )
+
+    with pytest.raises(
+        RunError, match=r"invariant x at 5 is zero failed: policy S00, one month of 1\.\.12: lhs = "
+    ) as info:
+        _run(Point, tmp_path)
+    assert ", t = " not in str(info.value)
+
+    class Pinned(Growth):
+        invariants = (
+            Invariant("x at 5 is zero", lambda a: a.at("x", 5), 0.0, tol=0, months=(5, 5)),
+        )
+
+    with pytest.raises(RunError, match=r"failed: policy S00, t = 5: lhs = "):
+        _run(Pinned, tmp_path, "pinned")
 
 
 def test_a_failure_is_reported_before_a_later_invariant_is_evaluated(tmp_path: Path) -> None:

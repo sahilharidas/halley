@@ -312,17 +312,32 @@ def _check_units(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
 
 
 def _relative_to_time(node: ir.Node, variables: dict[str, ir.Variable]) -> bool:
-    """Whether a node's value moves with ``t``: ``t`` itself, a relative read of a time variable
-    or a scenario input, or a fixed read whose month is not a constant. Everything else (fields,
-    tables, run constants, scalar variables, ``at``/``sum_t``/``scen.x.at`` with constant
-    months, arithmetic, ``where`` and calls) may form a boundary value."""
-    if isinstance(node, (ir.TimeIndex, ir.ScenRead)):
-        return True
+    """Whether a node may not form a boundary value because its value moves with ``t``. An
+    allow-list: fields, tables, run constants, constants, ``sum_t``, arithmetic, ``where`` and
+    calls are fixed; a variable read is fixed when the variable has no time dimension; ``at``
+    and ``scen.x.at`` are fixed when their month is a constant. Everything else, ``t`` itself,
+    a relative read of a scenario input and any node kind added later (a series read), is
+    rejected until it is admitted here on purpose."""
+    if isinstance(
+        node,
+        (
+            ir.Const,
+            ir.MpField,
+            ir.TableLookup,
+            ir.RunConst,
+            ir.SumT,
+            ir.Unary,
+            ir.Binary,
+            ir.Where,
+            ir.Call,
+        ),
+    ):
+        return False
     if isinstance(node, ir.VarRead):
         return variables[node.name].has_time
     if isinstance(node, (ir.VarAt, ir.ScenAt)):
         return not isinstance(node.index, ir.Const)
-    return False
+    return True
 
 
 def _check_roles(graph: ir.Graph) -> None:

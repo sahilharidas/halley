@@ -692,25 +692,28 @@ def _first_failing_input(view: InputView, ids: NDArray[Any], ok: NDArray[np.bool
     it runs over the model points, ``for scenario 1, month -14 of scenario input cpi`` when it
     lines up with exactly one scenario input, else the element's position (also when the shape
     fits more than one input); with the count of failing values when the result has more than
-    one."""
+    one. A one-element result of a one-policy, one-scenario run fits the policy axis and every
+    scenario input's scenario axis alike; it names the policy."""
     if ok.ndim == 0:
         return ""
-    candidates: list[str] = []
+    tables: list[str] = []
     for name, table in view.tables.items():
         if _lines_up(ok, table.shape):
             key = _first_failing_key(table, ok).removeprefix(" at ")
-            candidates.append(f"at {key} of table {name}" if key else f"in table {name}")
-    if ok.shape == ids.shape:
-        candidates.append(f"for policy {ids[int(np.flatnonzero(~ok)[0])]}")
+            tables.append(f"at {key} of table {name}" if key else f"in table {name}")
+    policy = f"for policy {ids[int(np.flatnonzero(~ok)[0])]}" if ok.shape == ids.shape else None
+    scenarios: list[str] = []
     for name, scen in view.scenarios.items():
         row = _first_failing_row(scen, ok)
         if row:
-            candidates.append(f"{row.strip()} of scenario input {name}")
-    where = (
-        candidates[0]
-        if len(candidates) == 1
-        else f"at element {int(np.flatnonzero(~ok.reshape(-1))[0])} of the rule's result"
-    )
+            scenarios.append(f"{row.strip()} of scenario input {name}")
+    candidates = [*tables, *([policy] if policy else []), *scenarios]
+    if len(candidates) == 1:
+        where = candidates[0]
+    elif policy is not None and not tables and ok.size == 1:
+        where = policy
+    else:
+        where = f"at element {int(np.flatnonzero(~ok.reshape(-1))[0])} of the rule's result"
     if ok.size == 1:
         return f" {where}"
     return f" for {int((~ok).sum())} of {ok.size} values, first {where}"

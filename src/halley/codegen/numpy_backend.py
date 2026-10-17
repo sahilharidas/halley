@@ -192,6 +192,66 @@ _HELPERS: dict[str, object] = {
 }
 
 
+# ------------------------------------------------------------- what a value is at run time
+
+SCALAR = "scalar"
+"""A Python or NumPy scalar in the generated code: a literal, a run constant, ``t`` inside a
+recursive component, a lookup whose keys are all scalars, and arithmetic, comparisons or a
+ufunc over those alone (``np.exp(0.5)`` is a NumPy scalar)."""
+ZERO_D = "0-d"
+"""A 0-d array: a keyless table's value, or ``np.where`` over scalars (so ``to_monthly_cf`` of a
+scalar too). Arithmetic on it gives a scalar again; indexing a table with it gives a scalar."""
+ARRAY = "array"
+"""An array with at least one axis: a model point field, a variable, a scenario value, ``t``
+outside a recursive component, and anything built from one of those."""
+
+
+def value_kind(node: ir.Node, step: bool) -> str:
+    """What the generated code holds for ``node``: :data:`SCALAR`, :data:`ZERO_D` or
+    :data:`ARRAY`. ``step`` says whether the reader is a member of a recursive component, where
+    ``t`` is a Python int and a model point field is one row of the batch, or not, where ``t``
+    is the month column ``_t[first:last]``.
+
+    Nothing in the generator reads this; it is the contract the ``explain`` interpreter mirrors
+    for ``**``. NumPy's array power takes a fast path for the exponents 0.5, 2 and -1 (sqrt,
+    square, reciprocal) that differs from libm's pow in the last place, and takes it whenever
+    the base is an array, a 0-d one included, and the exponent a scalar or a 0-d array; a scalar
+    base goes through scalar power (libm's pow), and an array exponent through the plain power
+    loop (libm's pow element by element). Measured on NumPy 2.5 for every one of those forms.
+    """
+    if isinstance(node, (ir.Const, ir.RunConst)):
+        return SCALAR
+    if isinstance(node, ir.TimeIndex):
+        return SCALAR if step else ARRAY
+    if isinstance(node, ir.TableLookup):
+        if not node.keys:
+            return ZERO_D  # the dense array of a keyless table has no axis
+        kinds = [value_kind(k, step) for k in node.keys]
+        return ARRAY if ARRAY in kinds else SCALAR
+    if isinstance(node, ir.Unary):
+        return ARRAY if value_kind(node.a, step) == ARRAY else SCALAR
+    if isinstance(node, ir.Binary):
+        kinds = [value_kind(node.a, step), value_kind(node.b, step)]
+        return ARRAY if ARRAY in kinds else SCALAR
+    if isinstance(node, ir.Where):
+        kinds = [value_kind(n, step) for n in (node.cond, node.a, node.b)]
+        return ARRAY if ARRAY in kinds else ZERO_D  # np.where always returns an array
+    if isinstance(node, ir.Call):
+        kinds = [value_kind(a, step) for a in node.args]
+        if ARRAY in kinds:
+            return ARRAY
+        if node.fn == "as_cu":
+            return kinds[0]  # emitted as its argument
+        return ZERO_D if node.fn == "to_monthly_cf" else SCALAR  # to_monthly_cf is an np.where
+    return ARRAY  # VarRead, VarAt, SumT, MpField, ScenRead, ScenAt
+
+
+def backend_scalar(node: ir.Node, step: bool) -> bool:
+    """Whether the generated code holds ``node`` as a Python or NumPy scalar, so that ``node **
+    k`` there is libm's pow and never NumPy's array fast path (see :func:`value_kind`)."""
+    return value_kind(node, step) == SCALAR
+
+
 # ---------------------------------------------------------------------------- generation
 
 

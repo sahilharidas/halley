@@ -536,6 +536,47 @@ def test_rerun_is_bit_identical_d19(
         assert np.array_equal(arr, again.arrays[name]), name
 
 
+def test_two_scenarios_share_the_history_and_split_the_path(
+    compiled_annuity: dict[str, CompiledModel], run_cpi_alone: RunResult, runs_dir: Path
+) -> None:
+    """A stochastic run (D4): two CPI scenarios with identical history rows, 2.5% a year in the
+    first and 3.5% in the second, the discount curve the same in both. Every invariant passes
+    (I9 per scenario through ``a.scen``), scenario 0 is the deterministic run bit for bit,
+    ``onerous`` is per policy and scenario, and the monthly file carries both scenario ids."""
+
+    def cpi(s: int, u: int) -> float:
+        if u <= 0 or s == 0:
+            return data.cpi_path(u)
+        return data.CPI_BASE * 1.035 ** (u / 12)
+
+    res = run(
+        compiled_annuity["cpi"],
+        model_points=SPEC / "mp_cpi.parquet",
+        tables=TABLES,
+        scenarios={
+            "rf_df": data.discount_table(n_scenarios=2),
+            "cpi": data.cpi_table(cpi, n_scenarios=2),
+        },
+        settings=RunSettings(valuation_date=VALUATION_DATE),
+        run_dir=runs_dir / "two-scenarios",
+    )
+    assert res.n_scenarios == 2
+    assert res.H == run_cpi_alone.H
+    assert res.manifest["dimensions"]["scenarios"] == 2
+    assert all(r.passed for r in res.invariants)
+    assert [r.name for r in res.invariants] == [r.name for r in run_cpi_alone.invariants]
+    for name in OUTPUTS:
+        assert np.array_equal(res.var(name)[:, :, :1], run_cpi_alone.var(name)), name
+    bel = res.var("bel")
+    assert bel.shape == (res.H + 1, 1, 2)
+    assert bel[0, 0, 0] != bel[0, 0, 1]  # the faster CPI path raises the liability
+    assert bel[0, 0, 1] > bel[0, 0, 0]
+    assert res.arrays["onerous"].shape == (1, 1, 2)
+    monthly = pq.read_table(res.run_dir / "outputs" / "monthly.parquet")
+    assert sorted(set(monthly.column("scenario").to_pylist())) == [0, 1]
+    assert monthly.num_rows == 2 * (res.H + 1)
+
+
 def test_the_interpreter_agrees_with_the_generated_code(runs: dict[str, RunResult]) -> None:
     level, cpi = runs["level"], runs["cpi"]
     for name, t in (("bel", 0), ("q_mth", 7), ("df", 120), ("v_be", 100), ("ra", 0)):

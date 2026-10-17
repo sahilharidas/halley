@@ -11,9 +11,10 @@ import inspect
 import textwrap
 import typing
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from halley import ir
+from halley.authoring.contracts import InputRule, Invariant
 from halley.authoring.product import (
     BoundaryScope,
     ModelPoint,
@@ -36,10 +37,13 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
         isinstance(model, type) and issubclass(model, Product)  # pyright: ignore[reportUnnecessaryIsInstance]
     ):
         raise BuildError(f"{model!r} is not a Product subclass")
-    if vars(model).get("abstract", False):
+    # ``is True``: the flag is a bool; a @var named abstract is a VarDef, which the reserved-name
+    # check below reports at its definition
+    if vars(model).get("abstract") is True:
         raise BuildError(
             f"{model.__qualname__} is abstract (it sets abstract = True); build one of its "
-            "subclasses"
+            "subclasses",
+            _class_loc(model),
         )
     resolved = _resolve_statics(model, statics or {})
     var_defs = _collect_vars(model)
@@ -77,6 +81,8 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
                 f"tolerance_scales names {field_name!r}, which is not a model point field"
             )
         scales[unit_from_name(unit_name)] = field_name
+    _require_tuple_of(model, "invariants", Invariant)
+    _require_tuple_of(model, "input_rules", InputRule)
     invariant_reads: set[str] = set()
     for inv in model.invariants:
         for name in inv.reads:
@@ -101,6 +107,32 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
         outputs=outputs,
         scale_fields=scales,
         invariant_reads=frozenset(invariant_reads),
+    )
+
+
+def _class_loc(model: type) -> Loc | None:
+    """Where the class itself is defined, for an error about the class rather than a method."""
+    try:
+        file = inspect.getsourcefile(model)
+        _lines, line = inspect.getsourcelines(model)
+    except (OSError, TypeError):
+        return None
+    return None if file is None else Loc(file, line, model.__qualname__)
+
+
+def _require_tuple_of(model: type[Product], name: str, cls: type) -> None:
+    """``model.<name>`` is a tuple of ``cls``. The realistic slip is a one-element tuple written
+    without its comma, ``invariants = (Invariant(...))``, which arrives as the element itself
+    and would otherwise surface as a TypeError far from the class."""
+    value: object = getattr(model, name)
+    if isinstance(value, tuple):
+        items = cast(tuple[object, ...], value)  # the elements are checked one by one below
+        if all(isinstance(item, cls) for item in items):
+            return
+    raise BuildError(
+        f"{model.__qualname__}.{name} must be a tuple of {cls.__name__} (a one-element tuple "
+        "needs a trailing comma)",
+        _class_loc(model),
     )
 
 
