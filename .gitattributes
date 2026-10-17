@@ -1,3 +1,4 @@
 # ruff formats to LF; keep the repo LF regardless of core.autocrlf.
 * text=auto eol=lf
 *.parquet binary
+*.xlsx binary
