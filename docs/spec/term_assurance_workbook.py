@@ -7,25 +7,29 @@ is an Excel formula transcribing one formula of the specification, in its stated
 and computation form (powers where it says power, ratios of two curve cells, left-to-right
 subtraction, sums in ascending ``t``). No engine output, number script or other document is read
 and nothing is rounded. Python computes a policy's ``rem_m`` only to know how many rows to lay
-out; the ``inputs`` sheet recomputes it by formula and ``checks!rows_ok`` compares the two.
+out; the policy sheet recomputes it by formula and its ``rows_ok`` cell compares the two.
 
-Sheets written to ``docs/spec/term-assurance/term-assurance.xlsx``:
+Sheets written to ``docs/spec/term-assurance/term-assurance.xlsx``, in the layout that section 11
+of the specification fixes:
 
-``readme``        what each sheet and column is, with units and the spec sections.
-``inputs``        valuation date; basis constants, with ``i_m``, ``v_m`` and ``e_m`` by formula;
-                  the lapse and commission tables; the ten model points with their derived
-                  fields computed by formula from the dates (sections 4.3 and 5); and the
-                  mortality table of section 6.1 materialised for ages 18 to 120 and both sexes
-                  from the Gompertz-Makeham formula (the materialised-block option of section 11,
-                  looked up by INDEX/MATCH on ``(sex, age)``).
-``P01`` .. ``P10``  one sheet per policy: headers in row 1, one row per ``t = 0 .. rem_m``, one
-                  column per section 11.1 quantity in the section 7.1 order, then the row-level
-                  check cells of section 12, then the policy's constants linked from ``inputs``
-                  (sheet-scoped defined names point at that block, so formulas read as the spec).
-``scalars``       the section 11.2 scalars per policy and the section 11.3 scalar totals.
-``totals_t``      the section 11.3 portfolio totals by ``t`` over the batch horizon.
-``checks``        one boolean per section 12 invariant per policy, a per-policy ``ok`` and the
-                  ``all_ok`` cell (defined name ``all_ok``) with its label in the cell to its left.
+``readme``        what each sheet, block and column is, with units and the spec sections.
+``mortality``     the section 6.1 parameters and the mortality table materialised for ages 18 to
+                  120 and both sexes from the Gompertz-Makeham formula (the materialised-block
+                  option of section 11). The one block the policy sheets share: each ``q_ann``
+                  cell looks it up by INDEX/MATCH on ``(sex, age)``.
+``P01`` .. ``P10``  one sheet per policy, named by ``policy_id``, with these blocks from the top:
+                  the inputs of 3.1 (and the run-level ``valuation_date`` of 3.3), typed; the
+                  derived constants of 3.2 and 4.3 by formula; the basis constants of section 6
+                  with ``i_m``, ``v_m`` and ``e_m`` by formula; the lapse and commission tables;
+                  the monthly block of 7.1 and 11.1 (a header row, rows ``t = 0 .. rem_m``, one
+                  column per quantity in the 7.1 order, the row-level check cells of section 12
+                  to its right); the scalars of 11.2; the check cells of section 12 (the section
+                  1 scales, two helper sums, one ``<id>_ok`` per (sheet) invariant, ``rows_ok``
+                  and ``ok``). Sheet-scoped defined names point at the sheet's own cells, so the
+                  formulas read as the spec and a reviewer checks one sheet without leaving it.
+``summary``       the 11.2 scalars per policy and the 11.3 scalar totals (plain SUMs), the check
+                  cells per policy repeated by reference with ``all_ok`` (defined name
+                  ``all_ok``, labelled in the cell to its left), and the 11.3 totals by ``t``.
 
 Run from the repository root, then recalculate in Excel so the cached values exist:
 
@@ -66,12 +70,14 @@ BASIS: list[tuple[str, float | str, str, str]] = [
     ("A_F", 0.00015, "Gompertz-Makeham A, sex F", "6.1"),
     ("B_M", 0.000017, "Gompertz-Makeham B, sex M", "6.1"),
     ("B_F", 0.000011, "Gompertz-Makeham B, sex F", "6.1"),
-    ("c", 1.1, "Gompertz-Makeham c (both sexes)", "6.1"),
+    ("c", 1.1, "Gompertz-Makeham c (both sexes); defined name gm_c", "6.1"),
     ("maint_base", 5.00, "Money per policy, per month, time-0 prices", "6.5"),
     ("claim_exp_base", 250.00, "Money per policy (per death), time-0 prices", "6.5"),
 ]
 # Excel reserves the names R and C, so the spec's ``c`` is the defined name ``gm_c``.
 EXCEL_NAME = {"c": "gm_c"}
+# Section 6.1: the parameters the materialised mortality table is built from.
+MORT_PARAMS = [entry for entry in BASIS if entry[3] == "6.1"]
 
 # Section 6.2: annual lapse rate by clamped key k = min(dur_y, 5).
 LAPSE_TABLE = [0.15, 0.10, 0.08, 0.06, 0.05, 0.04]
@@ -97,7 +103,7 @@ class ModelPoint:
 
     @property
     def rem_m(self) -> int:
-        """Section 4.3 ``rem_m``, used only to size the policy sheet (see ``checks!rows_ok``)."""
+        """Section 4.3 ``rem_m``, used only to size the policy sheet (see its ``rows_ok`` cell)."""
         term_m = months_between(self.entry_date, self.maturity_date)
         dur_m = months_between(self.entry_date, VALUATION_DATE)
         return term_m - dur_m
@@ -136,29 +142,74 @@ MODEL_POINTS = [
 # Layout constants.
 # ----------------------------------------------------------------------------------------------
 
-# inputs sheet: fixed rows of each block.
-VALUATION_ROW = 2
-BASIS_FIRST_ROW = 5
-LAPSE_HEADER_ROW = 19
-COMM_HEADER_ROW = 28
-MP_HEADER_ROW = 33
-MP_FIRST_ROW = 34
-MORT_HEADER_ROW = 46
-MORT_FIRST_ROW = 47
-
-# inputs sheet: model point columns, inputs (3.1) then derived fields (3.2) in that order.
+# Policy sheet, the blocks above the monthly block: the same rows on every sheet. Column A holds
+# the label (and ``t`` in the monthly block), B the value, C the spec section, D the unit.
 MP_INPUT_FIELDS = [
     "policy_id", "sex", "birth_date", "entry_date", "maturity_date", "prem_term_y",
     "sum_assured", "premium", "pols_if_init",
 ]  # fmt: skip
-MP_DERIVED_FIELDS = [
-    "age_at_entry", "dur_m", "term_m", "rem_m", "prem_term_m", "prem_rem_m", "dur_y_last",
-]  # fmt: skip
-MP_COL = {
-    name: get_column_letter(k + 1) for k, name in enumerate(MP_INPUT_FIELDS + MP_DERIVED_FIELDS)
+INPUT_FIELDS = ["valuation_date", *MP_INPUT_FIELDS]
+INPUT_META: dict[str, tuple[str, str]] = {  # section, unit
+    "valuation_date": ("3.3", "Date, first of a month (run-level input)"),
+    "policy_id": ("3.1", "string"),
+    "sex": ("3.1", "string, M or F"),
+    "birth_date": ("3.1", "Date"),
+    "entry_date": ("3.1", "Date"),
+    "maturity_date": ("3.1", "Date"),
+    "prem_term_y": ("3.1", "Int (years)"),
+    "sum_assured": ("3.1", "Money per policy"),
+    "premium": ("3.1", "Money per policy, monthly, in advance"),
+    "pols_if_init": ("3.1", "Count"),
 }
+# Section 3.2 derived fields: (symbol, formula on the inputs above, section, unit). Section 5's
+# age last birthday compares (month, day) lexicographically; section 4.2's months_between is
+# applied as section 4.3 says.
+DERIVED: list[tuple[str, str, str, str]] = [
+    (
+        "age_at_entry",
+        "=YEAR(entry_date)-YEAR(birth_date)"
+        "-IF(OR(MONTH(entry_date)<MONTH(birth_date),"
+        "AND(MONTH(entry_date)=MONTH(birth_date),DAY(entry_date)<DAY(birth_date))),1,0)",
+        "5",
+        "Int (years)",
+    ),
+    (
+        "dur_m",
+        "=12*(YEAR(valuation_date)-YEAR(entry_date))+(MONTH(valuation_date)-MONTH(entry_date))"
+        "-IF(DAY(valuation_date)<DAY(entry_date),1,0)",
+        "4.3",
+        "Int (months)",
+    ),
+    (
+        "term_m",
+        "=12*(YEAR(maturity_date)-YEAR(entry_date))+(MONTH(maturity_date)-MONTH(entry_date))"
+        "-IF(DAY(maturity_date)<DAY(entry_date),1,0)",
+        "4.3",
+        "Int (months)",
+    ),
+    ("rem_m", "=term_m-dur_m", "4.3", "Int (months)"),
+    ("prem_term_m", "=12*prem_term_y", "4.3", "Int (months)"),
+    ("prem_rem_m", "=MAX(prem_term_m-dur_m,0)", "4.3", "Int (months)"),
+    ("dur_y_last", "=INT((term_m-1)/12)", "4.3", "Int (years)"),
+]
+MP_DERIVED_FIELDS = [name for name, _, _, _ in DERIVED]
+DERIVED_META = {name: (section, unit) for name, _, section, unit in DERIVED}
 
-# Policy sheet: the section 11.1 columns in the section 7.1 evaluation order, with units.
+INPUT_TITLE_ROW = 1
+INPUT_FIRST_ROW = INPUT_TITLE_ROW + 1
+DERIVED_TITLE_ROW = INPUT_FIRST_ROW + len(INPUT_FIELDS) + 1
+DERIVED_FIRST_ROW = DERIVED_TITLE_ROW + 1
+BASIS_TITLE_ROW = DERIVED_FIRST_ROW + len(DERIVED) + 1
+BASIS_FIRST_ROW = BASIS_TITLE_ROW + 1
+LAPSE_TITLE_ROW = BASIS_FIRST_ROW + len(BASIS) + 1
+LAPSE_HEADER_ROW = LAPSE_TITLE_ROW + 1
+COMM_TITLE_ROW = LAPSE_HEADER_ROW + len(LAPSE_TABLE) + 2
+COMM_HEADER_ROW = COMM_TITLE_ROW + 1
+MONTH_TITLE_ROW = COMM_HEADER_ROW + len(COMM_TABLE) + 2
+MONTH_HEADER_ROW = MONTH_TITLE_ROW + 1
+MONTH_FIRST_ROW = MONTH_HEADER_ROW + 1  # the row of t = 0; the row of t is MONTH_FIRST_ROW + t
+
+# Policy sheet, monthly block: the section 11.1 columns in the section 7.1 evaluation order.
 QUANTITIES: list[tuple[str, str, str]] = [
     ("t", "Int", "4.1"),
     ("dur_y", "Int", "5"),
@@ -197,7 +248,7 @@ QUANTITIES: list[tuple[str, str, str]] = [
     ("reserve_floored", "Money (state)", "10.5"),
 ]
 
-# Policy sheet: row-level check cells of section 12, after one blank column.
+# Policy sheet, monthly block: the row-level check cells of section 12, after one blank column.
 ROW_CHECKS: list[tuple[str, str]] = [
     ("H1", "pols_if >= 0 and non-increasing, exactly (t = 0 .. rem_m)"),
     (
@@ -218,28 +269,28 @@ ROW_CHECKS: list[tuple[str, str]] = [
     ("P10", "unit identities, exactly"),
 ]
 FIRST_CHECK_COL = len(QUANTITIES) + 2  # one blank column after the quantities
+LAST_COL = FIRST_CHECK_COL + len(ROW_CHECKS) - 1
 COL = {name: get_column_letter(k + 1) for k, (name, _, _) in enumerate(QUANTITIES)}
 COL.update({name: get_column_letter(FIRST_CHECK_COL + k) for k, (name, _) in enumerate(ROW_CHECKS)})
 
-# Policy sheet: the constants block (labels and values), after one more blank column.
-CONST_LABEL_COL = get_column_letter(FIRST_CHECK_COL + len(ROW_CHECKS) + 1)
-CONST_VALUE_COL = get_column_letter(FIRST_CHECK_COL + len(ROW_CHECKS) + 2)
-CONST_FIELDS = MP_INPUT_FIELDS + MP_DERIVED_FIELDS
-# Section 1 scales, from the policy's own sum_assured and pols_if_init cells.
-SCALES = [
-    ("scale_money", "=sum_assured*pols_if_init", "Money (in-force) scale"),
-    ("scale_pp", "=sum_assured", "Money per policy scale"),
-    ("scale_count", "=pols_if_init", "Count scale"),
-]
-
-# scalars sheet columns (section 11.2).
-SCALAR_COLUMNS = [
-    "policy_id", "age_at_entry", "dur_m", "term_m", "rem_m", "prem_term_m", "prem_rem_m",
-    "dur_y_last", "pv_premiums", "pv_commission", "pv_maint_expense", "pv_death_outgo",
+# Policy sheet, scalars block (section 11.2): the derived constants again, then Money and Count.
+SCALAR_FIELDS = [
+    *MP_DERIVED_FIELDS, "pv_premiums", "pv_commission", "pv_maint_expense", "pv_death_outgo",
     "pv_claim_expense", "pv_net_cf", "reserve_0", "reserve_pp_0", "reserve_floored_0",
     "maturities_n",
 ]  # fmt: skip
-SCOL = {name: get_column_letter(k + 1) for k, name in enumerate(SCALAR_COLUMNS)}
+SCALAR_META: dict[str, tuple[str, str]] = {  # section, unit, for the Money and Count scalars
+    "pv_premiums": ("9.3", "Money"),
+    "pv_commission": ("9.3", "Money"),
+    "pv_maint_expense": ("9.3", "Money"),
+    "pv_death_outgo": ("9.3", "Money"),
+    "pv_claim_expense": ("9.3", "Money"),
+    "pv_net_cf": ("9.3", "Money"),
+    "reserve_0": ("10.2", "Money: reserve(0)"),
+    "reserve_pp_0": ("10.4", "Money per policy: reserve_pp(0)"),
+    "reserve_floored_0": ("10.5", "Money: reserve_floored(0)"),
+    "maturities_n": ("7.3", "Count: maturities(rem_m), the survivors to the end of the term"),
+}
 PV_SUMS = {
     "pv_premiums": "pv_premiums_t",
     "pv_commission": "pv_commission_t",
@@ -252,40 +303,122 @@ SCALAR_TOTALS = [
     "pv_net_cf", "reserve_0", "reserve_floored_0",
 ]  # fmt: skip
 
-# totals_t sheet: the Money and Count monthly columns of 11.1 (per-policy Money is not summed).
-STATE_TOTALS = ["pols_if", "reserve", "reserve_floored"]
-MONTH_TOTALS = [
-    "deaths", "lapses", "maturities", "premium_income", "commission", "maint_expense",
-    "death_outgo", "claim_expense", "net_cf", "net_outgo", "pv_net_cf_t", "pv_premiums_t",
-    "pv_commission_t", "pv_maint_expense_t", "pv_death_outgo_t", "pv_claim_expense_t",
+# Policy sheet, check block (section 12): the section 1 scales and two helper sums, each in one
+# named cell, then one ``<id>_ok`` per (sheet) invariant, ``rows_ok`` and ``ok``.
+CHECK_HELPERS: dict[str, str] = {
+    "scale_money": "Money (in-force) scale of section 1: sum_assured * pols_if_init",
+    "scale_pp": "Money per policy scale of section 1: sum_assured",
+    "scale_count": "Count scale of section 1: pols_if_init",
+    "exits_sum": "helper (P8): sum over t = 1 .. rem_m of deaths + lapses + maturities",
+    "pv_net_cf_t_sum": "helper (P9): sum over t = 1 .. rem_m of pv_net_cf_t",
+}
+SHEET_INVARIANTS = [
+    "H1", "H2", "H3", "H4", "H5a", "H5b", "P1", "P2", "P3", "P4", "P5", "P6", "P8", "P9", "P10",
 ]  # fmt: skip
+OK_CELLS = [f"{inv}_ok" for inv in SHEET_INVARIANTS] + ["rows_ok", "ok"]
+OK_MEANING: dict[str, str] = {
+    "H1_ok": "every H1 row cell (t = 0 .. rem_m)",
+    "H2_ok": "every H2 row cell (t = 1 .. rem_m)",
+    "H3_ok": "reserve(rem_m) = 0 and pols_if(rem_m) = 0, exactly",
+    "H4_ok": "every H4 row cell (t = 1 .. rem_m)",
+    "H5a_ok": "reserve(0) equals -pv_net_cf within tolerance (scale_money)",
+    "H5b_ok": "every H5b row cell (t = 0 .. rem_m - 1)",
+    "P1_ok": "every P1 row cell (t = 1 .. rem_m)",
+    "P2_ok": "every P2 row cell (t = 1 .. rem_m)",
+    "P3_ok": "the number of months with premium_pp <> 0 equals prem_rem_m",
+    "P4_ok": "every P4 row cell (t = 1 .. rem_m)",
+    "P5_ok": "every P5 row cell (t = 0 .. rem_m - 1)",
+    "P6_ok": "every P6 row cell (t = 0 .. rem_m)",
+    "P8_ok": "exits_sum equals pols_if_init within tolerance (scale_count)",
+    "P9_ok": "pv_net_cf equals pv_net_cf_t_sum within tolerance (scale_money)",
+    "P10_ok": "every P10 row cell (t = 1 .. rem_m)",
+    "rows_ok": "layout: the last t of the monthly block equals the formula-derived rem_m",
+    "ok": "every cell above",
+}
+
+# summary sheet: the three blocks, top to bottom.
+SUMMARY_SCALAR_COLUMNS = ["policy_id", *SCALAR_FIELDS]
+SCOL = {name: get_column_letter(k + 1) for k, name in enumerate(SUMMARY_SCALAR_COLUMNS)}
+SUMMARY_CHECK_COLUMNS = ["policy_id", *OK_CELLS]
+CCOL = {name: get_column_letter(k + 1) for k, name in enumerate(SUMMARY_CHECK_COLUMNS)}
+# The Money and Count monthly columns of 11.1 (per-policy Money is not summed).
+STATE_TOTALS = ["pols_if", "reserve", "reserve_floored"]
 TOTAL_COLUMNS = [
     "deaths", "lapses", "maturities", "pols_if", "premium_income", "commission",
     "maint_expense", "death_outgo", "claim_expense", "net_cf", "net_outgo", "pv_net_cf_t",
     "pv_premiums_t", "pv_commission_t", "pv_maint_expense_t", "pv_death_outgo_t",
     "pv_claim_expense_t", "reserve", "reserve_floored",
 ]  # fmt: skip
+TCOL = {name: get_column_letter(k + 2) for k, name in enumerate(TOTAL_COLUMNS)}
 
-# checks sheet columns: the section 12 invariants the sheet can hold, a layout check, the
-# per-policy ``ok``, then helper scalars.
-CHECK_COLUMNS = [
-    "policy_id", "H1", "H2", "H3", "H4", "H5a", "H5b", "P1", "P2", "P3", "P4", "P5", "P6",
-    "P8", "P9", "P10", "rows_ok", "ok", "", "exits_sum", "pv_net_cf_t_sum", "scale_money",
-    "scale_count",
-]  # fmt: skip
-CCOL = {name: get_column_letter(k + 1) for k, name in enumerate(CHECK_COLUMNS) if name}
+SUMMARY_SCALAR_TITLE_ROW = 1
+SUMMARY_SCALAR_HEADER_ROW = SUMMARY_SCALAR_TITLE_ROW + 1
+SUMMARY_SCALAR_FIRST_ROW = SUMMARY_SCALAR_HEADER_ROW + 1
+SUMMARY_TOTAL_ROW = SUMMARY_SCALAR_FIRST_ROW + len(MODEL_POINTS)
+SUMMARY_CHECK_TITLE_ROW = SUMMARY_TOTAL_ROW + 2
+SUMMARY_CHECK_HEADER_ROW = SUMMARY_CHECK_TITLE_ROW + 1
+SUMMARY_CHECK_FIRST_ROW = SUMMARY_CHECK_HEADER_ROW + 1
+SUMMARY_ALL_OK_ROW = SUMMARY_CHECK_FIRST_ROW + len(MODEL_POINTS) + 1
+SUMMARY_TOTALS_T_TITLE_ROW = SUMMARY_ALL_OK_ROW + 2
+SUMMARY_TOTALS_T_HEADER_ROW = SUMMARY_TOTALS_T_TITLE_ROW + 1
+SUMMARY_TOTALS_T_FIRST_ROW = SUMMARY_TOTALS_T_HEADER_ROW + 1
+
+# mortality sheet: the 6.1 parameters, then the table.
+MORT_PARAM_FIRST_ROW = 2
+MORT_TITLE_ROW = MORT_PARAM_FIRST_ROW + len(MORT_PARAMS) + 1
+MORT_HEADER_ROW = MORT_TITLE_ROW + 1
+MORT_FIRST_ROW = MORT_HEADER_ROW + 1
 
 BOLD = Font(bold=True)
 
 
-class Row:
-    """Cell addresses of one row of a policy sheet by spec symbol: ``Row(3).q_m == "E3"``."""
+@dataclass(frozen=True)
+class Blocks:
+    """Rows of the blocks of one policy sheet that follow its monthly block, from its ``rem_m``."""
 
-    def __init__(self, r: int) -> None:
-        self.r = r
+    rem_m: int
+
+    @property
+    def last(self) -> int:
+        """The row of ``t = rem_m``, the last row of the monthly block."""
+        return MONTH_FIRST_ROW + self.rem_m
+
+    @property
+    def scalar_title(self) -> int:
+        return self.last + 2
+
+    def scalar_row(self, name: str) -> int:
+        return self.scalar_title + 1 + SCALAR_FIELDS.index(name)
+
+    @property
+    def check_title(self) -> int:
+        return self.scalar_title + len(SCALAR_FIELDS) + 2
+
+    def helper_row(self, name: str) -> int:
+        return self.check_title + 1 + list(CHECK_HELPERS).index(name)
+
+    def ok_row(self, name: str) -> int:
+        return self.check_title + len(CHECK_HELPERS) + 2 + OK_CELLS.index(name)
+
+
+class Row:
+    """Cell addresses of row ``t`` of the monthly block by spec symbol: ``Row(1).q_m == "E53"``."""
+
+    def __init__(self, t: int) -> None:
+        self.r = MONTH_FIRST_ROW + t
 
     def __getattr__(self, name: str) -> str:
         return f"{COL[name]}{self.r}"
+
+
+def cell_at(name: str, t: int) -> str:
+    """Absolute same-sheet address of monthly column ``name`` in row ``t``."""
+    return f"${COL[name]}${MONTH_FIRST_ROW + t}"
+
+
+def column_range(name: str, first: int, last: int) -> str:
+    """Absolute same-sheet range of monthly column ``name`` over rows ``t = first .. last``."""
+    return f"{cell_at(name, first)}:{cell_at(name, last)}"
 
 
 def define(wb: openpyxl.Workbook, name: str, ref: str) -> None:
@@ -298,9 +431,9 @@ def define_local(ws: Worksheet, name: str, ref: str) -> None:
     ws.defined_names[name] = DefinedName(name, attr_text=ref)
 
 
-def rng(sheet: str, name: str, first: int, last: int) -> str:
-    """Absolute range of column ``name`` on ``sheet`` from row ``first`` to row ``last``."""
-    return f"{sheet}!${COL[name]}${first}:${COL[name]}${last}"
+def title(ws: Worksheet, row: int, text: str) -> None:
+    ws[f"A{row}"] = text
+    ws[f"A{row}"].font = BOLD
 
 
 def set_widths(ws: Worksheet, width: float, upto: int) -> None:
@@ -315,118 +448,132 @@ def set_widths(ws: Worksheet, width: float, upto: int) -> None:
 
 def write_readme(wb: openpyxl.Workbook) -> None:
     ws = wb.active
+    assert ws is not None
     ws.title = "readme"
+    b0 = Blocks(0)  # the rows after the monthly block, for a policy with rem_m = 0
     lines = [
         "Halley term assurance: reference workbook for docs/spec/term-assurance.md (version 0.1).",
         "Built from the specification alone: typed cells are its reference inputs (sections 3.3,"
         " 6, 13); every other cell is a formula transcribing one formula of the spec.",
         "",
         "Sheets",
-        "inputs: valuation date, basis constants, lapse and commission tables, model points with"
-        " derived fields by formula, mortality table materialised from the 6.1 formula.",
-        "P01 .. P10: one sheet per policy, headers in row 1, one row per t = 0 .. rem_m, one"
-        " column per 11.1 quantity in the 7.1 order; row checks of section 12 to the right;"
-        " then the policy's constants linked from inputs (sheet-scoped names point at them).",
-        "scalars: section 11.2 scalars per policy (pv sums over t = 1 .. rem_m) and the"
-        " section 11.3 scalar totals in the row labelled total.",
-        "totals_t: section 11.3 totals by t = 0 .. H over the ten policies, policies beyond"
-        " their own rem_m read as zero.",
-        "checks: one boolean per section 12 invariant per policy, rows_ok (the sheet's row count"
-        " equals the formula-derived rem_m), ok per policy, and all_ok.",
+        "mortality: the 6.1 parameters A and B by sex and c, and the mortality table q_ann(sex, x)"
+        " materialised for ages 18 to 120 from the 6.1 formula in its stated order (section 11,"
+        " materialised-block option). The one block shared by the policy sheets: each q_ann cell"
+        " looks it up by INDEX/MATCH on (sex, age).",
+        "P01 .. P10: one sheet per policy, named by policy_id, with the section 11 blocks in order"
+        " from the top: inputs (3.1, plus the run-level valuation_date of 3.3), typed; derived"
+        " constants (3.2, 4.3, 5) by formula; basis constants (6) with i_m, v_m, e_m by formula;"
+        " lapse table (6.2); commission table (6.6); the monthly block (7.1, 11.1) with a header"
+        " row and rows t = 0 .. rem_m, the row checks of section 12 to its right; scalars (11.2);"
+        " check cells (12). Every formula reads this sheet's own cells, through sheet-scoped"
+        " defined names (sex, premium, rem_m, i_m, lapse_table, scale_money, ...) or same-sheet"
+        " absolute references, except the q_ann lookup on mortality.",
+        "summary: the 11.2 scalars per policy by reference, the 11.3 scalar totals in the row"
+        " labelled total (plain SUMs in ascending policy_id order), the <id>_ok cells per policy"
+        " by reference with ok per policy and all_ok (defined name all_ok), and the 11.3 totals"
+        " by t = 0 .. 480 over the ten policies, policies beyond their own rem_m read as zero.",
         "",
         "Conventions",
-        "q_ann is looked up from the materialised (sex, age, q_ann) block on inputs, ages 18 to"
-        " 120, each cell the section 6.1 formula in its stated order (section 11 option 2).",
+        "q_ann is looked up from the materialised (sex, age, q_ann) block on mortality, ages 18 to"
+        " 120, each cell the section 6.1 formula in its stated order (section 11 option 2); the"
+        " 6.1 parameters are typed on mortality (the table reads them) and on every policy sheet"
+        " (the basis block of section 11).",
         "Row t = 0 holds the state variables only (pols_if, infl, disc, reserve, reserve_pp,"
         " reserve_floored); month quantities are blank there (section 4.1).",
         "Tolerance (section 1): |a - b| <= 1e-9 * max(|a|, |b|, scale); inequalities use"
-        " a <= b + 1e-9 * scale; 'exactly' is a plain = comparison.",
+        " a <= b + 1e-9 * scale; 'exactly' is a plain = comparison. The scales are the check"
+        " block's scale_money, scale_pp and scale_count, from the sheet's own inputs.",
         "P7 and P11 are engine-only (rows beyond rem_m, batch independence) and have no cell.",
         "The spec's c is the defined name gm_c because Excel reserves the names R and C.",
+        "rows_ok on a policy sheet compares the last t of the monthly block (laid out by the"
+        " builder) with the formula-derived rem_m; it is a layout check, not a spec invariant.",
         "",
-        "Policy sheet columns (symbol, unit, spec section)",
+        "Policy sheet blocks (block, rows; column A label or t, B value, C section, D unit)",
+    ]
+    blocks = [
+        (
+            "inputs (3.1, 3.3), typed",
+            f"{INPUT_FIRST_ROW} to {INPUT_FIRST_ROW + len(INPUT_FIELDS) - 1}",
+        ),
+        (
+            "derived constants (3.2, 4.3, 5), by formula",
+            f"{DERIVED_FIRST_ROW} to {DERIVED_FIRST_ROW + len(DERIVED) - 1}",
+        ),
+        (
+            "basis constants (6), i_m, v_m, e_m by formula",
+            f"{BASIS_FIRST_ROW} to {BASIS_FIRST_ROW + len(BASIS) - 1}",
+        ),
+        ("lapse table (6.2)", f"{LAPSE_HEADER_ROW + 1} to {LAPSE_HEADER_ROW + len(LAPSE_TABLE)}"),
+        ("commission table (6.6)", f"{COMM_HEADER_ROW + 1} to {COMM_HEADER_ROW + len(COMM_TABLE)}"),
+        (
+            "monthly block (7.1, 11.1) and row checks (12)",
+            f"header {MONTH_HEADER_ROW}; row of t is {MONTH_FIRST_ROW} + t",
+        ),
+        ("scalars (11.2)", f"from {b0.scalar_row(SCALAR_FIELDS[0])} + rem_m"),
+        (
+            "check cells (12): scales and helpers, then <id>_ok, rows_ok, ok",
+            f"from {b0.helper_row('scale_money')} + rem_m; <id>_ok from"
+            f" {b0.ok_row(OK_CELLS[0])} + rem_m",
+        ),
     ]
     for k, line in enumerate(lines, start=1):
         ws.cell(row=k, column=1, value=line)
     row = len(lines) + 1
+    for name, rows in blocks:
+        ws.cell(row=row, column=1, value=name)
+        ws.cell(row=row, column=2, value=rows)
+        row += 1
+    row += 1
+    ws.cell(row=row, column=1, value="Policy sheet monthly columns (symbol, unit, spec section)")
+    row += 1
     for name, unit, section in QUANTITIES:
         ws.cell(row=row, column=1, value=name)
         ws.cell(row=row, column=2, value=unit)
         ws.cell(row=row, column=3, value=section)
         row += 1
     row += 1
-    ws.cell(row=row, column=1, value="Policy sheet check columns (section 12)")
+    ws.cell(row=row, column=1, value="Policy sheet row check columns (section 12)")
     row += 1
     for name, meaning in ROW_CHECKS:
         ws.cell(row=row, column=1, value=name)
         ws.cell(row=row, column=2, value=meaning)
         row += 1
-    ws.column_dimensions["A"].width = 24
+    row += 1
+    ws.cell(row=row, column=1, value="Policy sheet check cells (section 12), repeated on summary")
+    row += 1
+    for name in OK_CELLS:
+        ws.cell(row=row, column=1, value=name)
+        ws.cell(row=row, column=2, value=OK_MEANING[name])
+        row += 1
+    ws.column_dimensions["A"].width = 48
     ws.column_dimensions["B"].width = 60
 
 
 # ----------------------------------------------------------------------------------------------
-# inputs
+# mortality: the shared materialised table of section 6.1
 # ----------------------------------------------------------------------------------------------
 
 
-def write_inputs(wb: openpyxl.Workbook) -> None:
-    ws = wb.create_sheet("inputs")
-
-    ws["A1"] = "Run settings (section 3.3)"
-    ws["A1"].font = BOLD
-    ws[f"A{VALUATION_ROW}"] = "valuation_date"
-    ws[f"B{VALUATION_ROW}"] = VALUATION_DATE
-    ws[f"B{VALUATION_ROW}"].number_format = "yyyy-mm-dd"
-    ws[f"C{VALUATION_ROW}"] = "Date, first of a month"
-    define(wb, "valuation_date", f"inputs!$B${VALUATION_ROW}")
-
-    ws["A4"] = "Basis constants (section 6), each in one cell"
-    ws["A4"].font = BOLD
-    for k, (symbol, value, unit, section) in enumerate(BASIS):
-        row = BASIS_FIRST_ROW + k
+def write_mortality(wb: openpyxl.Workbook) -> None:
+    ws = wb.create_sheet("mortality")
+    title(
+        ws, 1, "Mortality parameters (section 6.1), each in one cell: the table below reads these"
+    )
+    for k, (symbol, value, unit, section) in enumerate(MORT_PARAMS):
+        row = MORT_PARAM_FIRST_ROW + k
         ws[f"A{row}"] = symbol
         ws[f"B{row}"] = value
-        ws[f"C{row}"] = unit
-        ws[f"D{row}"] = section
-        define(wb, EXCEL_NAME.get(symbol, symbol), f"inputs!$B${row}")
+        ws[f"C{row}"] = section
+        ws[f"D{row}"] = unit
+        define_local(ws, EXCEL_NAME.get(symbol, symbol), f"{ws.title}!$B${row}")
 
-    ws[f"A{LAPSE_HEADER_ROW - 1}"] = "Lapse table (section 6.2): key k = min(dur_y, 5)"
-    ws[f"A{LAPSE_HEADER_ROW - 1}"].font = BOLD
-    ws[f"A{LAPSE_HEADER_ROW}"] = "k"
-    ws[f"B{LAPSE_HEADER_ROW}"] = "lapse_table"
-    for k, w_ann in enumerate(LAPSE_TABLE):
-        ws[f"A{LAPSE_HEADER_ROW + 1 + k}"] = k
-        ws[f"B{LAPSE_HEADER_ROW + 1 + k}"] = w_ann
-    first, last = LAPSE_HEADER_ROW + 1, LAPSE_HEADER_ROW + len(LAPSE_TABLE)
-    define(wb, "lapse_key", f"inputs!$A${first}:$A${last}")
-    define(wb, "lapse_table", f"inputs!$B${first}:$B${last}")
-
-    ws[f"A{COMM_HEADER_ROW - 1}"] = "Commission table (section 6.6): key k = min(dur_y, 1)"
-    ws[f"A{COMM_HEADER_ROW - 1}"].font = BOLD
-    ws[f"A{COMM_HEADER_ROW}"] = "k"
-    ws[f"B{COMM_HEADER_ROW}"] = "comm_table"
-    for k, rate in enumerate(COMM_TABLE):
-        ws[f"A{COMM_HEADER_ROW + 1 + k}"] = k
-        ws[f"B{COMM_HEADER_ROW + 1 + k}"] = rate
-    first, last = COMM_HEADER_ROW + 1, COMM_HEADER_ROW + len(COMM_TABLE)
-    define(wb, "comm_key", f"inputs!$A${first}:$A${last}")
-    define(wb, "comm_table", f"inputs!$B${first}:$B${last}")
-
-    ws[f"A{MP_HEADER_ROW - 1}"] = (
-        "Model points (section 13) and derived fields by formula (sections 4.3 and 5)"
+    title(
+        ws,
+        MORT_TITLE_ROW,
+        "Mortality table q_ann(sex, x) (section 6.1): 1 - exp(-(A + B * c^x * (c - 1) / ln(c))),"
+        " ages 18 to 120; shared by every policy sheet, which looks it up by (sex, age)",
     )
-    ws[f"A{MP_HEADER_ROW - 1}"].font = BOLD
-    for name in MP_INPUT_FIELDS + MP_DERIVED_FIELDS:
-        ws[f"{MP_COL[name]}{MP_HEADER_ROW}"] = name
-        ws[f"{MP_COL[name]}{MP_HEADER_ROW}"].font = BOLD
-    for k, mp in enumerate(MODEL_POINTS):
-        write_model_point(ws, mp, MP_FIRST_ROW + k)
-
-    ws[f"A{MORT_HEADER_ROW - 1}"] = (
-        "Mortality table q_ann(sex, x) (section 6.1): 1 - exp(-(A + B * c^x * (c - 1) / ln(c)))"
-    )
-    ws[f"A{MORT_HEADER_ROW - 1}"].font = BOLD
     ws[f"A{MORT_HEADER_ROW}"] = "x"
     ws[f"B{MORT_HEADER_ROW}"] = "M"
     ws[f"C{MORT_HEADER_ROW}"] = "F"
@@ -436,45 +583,10 @@ def write_inputs(wb: openpyxl.Workbook) -> None:
         ws[f"B{row}"] = f"=1-EXP(-(A_M+B_M*gm_c^$A{row}*(gm_c-1)/LN(gm_c)))"
         ws[f"C{row}"] = f"=1-EXP(-(A_F+B_F*gm_c^$A{row}*(gm_c-1)/LN(gm_c)))"
     last = MORT_FIRST_ROW + len(MORT_AGES) - 1
-    define(wb, "mort_age", f"inputs!$A${MORT_FIRST_ROW}:$A${last}")
-    define(wb, "mort_sex", f"inputs!$B${MORT_HEADER_ROW}:$C${MORT_HEADER_ROW}")
-    define(wb, "mort_table", f"inputs!$B${MORT_FIRST_ROW}:$C${last}")
-
-    set_widths(ws, 14, len(MP_COL))
-    ws.column_dimensions["A"].width = 16
-
-
-def write_model_point(ws: Worksheet, mp: ModelPoint, row: int) -> None:
-    """One model point row: the 3.1 inputs typed, the 3.2 derived fields by formula."""
-    for name in MP_INPUT_FIELDS:
-        cell = ws[f"{MP_COL[name]}{row}"]
-        cell.value = getattr(mp, name)
-        if isinstance(cell.value, dt.date):
-            cell.number_format = "yyyy-mm-dd"
-    birth, entry, mat = (f"{MP_COL[f]}{row}" for f in ("birth_date", "entry_date", "maturity_date"))
-    prem_term_y = f"{MP_COL['prem_term_y']}{row}"
-    dur_m, term_m = f"{MP_COL['dur_m']}{row}", f"{MP_COL['term_m']}{row}"
-    prem_term_m = f"{MP_COL['prem_term_m']}{row}"
-    val = "valuation_date"
-    # Section 5: age last birthday at entry, lexicographic (month, day) comparison.
-    ws[f"{MP_COL['age_at_entry']}{row}"] = (
-        f"=YEAR({entry})-YEAR({birth})"
-        f"-IF(OR(MONTH({entry})<MONTH({birth}),"
-        f"AND(MONTH({entry})=MONTH({birth}),DAY({entry})<DAY({birth}))),1,0)"
-    )
-    # Section 4.2 months_between, applied as section 4.3 says.
-    ws[dur_m] = (
-        f"=12*(YEAR({val})-YEAR({entry}))+(MONTH({val})-MONTH({entry}))"
-        f"-IF(DAY({val})<DAY({entry}),1,0)"
-    )
-    ws[term_m] = (
-        f"=12*(YEAR({mat})-YEAR({entry}))+(MONTH({mat})-MONTH({entry}))"
-        f"-IF(DAY({mat})<DAY({entry}),1,0)"
-    )
-    ws[f"{MP_COL['rem_m']}{row}"] = f"={term_m}-{dur_m}"
-    ws[prem_term_m] = f"=12*{prem_term_y}"
-    ws[f"{MP_COL['prem_rem_m']}{row}"] = f"=MAX({prem_term_m}-{dur_m},0)"
-    ws[f"{MP_COL['dur_y_last']}{row}"] = f"=INT(({term_m}-1)/12)"
+    define(wb, "mort_age", f"{ws.title}!$A${MORT_FIRST_ROW}:$A${last}")
+    define(wb, "mort_sex", f"{ws.title}!$B${MORT_HEADER_ROW}:$C${MORT_HEADER_ROW}")
+    define(wb, "mort_table", f"{ws.title}!$B${MORT_FIRST_ROW}:$C${last}")
+    set_widths(ws, 16, 4)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -482,53 +594,110 @@ def write_model_point(ws: Worksheet, mp: ModelPoint, row: int) -> None:
 # ----------------------------------------------------------------------------------------------
 
 
-def write_policy(wb: openpyxl.Workbook, mp: ModelPoint, mp_row: int) -> None:
+def write_policy(wb: openpyxl.Workbook, mp: ModelPoint) -> None:
     ws = wb.create_sheet(mp.policy_id)
-    for name, _, _ in QUANTITIES:
-        ws[f"{COL[name]}1"] = name
-        ws[f"{COL[name]}1"].font = BOLD
-    for name, _ in ROW_CHECKS:
-        ws[f"{COL[name]}1"] = name
-        ws[f"{COL[name]}1"].font = BOLD
-    write_constants_block(ws, mp_row)
-    last = mp.rem_m + 2
-    for t in range(mp.rem_m + 1):
-        write_policy_row(ws, t, mp.rem_m)
-    for t in range(mp.rem_m + 1):
-        write_check_row(ws, t, mp.rem_m, last)
-    ws.freeze_panes = "B2"
-    set_widths(ws, 15, FIRST_CHECK_COL + len(ROW_CHECKS) + 2)
-    ws.column_dimensions[COL["t"]].width = 6
+    blocks = Blocks(mp.rem_m)
+    write_inputs_block(ws, mp)
+    write_derived_block(ws)
+    write_basis_block(ws)
+    write_monthly_block(ws, mp.rem_m)
+    write_scalars_block(ws, blocks)
+    write_checks_block(ws, blocks)
+    ws.freeze_panes = "B1"
+    set_widths(ws, 15, LAST_COL)
+    ws.column_dimensions["A"].width = 20
 
 
-def write_constants_block(ws: Worksheet, mp_row: int) -> None:
-    """The policy's inputs, derived fields and scales, linked from ``inputs`` and named."""
-    ws[f"{CONST_LABEL_COL}1"] = "constant"
-    ws[f"{CONST_VALUE_COL}1"] = "value (linked from inputs)"
-    ws[f"{CONST_LABEL_COL}1"].font = BOLD
-    ws[f"{CONST_VALUE_COL}1"].font = BOLD
-    row = 2
-    for name in CONST_FIELDS:
-        ws[f"{CONST_LABEL_COL}{row}"] = name
-        ws[f"{CONST_VALUE_COL}{row}"] = f"=inputs!${MP_COL[name]}${mp_row}"
-        if name.endswith("_date"):
-            ws[f"{CONST_VALUE_COL}{row}"].number_format = "yyyy-mm-dd"
+def write_inputs_block(ws: Worksheet, mp: ModelPoint) -> None:
+    """Section 3.1 inputs of this model point (section 13) and the 3.3 valuation date, typed."""
+    title(
+        ws,
+        INPUT_TITLE_ROW,
+        "Inputs (section 3.1, from section 13) and the run-level valuation_date (3.3), typed",
+    )
+    for k, name in enumerate(INPUT_FIELDS):
+        row = INPUT_FIRST_ROW + k
+        value = VALUATION_DATE if name == "valuation_date" else getattr(mp, name)
+        section, unit = INPUT_META[name]
+        ws[f"A{row}"] = name
+        ws[f"B{row}"] = value
+        if isinstance(value, dt.date):
+            ws[f"B{row}"].number_format = "yyyy-mm-dd"
+        ws[f"C{row}"] = section
+        ws[f"D{row}"] = unit
         if name != "policy_id":
-            define_local(ws, name, f"{ws.title}!${CONST_VALUE_COL}${row}")
-        row += 1
-    row += 1
-    ws[f"{CONST_LABEL_COL}{row}"] = "section 1 scales"
-    row += 1
-    for name, formula, _ in SCALES:
-        ws[f"{CONST_LABEL_COL}{row}"] = name
-        ws[f"{CONST_VALUE_COL}{row}"] = formula
-        define_local(ws, name, f"{ws.title}!${CONST_VALUE_COL}${row}")
-        row += 1
+            define_local(ws, name, f"{ws.title}!$B${row}")
+
+
+def write_derived_block(ws: Worksheet) -> None:
+    """Section 3.2 derived fields by the formulas of sections 4.3 and 5, on the inputs above."""
+    title(ws, DERIVED_TITLE_ROW, "Derived constants (sections 3.2, 4.3 and 5), by formula")
+    for k, (name, formula, section, unit) in enumerate(DERIVED):
+        row = DERIVED_FIRST_ROW + k
+        ws[f"A{row}"] = name
+        ws[f"B{row}"] = formula
+        ws[f"C{row}"] = section
+        ws[f"D{row}"] = unit
+        define_local(ws, name, f"{ws.title}!$B${row}")
+
+
+def write_basis_block(ws: Worksheet) -> None:
+    """Section 6: the constants, each in one cell, then the lapse and commission tables."""
+    title(ws, BASIS_TITLE_ROW, "Basis constants (section 6), each in one cell")
+    for k, (symbol, value, unit, section) in enumerate(BASIS):
+        row = BASIS_FIRST_ROW + k
+        ws[f"A{row}"] = symbol
+        ws[f"B{row}"] = value
+        ws[f"C{row}"] = section
+        ws[f"D{row}"] = unit
+        define_local(ws, EXCEL_NAME.get(symbol, symbol), f"{ws.title}!$B${row}")
+
+    title(ws, LAPSE_TITLE_ROW, "Lapse table (section 6.2): key k = min(dur_y, 5)")
+    ws[f"A{LAPSE_HEADER_ROW}"] = "k"
+    ws[f"B{LAPSE_HEADER_ROW}"] = "lapse_table"
+    ws[f"D{LAPSE_HEADER_ROW}"] = "Prob, annual"
+    for k, w_ann in enumerate(LAPSE_TABLE):
+        ws[f"A{LAPSE_HEADER_ROW + 1 + k}"] = k
+        ws[f"B{LAPSE_HEADER_ROW + 1 + k}"] = w_ann
+    first, last = LAPSE_HEADER_ROW + 1, LAPSE_HEADER_ROW + len(LAPSE_TABLE)
+    define_local(ws, "lapse_key", f"{ws.title}!$A${first}:$A${last}")
+    define_local(ws, "lapse_table", f"{ws.title}!$B${first}:$B${last}")
+
+    title(ws, COMM_TITLE_ROW, "Commission table (section 6.6): key k = min(dur_y, 1)")
+    ws[f"A{COMM_HEADER_ROW}"] = "k"
+    ws[f"B{COMM_HEADER_ROW}"] = "comm_table"
+    ws[f"D{COMM_HEADER_ROW}"] = "Fraction"
+    for k, rate in enumerate(COMM_TABLE):
+        ws[f"A{COMM_HEADER_ROW + 1 + k}"] = k
+        ws[f"B{COMM_HEADER_ROW + 1 + k}"] = rate
+    first, last = COMM_HEADER_ROW + 1, COMM_HEADER_ROW + len(COMM_TABLE)
+    define_local(ws, "comm_key", f"{ws.title}!$A${first}:$A${last}")
+    define_local(ws, "comm_table", f"{ws.title}!$B${first}:$B${last}")
+
+
+def write_monthly_block(ws: Worksheet, rem_m: int) -> None:
+    """Sections 7.1 and 11.1: the header row, rows ``t = 0 .. rem_m`` and the row checks."""
+    title(
+        ws,
+        MONTH_TITLE_ROW,
+        "Monthly block (sections 7.1 and 11.1): rows t = 0 .. rem_m, one column per quantity in"
+        " the 7.1 order; the row-level check cells of section 12 follow the blank column",
+    )
+    for name, _, _ in QUANTITIES:
+        ws[f"{COL[name]}{MONTH_HEADER_ROW}"] = name
+        ws[f"{COL[name]}{MONTH_HEADER_ROW}"].font = BOLD
+    for name, _ in ROW_CHECKS:
+        ws[f"{COL[name]}{MONTH_HEADER_ROW}"] = name
+        ws[f"{COL[name]}{MONTH_HEADER_ROW}"].font = BOLD
+    for t in range(rem_m + 1):
+        write_policy_row(ws, t, rem_m)
+    for t in range(rem_m + 1):
+        write_check_row(ws, t, rem_m)
 
 
 def write_policy_row(ws: Worksheet, t: int, rem_m: int) -> None:
     """Row ``t`` of the monthly block (section 7.1 steps 2 to 4)."""
-    cur, prv, nxt = Row(t + 2), Row(t + 1), Row(t + 3)
+    cur, prv, nxt = Row(t), Row(t - 1), Row(t + 1)
     ws[cur.t] = t
     if t == 0:
         # Step 2: state variables take their initial values; month quantities stay blank.
@@ -588,9 +757,9 @@ def write_policy_row(ws: Worksheet, t: int, rem_m: int) -> None:
     ws[cur.reserve_floored] = f"=IF({cur.reserve}>0,{cur.reserve},0)"
 
 
-def write_check_row(ws: Worksheet, t: int, rem_m: int, last: int) -> None:
+def write_check_row(ws: Worksheet, t: int, rem_m: int) -> None:
     """Row ``t`` of the section 12 row-level check cells."""
-    cur, prv, nxt = Row(t + 2), Row(t + 1), Row(t + 3)
+    cur, prv, nxt = Row(t), Row(t - 1), Row(t + 1)
     tol = "1E-9*"
     if t == 0:
         ws[cur.H1] = f"={cur.pols_if}>=0"
@@ -634,7 +803,7 @@ def write_check_row(ws: Worksheet, t: int, rem_m: int, last: int) -> None:
             f"{cur.maint_expense}={prv.pols_if}*{cur.maint_pp})"
         )
     if t < rem_m:
-        ws[cur.H5b_sum] = f"=SUM({nxt.H5b_term}:{COL['H5b_term']}${last})"
+        ws[cur.H5b_sum] = f"=SUM({nxt.H5b_term}:{cell_at('H5b_term', rem_m)})"
         lhs = f"{cur.reserve}*{cur.disc}"
         ws[cur.H5b] = (
             f"=ABS({lhs}-{cur.H5b_sum})<={tol}MAX(ABS({lhs}),ABS({cur.H5b_sum}),scale_money)"
@@ -651,133 +820,186 @@ def write_check_row(ws: Worksheet, t: int, rem_m: int, last: int) -> None:
     ws[cur.P6] = f"=AND({cur.reserve_floored}>=0,{cur.reserve_floored}>={cur.reserve})"
 
 
+def write_scalars_block(ws: Worksheet, b: Blocks) -> None:
+    """Section 11.2 (7.1 step 5): the derived constants again, the PV sums, the time-0 state."""
+    title(
+        ws,
+        b.scalar_title,
+        "Scalars (section 11.2): the derived constants, the PV sums over t = 1 .. rem_m in"
+        " ascending t, the time-0 state variables and maturities(rem_m)",
+    )
+    for name in SCALAR_FIELDS:
+        row = b.scalar_row(name)
+        ws[f"A{row}"] = name
+        if name in DERIVED_META:
+            ws[f"B{row}"] = f"={name}"
+            section, unit = DERIVED_META[name]
+        else:
+            section, unit = SCALAR_META[name]
+            define_local(ws, name, f"{ws.title}!$B${row}")
+        ws[f"C{row}"] = section
+        ws[f"D{row}"] = unit
+    # Section 9.3: each PV is the sum of its column over t = 1 .. rem_m, then pv_net_cf from the
+    # five, left to right.
+    for name, column in PV_SUMS.items():
+        ws[f"B{b.scalar_row(name)}"] = f"=SUM({column_range(column, 1, b.rem_m)})"
+    ws[f"B{b.scalar_row('pv_net_cf')}"] = "=" + "-".join(f"B{b.scalar_row(n)}" for n in PV_SUMS)
+    ws[f"B{b.scalar_row('reserve_0')}"] = f"={cell_at('reserve', 0)}"
+    ws[f"B{b.scalar_row('reserve_pp_0')}"] = f"={cell_at('reserve_pp', 0)}"
+    ws[f"B{b.scalar_row('reserve_floored_0')}"] = f"={cell_at('reserve_floored', 0)}"
+    ws[f"B{b.scalar_row('maturities_n')}"] = f"={cell_at('maturities', b.rem_m)}"
+
+
+def write_checks_block(ws: Worksheet, b: Blocks) -> None:
+    """Section 12 (7.1 step 5): scales and helper sums, then ``<id>_ok``, ``rows_ok``, ``ok``."""
+    rem_m, tol = b.rem_m, "1E-9*"
+    title(
+        ws,
+        b.check_title,
+        "Check cells (section 12): the section 1 scales and two helper sums, then one <id>_ok per"
+        " (sheet) invariant, TRUE when every row cell and scalar cell of that invariant is TRUE",
+    )
+    helpers = {
+        "scale_money": "=sum_assured*pols_if_init",
+        "scale_pp": "=sum_assured",
+        "scale_count": "=pols_if_init",
+        "exits_sum": (
+            f"=SUMPRODUCT({column_range('deaths', 1, rem_m)}+{column_range('lapses', 1, rem_m)}"
+            f"+{column_range('maturities', 1, rem_m)})"
+        ),
+        "pv_net_cf_t_sum": f"=SUM({column_range('pv_net_cf_t', 1, rem_m)})",
+    }
+    for name, meaning in CHECK_HELPERS.items():
+        row = b.helper_row(name)
+        ws[f"A{row}"] = name
+        ws[f"B{row}"] = helpers[name]
+        ws[f"D{row}"] = meaning
+        define_local(ws, name, f"{ws.title}!$B${row}")
+    ok = {
+        "H1_ok": f"=AND({column_range('H1', 0, rem_m)})",
+        "H2_ok": f"=AND({column_range('H2', 1, rem_m)})",
+        "H3_ok": f"=AND({cell_at('reserve', rem_m)}=0,{cell_at('pols_if', rem_m)}=0)",
+        "H4_ok": f"=AND({column_range('H4', 1, rem_m)})",
+        "H5a_ok": (
+            f"=ABS(reserve_0-(-pv_net_cf))<={tol}MAX(ABS(reserve_0),ABS(pv_net_cf),scale_money)"
+        ),
+        "H5b_ok": f"=AND({column_range('H5b', 0, rem_m - 1)})",
+        "P1_ok": f"=AND({column_range('P1', 1, rem_m)})",
+        "P2_ok": f"=AND({column_range('P2', 1, rem_m)})",
+        "P3_ok": f"=SUMPRODUCT(--({column_range('premium_pp', 1, rem_m)}<>0))=prem_rem_m",
+        "P4_ok": f"=AND({column_range('P4', 1, rem_m)})",
+        "P5_ok": f"=AND({column_range('P5', 0, rem_m - 1)})",
+        "P6_ok": f"=AND({column_range('P6', 0, rem_m)})",
+        "P8_ok": (
+            f"=ABS(exits_sum-scale_count)<={tol}MAX(ABS(exits_sum),ABS(scale_count),scale_count)"
+        ),
+        "P9_ok": (
+            f"=ABS(pv_net_cf-pv_net_cf_t_sum)"
+            f"<={tol}MAX(ABS(pv_net_cf),ABS(pv_net_cf_t_sum),scale_money)"
+        ),
+        "P10_ok": f"=AND({column_range('P10', 1, rem_m)})",
+        "rows_ok": f"=MAX({column_range('t', 0, rem_m)})=rem_m",
+    }
+    ok["ok"] = f"=AND($B${b.ok_row(OK_CELLS[0])}:$B${b.ok_row('rows_ok')})"
+    for name in OK_CELLS:
+        row = b.ok_row(name)
+        ws[f"A{row}"] = name
+        ws[f"B{row}"] = ok[name]
+        ws[f"D{row}"] = OK_MEANING[name]
+    ws[f"A{b.ok_row('ok')}"].font = BOLD
+
+
 # ----------------------------------------------------------------------------------------------
-# scalars, totals_t, checks
+# summary
 # ----------------------------------------------------------------------------------------------
 
 
-def write_scalars(wb: openpyxl.Workbook) -> None:
-    ws = wb.create_sheet("scalars")
-    for name in SCALAR_COLUMNS:
-        ws[f"{SCOL[name]}1"] = name
-        ws[f"{SCOL[name]}1"].font = BOLD
+def write_summary(wb: openpyxl.Workbook) -> None:
+    ws = wb.create_sheet("summary")
+    blocks = {mp.policy_id: Blocks(mp.rem_m) for mp in MODEL_POINTS}
+    policy_id_row = INPUT_FIRST_ROW + INPUT_FIELDS.index("policy_id")
+
+    # Section 11.2 scalars per policy, by reference; section 11.3 scalar totals as plain SUMs.
+    title(
+        ws,
+        SUMMARY_SCALAR_TITLE_ROW,
+        "Scalars (section 11.2) per policy, by reference to the policy sheets; the row labelled"
+        " total holds the section 11.3 scalar totals, plain SUMs in ascending policy_id order",
+    )
+    for name in SUMMARY_SCALAR_COLUMNS:
+        ws[f"{SCOL[name]}{SUMMARY_SCALAR_HEADER_ROW}"] = name
+        ws[f"{SCOL[name]}{SUMMARY_SCALAR_HEADER_ROW}"].font = BOLD
     for k, mp in enumerate(MODEL_POINTS):
-        row, mp_row, last = 2 + k, MP_FIRST_ROW + k, mp.rem_m + 2
-        pid = mp.policy_id
-        for name in ["policy_id", *MP_DERIVED_FIELDS]:
-            ws[f"{SCOL[name]}{row}"] = f"=inputs!${MP_COL[name]}${mp_row}"
-        # Section 9.3: each PV is the sum of its column over t = 1 .. rem_m.
-        for name, column in PV_SUMS.items():
-            ws[f"{SCOL[name]}{row}"] = f"=SUM({rng(pid, column, 3, last)})"
-        ws[f"{SCOL['pv_net_cf']}{row}"] = "=" + "-".join(f"{SCOL[name]}{row}" for name in PV_SUMS)
-        ws[f"{SCOL['reserve_0']}{row}"] = f"={pid}!${COL['reserve']}$2"
-        ws[f"{SCOL['reserve_pp_0']}{row}"] = f"={pid}!${COL['reserve_pp']}$2"
-        ws[f"{SCOL['reserve_floored_0']}{row}"] = f"={pid}!${COL['reserve_floored']}$2"
-        ws[f"{SCOL['maturities_n']}{row}"] = f"={pid}!${COL['maturities']}${last}"
-    # Section 11.3: Money scalars summed over policies in ascending policy_id order.
-    total_row = 2 + len(MODEL_POINTS)
-    ws[f"A{total_row}"] = "total"
-    ws[f"A{total_row}"].font = BOLD
+        row, b, pid = SUMMARY_SCALAR_FIRST_ROW + k, blocks[mp.policy_id], mp.policy_id
+        ws[f"{SCOL['policy_id']}{row}"] = f"={pid}!$B${policy_id_row}"
+        for name in SCALAR_FIELDS:
+            ws[f"{SCOL[name]}{row}"] = f"={pid}!$B${b.scalar_row(name)}"
+    ws[f"A{SUMMARY_TOTAL_ROW}"] = "total"
+    ws[f"A{SUMMARY_TOTAL_ROW}"].font = BOLD
     for name in SCALAR_TOTALS:
         col = SCOL[name]
-        ws[f"{col}{total_row}"] = f"=SUM({col}2:{col}{total_row - 1})"
-    set_widths(ws, 16, len(SCALAR_COLUMNS))
+        ws[f"{col}{SUMMARY_TOTAL_ROW}"] = (
+            f"=SUM({col}{SUMMARY_SCALAR_FIRST_ROW}:{col}{SUMMARY_TOTAL_ROW - 1})"
+        )
 
+    # Section 12 check cells per policy, by reference, and all_ok.
+    title(
+        ws,
+        SUMMARY_CHECK_TITLE_ROW,
+        "Check cells (section 12) per policy, by reference to the policy sheets: <id>_ok per"
+        " (sheet) invariant, rows_ok, ok per policy, and all_ok over the ten policies",
+    )
+    for name in SUMMARY_CHECK_COLUMNS:
+        ws[f"{CCOL[name]}{SUMMARY_CHECK_HEADER_ROW}"] = name
+        ws[f"{CCOL[name]}{SUMMARY_CHECK_HEADER_ROW}"].font = BOLD
+    for k, mp in enumerate(MODEL_POINTS):
+        row, b, pid = SUMMARY_CHECK_FIRST_ROW + k, blocks[mp.policy_id], mp.policy_id
+        ws[f"{CCOL['policy_id']}{row}"] = f"={pid}!$B${policy_id_row}"
+        for name in OK_CELLS:
+            ws[f"{CCOL[name]}{row}"] = f"={pid}!$B${b.ok_row(name)}"
+    ok, last = CCOL["ok"], SUMMARY_CHECK_FIRST_ROW + len(MODEL_POINTS) - 1
+    ws[f"A{SUMMARY_ALL_OK_ROW}"] = "all_ok"
+    ws[f"A{SUMMARY_ALL_OK_ROW}"].font = BOLD
+    ws[f"B{SUMMARY_ALL_OK_ROW}"] = f"=AND({ok}{SUMMARY_CHECK_FIRST_ROW}:{ok}{last})"
+    define(wb, "all_ok", f"{ws.title}!$B${SUMMARY_ALL_OK_ROW}")
 
-def write_totals_t(wb: openpyxl.Workbook) -> None:
-    ws = wb.create_sheet("totals_t")
+    # Section 11.3 totals by t over the batch horizon, each policy's rows beyond its own rem_m
+    # read as zero (the sheets have different row counts, so each term is INDEX-guarded).
     horizon = max(mp.rem_m for mp in MODEL_POINTS)
-    ws["A1"] = "t"
-    ws["A1"].font = BOLD
-    letters = {name: get_column_letter(k + 2) for k, name in enumerate(TOTAL_COLUMNS)}
-    for name, letter in letters.items():
-        ws[f"{letter}1"] = f"total_{name}"
-        ws[f"{letter}1"].font = BOLD
+    title(
+        ws,
+        SUMMARY_TOTALS_T_TITLE_ROW,
+        f"Totals by t (section 11.3), t = 0 .. {horizon}: the sum over the ten policies of each"
+        " Money and Count monthly column, a policy's values beyond its own rem_m read as zero",
+    )
+    ws[f"A{SUMMARY_TOTALS_T_HEADER_ROW}"] = "t"
+    ws[f"A{SUMMARY_TOTALS_T_HEADER_ROW}"].font = BOLD
+    for name, letter in TCOL.items():
+        ws[f"{letter}{SUMMARY_TOTALS_T_HEADER_ROW}"] = f"total_{name}"
+        ws[f"{letter}{SUMMARY_TOTALS_T_HEADER_ROW}"].font = BOLD
+    rem_m_row = DERIVED_FIRST_ROW + MP_DERIVED_FIELDS.index("rem_m")
     for t in range(horizon + 1):
-        row = t + 2
+        row = SUMMARY_TOTALS_T_FIRST_ROW + t
         ws[f"A{row}"] = t
-        for name, letter in letters.items():
+        for name, letter in TCOL.items():
             if t == 0 and name not in STATE_TOTALS:
                 continue  # month quantities are blank at t = 0 and are not totalled there
-            terms = []
-            for k, mp in enumerate(MODEL_POINTS):
-                rem = f"inputs!${MP_COL['rem_m']}${MP_FIRST_ROW + k}"
+            terms: list[str] = []
+            for mp in MODEL_POINTS:
+                rem = f"{mp.policy_id}!$B${rem_m_row}"
                 src = f"{mp.policy_id}!${COL[name]}:${COL[name]}"
-                terms.append(f"IF($A{row}<={rem},INDEX({src},$A{row}+2),0)")
+                terms.append(f"IF($A{row}<={rem},INDEX({src},$A{row}+{MONTH_FIRST_ROW}),0)")
             ws[f"{letter}{row}"] = "=" + "+".join(terms)
-    ws.freeze_panes = "B2"
-    set_widths(ws, 18, len(TOTAL_COLUMNS) + 1)
-
-
-def write_checks(wb: openpyxl.Workbook) -> None:
-    ws = wb.create_sheet("checks")
-    for name, letter in CCOL.items():
-        ws[f"{letter}1"] = name
-        ws[f"{letter}1"].font = BOLD
-    tol = "1E-9*"
-    for k, mp in enumerate(MODEL_POINTS):
-        row, mp_row, last = 2 + k, MP_FIRST_ROW + k, mp.rem_m + 2
-        pid, srow = mp.policy_id, 2 + k  # the policy's row on scalars is the same row
-        c = {name: f"{letter}{row}" for name, letter in CCOL.items()}
-        reserve_0 = f"scalars!${SCOL['reserve_0']}${srow}"
-        pv_net_cf = f"scalars!${SCOL['pv_net_cf']}${srow}"
-        ws[c["policy_id"]] = f"=inputs!$A${mp_row}"
-        ws[c["H1"]] = f"=AND({rng(pid, 'H1', 2, last)})"
-        ws[c["H2"]] = f"=AND({rng(pid, 'H2', 3, last)})"
-        ws[c["H3"]] = f"=AND({pid}!${COL['reserve']}${last}=0,{pid}!${COL['pols_if']}${last}=0)"
-        ws[c["H4"]] = f"=AND({rng(pid, 'H4', 3, last)})"
-        ws[c["H5a"]] = (
-            f"=ABS({reserve_0}-(-{pv_net_cf}))"
-            f"<={tol}MAX(ABS({reserve_0}),ABS({pv_net_cf}),{c['scale_money']})"
-        )
-        ws[c["H5b"]] = f"=AND({rng(pid, 'H5b', 2, last - 1)})"
-        ws[c["P1"]] = f"=AND({rng(pid, 'P1', 3, last)})"
-        ws[c["P2"]] = f"=AND({rng(pid, 'P2', 3, last)})"
-        ws[c["P3"]] = (
-            f"=SUMPRODUCT(--({rng(pid, 'premium_pp', 3, last)}<>0))"
-            f"=inputs!${MP_COL['prem_rem_m']}${mp_row}"
-        )
-        ws[c["P4"]] = f"=AND({rng(pid, 'P4', 3, last)})"
-        ws[c["P5"]] = f"=AND({rng(pid, 'P5', 2, last - 1)})"
-        ws[c["P6"]] = f"=AND({rng(pid, 'P6', 2, last)})"
-        ws[c["P8"]] = (
-            f"=ABS({c['exits_sum']}-{c['scale_count']})"
-            f"<={tol}MAX(ABS({c['exits_sum']}),ABS({c['scale_count']}),{c['scale_count']})"
-        )
-        ws[c["P9"]] = (
-            f"=ABS({pv_net_cf}-{c['pv_net_cf_t_sum']})"
-            f"<={tol}MAX(ABS({pv_net_cf}),ABS({c['pv_net_cf_t_sum']}),{c['scale_money']})"
-        )
-        ws[c["P10"]] = f"=AND({rng(pid, 'P10', 3, last)})"
-        ws[c["rows_ok"]] = f"=MAX({pid}!$A:$A)=inputs!${MP_COL['rem_m']}${mp_row}"
-        ws[c["ok"]] = f"=AND({c['H1']}:{c['rows_ok']})"
-        ws[c["exits_sum"]] = (
-            f"=SUMPRODUCT({rng(pid, 'deaths', 3, last)}+{rng(pid, 'lapses', 3, last)}"
-            f"+{rng(pid, 'maturities', 3, last)})"
-        )
-        ws[c["pv_net_cf_t_sum"]] = f"=SUM({rng(pid, 'pv_net_cf_t', 3, last)})"
-        ws[c["scale_money"]] = (
-            f"=inputs!${MP_COL['sum_assured']}${mp_row}*inputs!${MP_COL['pols_if_init']}${mp_row}"
-        )
-        ws[c["scale_count"]] = f"=inputs!${MP_COL['pols_if_init']}${mp_row}"
-    all_row = 3 + len(MODEL_POINTS)
-    ok = CCOL["ok"]
-    ws[f"A{all_row}"] = "all_ok"
-    ws[f"A{all_row}"].font = BOLD
-    ws[f"B{all_row}"] = f"=AND({ok}2:{ok}{all_row - 2})"
-    define(wb, "all_ok", f"checks!$B${all_row}")
-    set_widths(ws, 12, len(CHECK_COLUMNS))
+    set_widths(ws, 18, max(len(SUMMARY_SCALAR_COLUMNS), len(TOTAL_COLUMNS) + 1))
 
 
 def build() -> openpyxl.Workbook:
     wb = openpyxl.Workbook()
     write_readme(wb)
-    write_inputs(wb)
-    for k, mp in enumerate(MODEL_POINTS):
-        write_policy(wb, mp, MP_FIRST_ROW + k)
-    write_scalars(wb)
-    write_totals_t(wb)
-    write_checks(wb)
+    write_mortality(wb)
+    for mp in MODEL_POINTS:
+        write_policy(wb, mp)
+    write_summary(wb)
     return wb
 
 
@@ -788,6 +1010,7 @@ def main() -> None:
     rows = ", ".join(f"{mp.policy_id}: {mp.rem_m}" for mp in MODEL_POINTS)
     print(f"wrote {OUT} ({len(wb.sheetnames)} sheets; rem_m by policy: {rows})")
     print("formulas only: recalculate with docs/spec/recalc_excel.py before reading values")
+    print("then summary!all_ok (defined name all_ok) is the headline check")
 
 
 if __name__ == "__main__":
