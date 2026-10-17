@@ -123,7 +123,7 @@ def test_horizon_and_dimensions(term_run: RunResult) -> None:
 def test_every_monthly_column_reconciles(
     oracle: ModuleType, term_run: RunResult, projections: dict[str, Any]
 ) -> None:
-    worst: dict[str, float] = {}
+    worst: dict[str, float] = {}  # the largest |engine - oracle| as a fraction of the scale
     for mp in oracle.REF:
         pid, n = mp["policy_id"], mp["rem_m"]
         r = projections[pid]
@@ -131,11 +131,19 @@ def test_every_monthly_column_reconciles(
             first = 0 if col in STATE_COLS else 1
             engine = term_run.lane(col, pid)[first : n + 1]
             expected = np.array(r[col][first : n + 1], dtype=np.float64)
-            ok = within(engine, expected, _scale(col, mp))
+            scale = _scale(col, mp)
+            ok = within(engine, expected, scale)
             assert ok.all(), f"{pid} {col}: first difference at t = {first + int(np.argmin(ok))}"
-            worst[col] = max(worst.get(col, 0.0), float(np.abs(engine - expected).max()))
-    assert worst["reserve"] < 1e-9
-    assert worst["pols_if"] < 1e-15
+            worst[col] = max(worst.get(col, 0.0), float(np.abs(engine - expected).max()) / scale)
+    # The oracle is the spec's formulas in Python floats and the engine the same formulas in
+    # NumPy. Where both take ** from the C library (this laptop, a Linux runner without AVX-512)
+    # every column is bit-identical; where NumPy brings its own power kernel (AVX-512 on Linux)
+    # q_m, w_m and the factors can differ in their last bits and 480 months compound them: on
+    # such a runner the reserve is off by 2.7e-9, which is 2.7e-15 of the scale, and pols_if by
+    # 2.4e-15 of it; a one-ulp bias in every q_m would give 1.3e-14. 1e-13 of the scale is ten
+    # thousand times tighter than the spec's tolerance.
+    assert worst["reserve"] < 1e-13, worst["reserve"]
+    assert worst["pols_if"] < 1e-13, worst["pols_if"]
 
 
 def test_month_quantities_are_zero_at_t_zero_and_after_the_term(

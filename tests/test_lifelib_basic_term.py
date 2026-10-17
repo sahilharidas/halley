@@ -10,6 +10,15 @@ under the term spec's tolerance (section 1): ``|a - b| <= 1e-9 * max(|a|, |b|, s
 per policy and 1 for rates and factors. The conventions the model encodes are listed in the
 docstring of :mod:`halley.products.lifelib_basic_term`; the index shift is the one to remember:
 a flow Halley reports at month ``t`` is lifelib's flow at ``t - 1``, counts are unshifted.
+
+Several checks hold far inside that tolerance, where only the last bits of the float64 power
+kernels can differ: the fixtures came from one machine (Windows, where NumPy's ``**`` is the C
+library's ``pow``), and NumPy on an AVX-512 Linux machine uses its own power kernel. Each is
+within one ulp of the true value, so they differ by at most one ulp, which ``1 - (1 - q) **
+(1/12)`` turns into an absolute 2**-53 of the monthly rate: up to 5.5e-12 of a month's deaths
+and claims at the smallest monthly mortality rate the policies meet (2e-5), while the counts and
+factors drift by at most one ulp a month over the 276 months. Those checks are bounds set from that
+ulp; the exact zeros stay exact.
 """
 
 from __future__ import annotations
@@ -117,6 +126,15 @@ def _scale_of(name: str, scales: dict[str, Any]) -> Any:
     return scales["count"]
 
 
+def _max_relative(engine: Any, lifelib: Any) -> float:
+    """The largest |engine - lifelib| / |lifelib|; a lifelib zero must be an engine zero."""
+    zero = lifelib == 0
+    if (engine[zero] != 0).any():
+        return float("inf")
+    rel = np.abs(engine[~zero] - lifelib[~zero]) / np.abs(lifelib[~zero])
+    return float(rel.max()) if rel.size else 0.0
+
+
 # ------------------------------------------------------------------------------ structure
 
 
@@ -173,9 +191,11 @@ def test_present_values_reconcile_for_every_policy(
             else ""
         )
         if name != "pv_net_cf":  # the net flow cancels; the gross values agree far tighter
-            nonzero = lifelib != 0
-            rel = np.abs(engine[nonzero] - lifelib[nonzero]) / np.abs(lifelib[nonzero])
-            assert rel.max() < 1e-12, (name, rel.max())  # summation order and powers only
+            # summation order and the power kernels' last bits only: 1e-14 on the fixtures'
+            # machine, 2.4e-12 on an AVX-512 runner, at most 3.6e-12 for a one-ulp bias in
+            # every (1 - q) ** (1/12) of a policy (pv_claims and net_premium_pp see it)
+            rel = _max_relative(engine, lifelib)
+            assert rel < 1e-11, (name, rel)
     # policies with no count have exactly nothing
     empty = _column(basic_term_run, "policy_count") == 0
     assert empty.any()
@@ -197,6 +217,7 @@ def test_monthly_results_reconcile_for_the_sample(
     assert duration_mth[np.isin(r.ids, sample)].min() < 0  # future new business is sampled
     assert (rem_m[np.isin(r.ids, sample)] == 0).any()  # and a policy maturing at t = 0
     worst: dict[str, float] = {}
+    worst_rel: dict[str, float] = {}
     for name in STATES + FLOWS + RATES:
         engine_all = r.var(name)
         lifelib_all = lifelib_monthly.column(name).to_numpy()
@@ -216,12 +237,17 @@ def test_monthly_results_reconcile_for_the_sample(
                 f"{k[rows][inside][np.argmin(ok)]}"
             )
             worst[name] = max(worst.get(name, 0.0), float(np.abs(engine - lifelib).max()))
+            worst_rel[name] = max(worst_rel.get(name, 0.0), _max_relative(engine, lifelib))
             if name in FLOWS:  # lifelib's month beyond Halley's horizon has no flow
                 assert not lifelib_all[rows][~inside].any(), (p, name)
-    # counts, premiums, claims and commissions are bit-identical; expenses carry the inflation
-    # factor's last-bit difference (convention 10)
+    # counts, premiums, claims and commissions are lifelib's operations in lifelib's order:
+    # bit-identical on the fixtures' machine, elsewhere within the power kernels' last bits,
+    # which are up to 5.3e-12 of a month's deaths and claims in this sample (one ulp of
+    # (1 - q) ** (1/12) at a monthly rate of 2e-5; 4.2e-12 on an AVX-512 runner) and a drift of
+    # one ulp a month in the counts (6e-15 there); a lifelib zero is an engine zero. Expenses
+    # carry the inflation factor's last-bit difference (convention 10)
     for name in (*STATES, "premiums", "claims", "commissions", "pols_death", "pols_lapse"):
-        assert worst[name] == 0.0, (name, worst[name])
+        assert worst_rel[name] < 1e-11, (name, worst_rel[name])
     assert worst["expenses"] < 1e-9
 
 
@@ -279,12 +305,18 @@ def test_portfolio_totals_reconcile(basic_term_run: RunResult, lifelib_totals: A
     for name in ("pols_if", "pols_maturity", "pols_new_biz"):
         lifelib = lifelib_totals.column(name).to_numpy()
         assert within(totals[name][:, 0, 0], lifelib, count_scale).all(), name
-    assert np.array_equal(
+    # lifelib's two powers in lifelib's order: bit-identical on the fixtures' machine; another
+    # pow kernel moves the monthly rate by an ulp, which (1 + rate) ** (-t) compounds to 6e-14
+    # at the horizon (one ulp at one t on a Linux runner without AVX-512, 2.4e-14 on one with)
+    disc = _max_relative(
         r.var("disc_factors")[:, 0, 0], lifelib_totals.column("disc_factors").to_numpy()
     )
+    assert disc < 1e-12, disc
     inflation = lifelib_totals.column("inflation_factor").to_numpy()
     assert within(r.var("inflation_factor")[:, 0, 0], inflation, 1.0).all()
-    assert np.abs(r.var("inflation_factor")[:, 0, 0] - inflation).max() < 1e-13
+    # convention 10: 2.6e-14 at the horizon on the fixtures' machine, plus up to 7.7e-14 where
+    # one ulp of (1 + 0.01) ** (1/12) is compounded by ** t
+    assert np.abs(r.var("inflation_factor")[:, 0, 0] - inflation).max() < 1e-12
 
 
 # ---------------------------------------------------------------------------------- the run
