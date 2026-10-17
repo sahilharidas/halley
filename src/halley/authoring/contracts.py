@@ -65,7 +65,7 @@ def resolve_month(spec: int | str, horizon: int) -> int:
     raise ValueError(f"a month is an int, 'H' or 'H-k', not {spec!r}")
 
 
-def _check_month_spec(spec: object, what: str) -> None:
+def _check_month_spec(spec: object, what: str) -> int | str:
     if isinstance(spec, bool) or not isinstance(spec, (int, str)):
         raise ValueError(f"{what}: a month is an int, 'H' or 'H-k', not {spec!r}")
     if isinstance(spec, str):
@@ -73,6 +73,19 @@ def _check_month_spec(spec: object, what: str) -> None:
             resolve_month(spec, 0)
         except ValueError as exc:
             raise ValueError(f"{what}: {exc}") from None
+    return spec
+
+
+def _check_window(first: object, last: object, what: str) -> None:
+    """Both months spelled correctly and, when their order does not depend on the horizon
+    (two ints, or two ``H``-relative spellings), ``first <= last``; a mixed pair is checked at
+    the run's horizon."""
+    first = _check_month_spec(first, what)
+    last = _check_month_spec(last, what)
+    if isinstance(first, int) == isinstance(last, int) and (
+        resolve_month(first, 0) > resolve_month(last, 0)
+    ):
+        raise ValueError(f"{what}: ({first!r}, {last!r}) is an empty window")
 
 
 # ----------------------------------------------------------------------------- model points
@@ -218,8 +231,11 @@ class TableView:
     per key, in declared order; 0-d for a keyless table), its key names and ranges, and the
     file's ``halley.*`` metadata as strings, keys without the prefix.
 
-    ``view.q`` or ``view["q"]`` is the dense array of column ``q``; ``view.at("q", age=120)``
-    fixes keys by value and keeps every axis, so a comparison on it still names the failing key.
+    ``view["q"]`` is the dense array of column ``q``, and ``view.q`` the same by attribute; a
+    column may not be named like one of the view's own attributes (:data:`TABLE_VIEW_ATTRIBUTES`;
+    :class:`Table` refuses such a column at declaration), so the two spellings always agree.
+    ``view.at("q", age=120)`` fixes keys by value and keeps every axis, so a comparison on it
+    still names the failing key.
     """
 
     def __init__(
@@ -229,10 +245,20 @@ class TableView:
         values: dict[str, NDArray[Any]],
         metadata: dict[str, str],
     ) -> None:
-        self.name = name
+        self._name = name
         self._keys = keys
         self._values = values
-        self.metadata = metadata
+        self._metadata = metadata
+
+    @property
+    def name(self) -> str:
+        """The table's name."""
+        return self._name
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        """The file's ``halley.*`` metadata (and a bare ``version``), keys without the prefix."""
+        return self._metadata
 
     @property
     def keys(self) -> tuple[str, ...]:
@@ -309,6 +335,11 @@ class TableView:
             ) from None
 
 
+TABLE_VIEW_ATTRIBUTES = frozenset(name for name in dir(TableView) if not name.startswith("_"))
+"""The names a table column may not take: ``view.<column>`` would find the view's own attribute
+instead of the column."""
+
+
 @dataclass(frozen=True, slots=True)
 class TableRule:
     """A rule on one loaded table: ``check(view)`` returns a bool, or a boolean array over the
@@ -332,6 +363,17 @@ class Table:
     doc: str = ""
     metadata: tuple[str, ...] = ()
     rules: tuple[TableRule, ...] = ()
+
+    def __post_init__(self) -> None:
+        names = [c.name for c in self.columns]
+        if len(set(names)) != len(names):
+            raise ValueError(f"table {self.name}: column names must be unique")
+        for name in names:
+            if name in TABLE_VIEW_ATTRIBUTES or name.startswith("_"):
+                raise ValueError(
+                    f"table {self.name}: column {name!r} would be shadowed by TableView.{name} "
+                    f"in a rule's view.{name}; rename the column"
+                )
 
     def decl(self) -> ir.TableDecl:
         return ir.TableDecl(
@@ -418,8 +460,7 @@ class ScenarioInput:
     def __post_init__(self) -> None:
         if self.covers is not None:
             lo, hi = self.covers
-            _check_month_spec(lo, f"scenario input {self.name}: covers")
-            _check_month_spec(hi, f"scenario input {self.name}: covers")
+            _check_window(lo, hi, f"scenario input {self.name}: covers")
 
     @property
     def file_column(self) -> str:
@@ -539,8 +580,7 @@ class Invariant:
             raise ValueError(f"invariant {self.name}: tol must be at least 0")
         if self.months is not None:
             first, last = self.months
-            _check_month_spec(first, f"invariant {self.name}: months")
-            _check_month_spec(last, f"invariant {self.name}: months")
+            _check_window(first, last, f"invariant {self.name}: months")
         if self.loc is None:
             object.__setattr__(self, "loc", _declaration_loc())
 

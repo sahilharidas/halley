@@ -18,6 +18,7 @@ residual covers every policy and the first failing policy is deterministic. A fa
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -60,7 +61,9 @@ def merge_results(batches: Sequence[Sequence[InvariantResult]]) -> list[Invarian
         column = [results[i] for results in batches]
         failed = [r for r in column if not r.passed]
         detail = failed[0].detail if failed else column[0].detail
-        merged.append(InvariantResult(name, not failed, max(r.worst for r in column), detail))
+        # a residual that is not a number is the worst there is, whichever batch it came from
+        worst = max(math.inf if math.isnan(r.worst) else r.worst for r in column)
+        merged.append(InvariantResult(name, not failed, worst, detail))
     return merged
 
 
@@ -306,13 +309,25 @@ def _as_array(value: Any, dtype: Any) -> NDArray[Any]:
     return arr
 
 
+def _mask(inv: Invariant, a: BatchView) -> NDArray[np.bool_] | None:
+    """The ``where`` mask as a boolean array; a mask of any other dtype is refused, as the
+    loader refuses a rule that does not return booleans, so a forgotten comparison cannot
+    silently mask every month out."""
+    if inv.where is None:
+        return None
+    raw = np.asarray(inv.where(a))
+    if raw.dtype != np.bool_:
+        raise RunError(f"where must return booleans, not {raw.dtype}")
+    return _as_array(raw, np.bool_)
+
+
 def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
     try:
         lhs = _as_array(inv.lhs(a) if callable(inv.lhs) else inv.lhs, np.float64)
         rhs = _as_array(inv.rhs(a) if callable(inv.rhs) else inv.rhs, np.float64)
         lhs, rhs = np.broadcast_arrays(lhs, rhs)
         scale = _as_array(inv.scale(a, lhs, rhs) if callable(inv.scale) else inv.scale, np.float64)
-        mask = _as_array(inv.where(a), np.bool_) if inv.where is not None else None
+        mask = _mask(inv, a)
     except RunError as exc:
         raise RunError(f"invariant {inv.name}: {exc.message}", inv.loc) from exc
     except Exception as exc:  # the invariant's own failure
@@ -325,7 +340,9 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
         resid = lhs - rhs
     try:
         bound = inv.tol * scale
-        bad = resid > bound
+        # the spec's rule is |a - b| <= tol * scale, which is false for a residual that is not a
+        # number (0 / 0, inf - inf), so a NaN or an infinite residual fails
+        bad = ~(resid <= bound)
         if mask is not None:
             bad = bad & mask
             resid = np.where(mask, resid, 0.0)
@@ -340,6 +357,16 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
             inv.loc,
         )
     first, last = inv.window(a.H)
+    if last < first:
+        raise RunError(
+            f"invariant {inv.name}: months ({first}, {last}) is an empty window at H = {a.H}",
+            inv.loc,
+        )
+    if first < 0 or last > a.H:
+        raise RunError(
+            f"invariant {inv.name}: months ({first}, {last}) is outside 0..{a.H} at H = {a.H}",
+            inv.loc,
+        )
     n_window = last - first + 1
     n_time = shape[0]
     if inv.months is not None and n_time == a.H + 1 and n_window != n_time:
@@ -352,7 +379,12 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
             f"invariant {inv.name}: its arrays have {n_time} months, not {n_window}{hint}",
             inv.loc,
         )
-    worst = float(max(resid.max(), 0.0)) if resid.size else 0.0
+    if resid.size == 0:
+        raise RunError(f"invariant {inv.name}: its arrays are empty; nothing was checked", inv.loc)
+    finite = np.isfinite(resid)
+    worst = float(max(resid[finite].max(), 0.0)) if finite.any() else 0.0
+    if not finite.all():
+        worst = math.inf
     if not bad.any():
         return InvariantResult(inv.name, True, worst, "")
     i, p, s = (int(x) for x in np.argwhere(bad)[0])
@@ -364,19 +396,28 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
     if shape[2] > 1:
         parts.append(f"scenario {s}")
     where = ", ".join(parts) or "the batch"
+    r = float(resid[i, p, s])
+    verdict = (
+        "is not a number"
+        if math.isnan(r)
+        else f"{r!r} exceeds the tolerance {float(bound[i, p, s])!r}"
+    )
     detail = (
         f"{where}: lhs = {float(lhs[i, p, s])!r}, rhs = {float(rhs[i, p, s])!r}; the residual "
-        f"{float(resid[i, p, s])!r} exceeds the tolerance {float(bound[i, p, s])!r}"
+        f"{verdict}"
     )
     return InvariantResult(inv.name, False, worst, detail + (f" ({inv.doc})" if inv.doc else ""))
 
 
 def check_declared(invariants: Sequence[Invariant], view: BatchView) -> list[InvariantResult]:
-    """Evaluate the product's invariants on one batch, in declaration order. The first failure
-    raises a :class:`~halley.errors.RunError` naming the invariant, the first failing policy and
-    month, located at the invariant's declaration."""
-    results = [_evaluate(inv, view) for inv in invariants]
-    for inv, r in zip(invariants, results, strict=True):
+    """Evaluate the product's invariants on one batch, in declaration order, stopping at the
+    first failure, which raises a :class:`~halley.errors.RunError` naming the invariant, the
+    first failing policy and month, located at the invariant's declaration (so a later
+    invariant that cannot even be evaluated never hides it)."""
+    results: list[InvariantResult] = []
+    for inv in invariants:
+        r = _evaluate(inv, view)
         if not r.passed:
             raise RunError(f"invariant {r.name} failed: {r.detail}", inv.loc)
+        results.append(r)
     return results

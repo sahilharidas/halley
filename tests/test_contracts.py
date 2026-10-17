@@ -16,8 +16,21 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from halley import Invariant, LoadError, RunSettings, ScenarioInput, build, load_run, run
+from halley import (
+    Column,
+    InputRule,
+    Invariant,
+    Key,
+    LoadError,
+    RunSettings,
+    ScenarioInput,
+    Table,
+    build,
+    load_run,
+    run,
+)
 from halley.authoring import ScenarioView, TableView
+from halley.authoring.contracts import TABLE_VIEW_ATTRIBUTES
 from halley.runtime import load_table
 from models import (
     VAL,
@@ -90,9 +103,96 @@ def test_input_rules_run_after_every_input_is_loaded(tmp_path: Path) -> None:
         run_ruled(tmp_path, tables=ruled_tables(base_year="2020"))
     with pytest.raises(
         LoadError,
-        match=r"input rule every k is at most the horizon fails for 1 of 3 values \(a fixed",
+        match=r"input rule every k is at most the horizon fails for 1 of 3 values, first for "
+        r"policy S02 \(a fixed",
     ):
         run_ruled(tmp_path, horizon=3)
+
+
+def _run_rules(tmp_path: Path, *rules: InputRule) -> None:
+    class Sub(Ruled):
+        input_rules = rules
+
+    run(
+        build(Sub),
+        model_points=simple_model_points(),
+        tables=ruled_tables(),
+        scenarios=ruled_scenarios(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "sub",
+    )
+
+
+def test_input_rule_failures_name_the_table_key_policy_or_scenario_row(tmp_path: Path) -> None:
+    # the result has the dense shape of exactly one table: the first failing key
+    with pytest.raises(
+        LoadError,
+        match=r"input rule q below 1 fails for 2 of 12 values, first at sex = M, age = 25 of "
+        r"table mort \(q closes the table\)",
+    ):
+        _run_rules(
+            tmp_path, InputRule("q below 1", lambda v: v.tables["mort"].q < 1, "q closes the table")
+        )
+    # a rule fixing one key names the other, as a table rule does
+    with pytest.raises(LoadError, match=r"fails for 2 of 2 values, first at sex = M of table mort"):
+        _run_rules(
+            tmp_path, InputRule("q at 25 is 0", lambda v: v.tables["mort"].at("q", age=25) == 0)
+        )
+    # one value per scenario and month of exactly one scenario input: the first failing row
+    with pytest.raises(
+        LoadError,
+        match=r"input rule cpi above 101 fails for \d+ of 54 values, first for scenario 0, "
+        r"month -14 of scenario input cpi",
+    ):
+        _run_rules(tmp_path, InputRule("cpi above 101", lambda v: v.scenarios["cpi"].values > 101))
+    # one value per scenario fits both scenario inputs, so only the position can be named
+    with pytest.raises(
+        LoadError,
+        match=r"input rule df\(0\) = 2 fails for 2 of 2 values, first at element 0 of the rule's "
+        r"result",
+    ):
+        _run_rules(tmp_path, InputRule("df(0) = 2", lambda v: v.scenarios["df"].at(0) == 2.0))
+    # a single failing value names where it is without a count: the table when every key is
+    # fixed, else its position
+    with pytest.raises(LoadError, match=r"input rule q\(M, 25\) is 0 fails in table mort$"):
+        _run_rules(
+            tmp_path,
+            InputRule("q(M, 25) is 0", lambda v: v.tables["mort"].at("q", sex="M", age=25) == 0),
+        )
+    with pytest.raises(LoadError, match=r"input rule alpha is 1 fails at element 0 of the rule's"):
+        _run_rules(tmp_path, InputRule("alpha is 1", lambda v: v.tables["params"].alpha[None] == 1))
+
+
+def test_a_table_column_may_not_shadow_the_view(tmp_path: Path) -> None:
+    assert {
+        "at",
+        "columns",
+        "index",
+        "key_range",
+        "key_values",
+        "keys",
+        "metadata",
+        "name",
+        "shape",
+    } <= TABLE_VIEW_ATTRIBUTES
+    with pytest.raises(
+        ValueError,
+        match=r"table t: column 'name' would be shadowed by TableView\.name in a rule's view\.name",
+    ):
+        Table("t", keys=(), columns=(Column("name", "Factor"),))
+    with pytest.raises(ValueError, match="column 'shape' would be shadowed"):
+        Table(
+            "t",
+            keys=(Key("age", lo=0, hi=1),),
+            columns=(Column("q", "Factor"), Column("shape", "Factor")),
+        )
+    with pytest.raises(ValueError, match="table t: column names must be unique"):
+        Table("t", keys=(), columns=(Column("q", "Factor"), Column("q", "Factor")))
+    res = run_ruled(tmp_path)
+    assert res.inputs is not None
+    view = res.inputs.tables["mort"].view()
+    assert view.name == "mort"
+    assert view["q"] is view.q
 
 
 # ---------------------------------------------------------------------------- scenarios
@@ -166,6 +266,8 @@ def test_covers_is_spelled_as_a_month_or_h() -> None:
     assert ScenarioInput("x", "Factor", covers=(-2, "H-1")).covers == (-2, "H-1")
     with pytest.raises(ValueError, match="a month is an int, 'H' or 'H-k'"):
         ScenarioInput("x", "Factor", covers=(0, "T"))
+    with pytest.raises(ValueError, match=r"scenario input x: covers: \(5, 2\) is an empty window"):
+        ScenarioInput("x", "Factor", covers=(5, 2))
     with pytest.raises(ValueError, match="invariant bad: months: a month is an int, 'H' or"):
         Invariant("bad", 1.0, months=(0, "H+1"))
 

@@ -26,6 +26,7 @@ from halley import (
     var,
 )
 from halley.authoring import BatchView
+from halley.runtime.invariants import InvariantResult, merge_results
 from models import (
     VAL,
     Growth,
@@ -411,3 +412,217 @@ def test_helpers_may_be_annotated_with_the_batch_view() -> None:
 
     assert Annotated.invariants[0].lhs is helper
     assert isinstance(Annotated.invariants[0].rhs, float)
+
+
+def test_an_eq_failure_pins_the_residual_against_the_tolerance(tmp_path: Path) -> None:
+    class Offset(Growth):
+        invariants = (
+            Invariant(
+                "x = x + a half",
+                lambda a: a.var("x"),
+                lambda a: a.var("x") + 0.5,
+                tol=1e-9,
+                doc="a deliberate offset",
+            ),
+        )
+
+    with pytest.raises(RunError, match="invariant x = x \\+ a half failed: ") as info:
+        _run(Offset, tmp_path)
+    assert (
+        "policy S00, t = 0: lhs = 1.0, rhs = 1.5; the residual 0.5 exceeds the tolerance 1e-09 "
+        "(a deliberate offset)" in str(info.value)
+    )
+
+
+def test_a_callable_scale_near_miss_fails_and_a_nearer_one_passes(tmp_path: Path) -> None:
+    def relative(a: BatchView, lhs: Any, rhs: Any) -> Any:
+        return np.maximum(np.abs(lhs), np.abs(rhs))
+
+    class Near(_Scaled):
+        invariants = (
+            Invariant(
+                "x within a billionth of x",
+                lambda a: a.var("x"),
+                lambda a: a.var("x") * (1 + 5e-10),
+                tol=1e-9,
+                scale=relative,
+            ),
+        )
+
+    res = _run(Near, tmp_path, "near")
+    r = res.invariants[-1]
+    assert r.passed
+    assert 1e-10 < r.worst < 2e-9  # 5e-10 of x(0) = 3 for S02
+
+    class Over(_Scaled):
+        invariants = (
+            Invariant(
+                "x within a billionth of x",
+                lambda a: a.var("x"),
+                lambda a: a.var("x") * (1 + 2e-9),
+                tol=1e-9,
+                scale=relative,
+            ),
+        )
+
+    with pytest.raises(
+        RunError, match=r"failed: policy S00, t = 0: lhs = 1\.0, rhs = 1\.000000002"
+    ):
+        _run(Over, tmp_path, "over")
+
+
+def test_where_excludes_the_months_and_policies_it_masks(tmp_path: Path) -> None:
+    class Unmasked(Growth):
+        invariants = (
+            Invariant("cf below 85", lambda a: a.var("cf")[1:], 85.0, kind="le", months=(1, "H")),
+        )
+
+    # S02: cf(1) = 3 * 30 = 90, falling by 1% a month; below 85 from t = 7
+    with pytest.raises(RunError, match=r"failed: policy S02, t = 1: lhs = 90\.0, rhs = 85\.0"):
+        _run(Unmasked, tmp_path, "unmasked")
+
+    class LateMonths(Growth):
+        invariants = (
+            Invariant(
+                "cf below 85 from t = 7",
+                lambda a: a.var("cf")[1:],
+                85.0,
+                kind="le",
+                months=(1, "H"),
+                where=lambda a: a.t[1:] > 6,
+            ),
+        )
+
+    res = _run(LateMonths, tmp_path, "late")
+    assert res.invariants[-1].passed
+    assert res.invariants[-1].worst == 0.0  # the masked residuals count for nothing
+
+    class OtherPolicies(Growth):
+        invariants = (
+            Invariant(
+                "cf below 85 but for the largest premium",
+                lambda a: a.var("cf")[1:],
+                85.0,
+                kind="le",
+                months=(1, "H"),
+                where=lambda a: a.mp.premium < 30,
+            ),
+        )
+
+    res = _run(OtherPolicies, tmp_path, "others", batch_size=2)
+    assert res.invariants[-1].passed
+    assert res.invariants[-1].worst == 0.0
+
+
+def test_a_residual_that_is_not_a_number_fails(tmp_path: Path) -> None:
+    class NotANumber(Growth):
+        invariants = (
+            Invariant("nan lhs", lambda a: a.var("x") * np.nan, lambda a: a.var("x"), tol=0),
+        )
+
+    with pytest.raises(
+        RunError,
+        match=r"invariant nan lhs failed: policy S00, t = 0: lhs = nan, rhs = 1\.0; the residual "
+        r"is not a number",
+    ):
+        _run(NotANumber, tmp_path, "nan")
+    assert not (tmp_path / "nan" / "invariants.json").exists()
+    assert not (tmp_path / "nan" / "manifest.json").exists()
+
+    class Infinite(Growth):
+        invariants = (
+            Invariant("inf lhs", lambda a: a.var("x") * np.inf, lambda a: a.var("x"), tol=0),
+        )
+
+    with pytest.raises(RunError, match=r"lhs = inf, rhs = 1\.0; the residual inf exceeds the "):
+        _run(Infinite, tmp_path, "inf")
+
+    class MaskedOut(Growth):
+        """A division that is not a number only where the mask excludes it."""
+
+        invariants = (
+            Invariant(
+                "nan outside the mask",
+                lambda a: np.where(a.t > 0, a.var("x"), np.nan),
+                lambda a: a.var("x"),
+                tol=0,
+                where=lambda a: a.t > 0,
+            ),
+        )
+
+    res = _run(MaskedOut, tmp_path, "masked")
+    assert res.invariants[-1].passed
+    assert res.invariants[-1].worst == 0.0
+    on_disk = (tmp_path / "masked" / "invariants.json").read_text(encoding="utf-8")
+    assert "NaN" not in on_disk
+    assert "Infinity" not in on_disk
+    assert all(np.isfinite(r["worst"]) for r in json.loads(on_disk))
+
+
+def test_merging_never_loses_a_residual_that_is_not_a_number() -> None:
+    ok = InvariantResult("r", True, 0.5, "")
+    nan = InvariantResult("r", True, float("nan"), "")
+    assert merge_results([[nan], [ok]])[0].worst == float("inf")
+    assert merge_results([[ok], [nan]])[0].worst == float("inf")
+    assert merge_results([[ok], [ok]])[0].worst == 0.5
+
+
+def test_where_must_return_booleans(tmp_path: Path) -> None:
+    class Forgotten(Growth):
+        invariants = (
+            Invariant(
+                "a mask without a comparison",
+                lambda a: a.var("x"),
+                0.0,
+                kind="ge",
+                tol=0,
+                where=lambda a: a.var("x") * 0.0,
+            ),
+        )
+
+    with pytest.raises(
+        RunError, match="invariant a mask without a comparison: where must return booleans, not"
+    ) as info:
+        _run(Forgotten, tmp_path)
+    assert "float64" in str(info.value)
+    assert info.value.loc is not None
+    assert Path(info.value.loc.file) == Path(__file__)
+
+
+def test_an_empty_or_misplaced_window_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"invariant bad: months: \(5, 2\) is an empty window"):
+        Invariant("bad", 1.0, months=(5, 2))
+    with pytest.raises(ValueError, match=r"months: \('H', 'H-1'\) is an empty window"):
+        Invariant("bad", 1.0, months=("H", "H-1"))
+    assert Invariant("fine", 1.0, months=("H-1", "H")).months == ("H-1", "H")
+    assert Invariant("fine", 1.0, months=(3, 3)).months == (3, 3)
+
+    class Reversed(Growth):
+        # the order of a mixed pair depends on the horizon, so it is checked at the run
+        invariants = (Invariant("reversed", lambda a: a.var("x"), 0.0, months=("H", 3)),)
+
+    with pytest.raises(RunError, match=r"months \(12, 3\) is an empty window at H = 12"):
+        _run(Reversed, tmp_path, "reversed")
+
+    class Early(Growth):
+        invariants = (Invariant("early", lambda a: a.var("x"), 0.0, months=(0, "H-13")),)
+
+    with pytest.raises(RunError, match=r"months \(0, -1\) is an empty window at H = 12"):
+        _run(Early, tmp_path, "early")
+
+    class Outside(Growth):
+        invariants = (Invariant("outside", lambda a: a.var("x"), 0.0, months=(-1, "H")),)
+
+    with pytest.raises(RunError, match=r"months \(-1, 12\) is outside 0\.\.12 at H = 12"):
+        _run(Outside, tmp_path, "outside")
+
+
+def test_a_failure_is_reported_before_a_later_invariant_is_evaluated(tmp_path: Path) -> None:
+    class FailThenRaise(Growth):
+        invariants = (
+            Invariant("fails", lambda a: a.var("x"), -1.0, kind="le", tol=0),
+            Invariant("raises", lambda a: a.var("nope"), 0.0),
+        )
+
+    with pytest.raises(RunError, match=r"invariant fails failed: policy S00, t = 0: lhs = 1\.0"):
+        _run(FailThenRaise, tmp_path)

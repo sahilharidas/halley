@@ -672,6 +672,45 @@ def load_inputs(
         for rule in input_rules:
             ok = _run_check(rule.check, view, f"input rule {rule.name}")
             if not ok.all():
-                count = f" for {int((~ok).sum())} of {ok.size} values" if ok.ndim else ""
-                raise LoadError(f"input rule {rule.name} fails{count}{_doc(rule.doc)}")
+                where = _first_failing_input(view, inputs.ids, ok)
+                raise LoadError(f"input rule {rule.name} fails{where}{_doc(rule.doc)}")
     return inputs
+
+
+def _lines_up(ok: NDArray[np.bool_], shape: tuple[int, ...]) -> bool:
+    """Whether a rule's result has a table's dense shape, axes of length 1 allowed."""
+    return (
+        ok.ndim == len(shape)
+        and ok.ndim > 0
+        and all(n in (1, full) for n, full in zip(ok.shape, shape, strict=True))
+    )
+
+
+def _first_failing_input(view: InputView, ids: NDArray[Any], ok: NDArray[np.bool_]) -> str:
+    """Where an input rule first fails, by the shape of its result: ``at sex = M, age = 25 of
+    table mort`` when it lines up with exactly one table's dense shape, ``for policy P05`` when
+    it runs over the model points, ``for scenario 1, month -14 of scenario input cpi`` when it
+    lines up with exactly one scenario input, else the element's position (also when the shape
+    fits more than one input); with the count of failing values when the result has more than
+    one."""
+    if ok.ndim == 0:
+        return ""
+    candidates: list[str] = []
+    for name, table in view.tables.items():
+        if _lines_up(ok, table.shape):
+            key = _first_failing_key(table, ok).removeprefix(" at ")
+            candidates.append(f"at {key} of table {name}" if key else f"in table {name}")
+    if ok.shape == ids.shape:
+        candidates.append(f"for policy {ids[int(np.flatnonzero(~ok)[0])]}")
+    for name, scen in view.scenarios.items():
+        row = _first_failing_row(scen, ok)
+        if row:
+            candidates.append(f"{row.strip()} of scenario input {name}")
+    where = (
+        candidates[0]
+        if len(candidates) == 1
+        else f"at element {int(np.flatnonzero(~ok.reshape(-1))[0])} of the rule's result"
+    )
+    if ok.size == 1:
+        return f" {where}"
+    return f" for {int((~ok).sum())} of {ok.size} values, first {where}"

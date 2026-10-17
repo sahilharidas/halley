@@ -199,14 +199,18 @@ def _h5b_lhs(a: BatchView) -> NDArray[Any]:
 
 def _h5b_rhs(a: BatchView) -> NDArray[Any]:
     """The discounted net outgo of months u+1..H, for u = 0..H-1: month s contributes
-    outgo(s) disc(s) - income(s) disc(s-1), summed from H downwards (a fixed order)."""
+    outgo(s) disc(s) - income(s) disc(s-1), accumulated in ascending s as the spec states
+    (section 12, H5b): rhs(u) = ((term(u+1) + term(u+2)) + ...) + term(H), one running total
+    per u from an exact zero. Every u is accumulated in one pass over s, O(H^2) elements."""
     disc = a.var("disc")
     outgo = (a.var("death_outgo") + a.var("claim_expense") + a.var("maint_expense")) * disc
     income = np.zeros_like(outgo)
     income[1:] = (a.var("premium_income")[1:] - a.var("commission")[1:]) * disc[:-1]
     term = outgo - income
-    tail = np.cumsum(term[::-1], axis=0)[::-1]  # tail[u] = sum over s = u..H
-    return tail[1:]
+    rhs = np.zeros_like(term[:-1])
+    for s in range(1, a.H + 1):
+        rhs[:s] += term[s]  # month s enters the running total of every u < s
+    return rhs
 
 
 _FLOWS = ("premium_income", "commission", "maint_expense", "death_outgo", "claim_expense")
