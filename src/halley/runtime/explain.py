@@ -123,6 +123,8 @@ class Lane:
         if isinstance(node, ir.ScenAt):
             sc = self.inputs.scenarios[node.name]
             return sc.values[int(self.eval(node.index, t)) - sc.u0, 0, self.s].item()
+        if isinstance(node, ir.RunConst):
+            return self.inputs.run[node.name]
         if isinstance(node, ir.Unary):
             a = self.eval(node.a, t)
             return -a if node.op == "neg" else (not a)
@@ -175,19 +177,47 @@ def _binary(op: str, a: Any, b: Any) -> Any:
     raise HalleyError(f"unknown operator {op}")
 
 
+def _ufunc(fn: str, x: Any) -> Any:
+    """``np.<fn>`` of one value through the same NumPy loop the generated code runs, so that
+    ``exp`` and friends agree with the backend bit for bit (the C library and NumPy's own
+    vector implementations may differ in the last place)."""
+    return getattr(np, fn)(np.float64(x)).item()
+
+
 def _call(fn: str, args: list[Any]) -> Any:
-    if fn == "to_monthly":
-        return ((1 + args[0]) ** (1 / 12)) - 1
-    if fn == "to_monthly_prob":
-        return 1 - ((1 - args[0]) ** (1 / 12))
-    if fn in ("exp", "log", "expm1", "log1p", "sqrt"):
-        return getattr(math, fn)(args[0])
-    if fn == "minimum":
-        return min(args[0], args[1])
-    if fn == "maximum":
-        return max(args[0], args[1])
-    if fn == "abs":
-        return abs(args[0])
+    """Each formula function in the emitted form of the backend (``_Generator.call``), written
+    with the same grouping so the two agree bit for bit (D19)."""
+    try:
+        if fn == "to_monthly":
+            return ((1 + args[0]) ** (1 / 12)) - 1
+        if fn == "to_monthly_prob":
+            return 1 - ((1 - args[0]) ** (1 / 12))
+        if fn == "to_monthly_cf":
+            q = args[0]
+            inner = 0.0 if q >= 1 else q
+            return 1.0 if q >= 1 else -_ufunc("expm1", _ufunc("log1p", -inner) / 12)
+        if fn == "annual_step":
+            return 1 + args[0]
+        if fn == "cc_discount":
+            return _ufunc("exp", ((-args[0]) * args[1]) / 12)
+        if fn == "fwd_rate":
+            return (args[0] / args[1]) - 1
+        if fn == "ann_fwd":
+            return ((args[0] / args[1]) ** 12) - 1
+        if fn == "ann_spot":
+            return (args[0] ** (-12 / args[1])) - 1
+        if fn == "as_cu":
+            return args[0]
+        if fn in ("exp", "log", "expm1", "log1p", "sqrt"):
+            return _ufunc(fn, args[0])
+        if fn == "minimum":
+            return min(args[0], args[1])
+        if fn == "maximum":
+            return max(args[0], args[1])
+        if fn == "abs":
+            return abs(args[0])
+    except ZeroDivisionError:
+        return math.nan  # a discarded where() branch may divide by zero
     raise HalleyError(f"unknown function {fn}")
 
 
@@ -195,7 +225,17 @@ def _leaves(node: ir.Node) -> list[ir.Node]:
     out: list[ir.Node] = []
     for n in ir.walk(node):
         if isinstance(
-            n, (ir.VarRead, ir.VarAt, ir.SumT, ir.MpField, ir.TableLookup, ir.ScenRead, ir.ScenAt)
+            n,
+            (
+                ir.VarRead,
+                ir.VarAt,
+                ir.SumT,
+                ir.MpField,
+                ir.TableLookup,
+                ir.ScenRead,
+                ir.ScenAt,
+                ir.RunConst,
+            ),
         ):
             out.append(n)
     return out

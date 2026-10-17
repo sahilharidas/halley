@@ -146,6 +146,9 @@ class Sym:
     def __invert__(self) -> Sym:
         return Sym(ir.Unary(current_loc(), "not", self.node))
 
+    def __abs__(self) -> Sym:
+        return Sym(ir.Call(current_loc(), "abs", (self.node,)))
+
     # ----------------------------------------------------------------- forbidden uses
     def __bool__(self) -> bool:
         raise BuildError(
@@ -185,22 +188,13 @@ def as_node(value: object, loc: Loc | None) -> ir.Node:
 
 
 def offset_of(arg: object, loc: Loc | None, what: str) -> int:
-    """The constant offset ``k`` of a read written ``x(t + k)``."""
+    """The constant offset ``k`` of a read written ``x(t + k)``: an add/sub tree over exactly
+    one ``t`` (with net sign +1) and integer constants folds to one offset, so ``(t - 3) - 12``,
+    ``t - (L + 12)`` and ``t + 1 - 1`` are constant offsets; anything else is not."""
     if isinstance(arg, Sym):
-        node = arg.node
-        if isinstance(node, ir.TimeIndex):
-            return 0
-        if isinstance(node, ir.Binary) and node.op in ("add", "sub"):
-            a, b = node.a, node.b
-            if isinstance(a, ir.TimeIndex) and isinstance(b, ir.Const) and _is_int(b.value):
-                return int(b.value) if node.op == "add" else -int(b.value)
-            if (
-                node.op == "add"
-                and isinstance(b, ir.TimeIndex)
-                and isinstance(a, ir.Const)
-                and _is_int(a.value)
-            ):
-                return int(a.value)
+        folded = _fold_offset(arg.node)
+        if folded is not None:
+            return folded
         raise BuildError(
             f"the time offset of {what} must be a constant: {what}(t), {what}(t-1), {what}(t+1); "
             "data-dependent offsets go through lag() with declared bounds, and a fixed month "
@@ -214,6 +208,33 @@ def offset_of(arg: object, loc: Loc | None, what: str) -> int:
             loc,
         )
     raise BuildError(f"{what}() takes the time index t, with a constant offset", loc)
+
+
+def _fold_offset(node: ir.Node) -> int | None:
+    """``k`` when ``node`` is ``t + k`` written as any add/sub tree, else ``None``."""
+    linear = _linear(node, 1)
+    if linear is None:
+        return None
+    n_t, t_sign, k = linear
+    if n_t != 1 or t_sign != 1:
+        return None
+    return k
+
+
+def _linear(node: ir.Node, sign: int) -> tuple[int, int, int] | None:
+    """``(number of t leaves, their signed sum, the constant)`` of an add/sub tree, or
+    ``None`` when a leaf is anything but ``t`` or an integer constant."""
+    if isinstance(node, ir.TimeIndex):
+        return (1, sign, 0)
+    if isinstance(node, ir.Const):
+        return (0, 0, sign * int(node.value)) if _is_int(node.value) else None
+    if isinstance(node, ir.Binary) and node.op in ("add", "sub"):
+        a = _linear(node.a, sign)
+        b = _linear(node.b, sign if node.op == "add" else -sign)
+        if a is None or b is None:
+            return None
+        return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+    return None
 
 
 def _is_int(value: object) -> bool:

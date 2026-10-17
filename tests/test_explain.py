@@ -12,6 +12,7 @@ import pytest
 from halley import CompiledModel, RunResult, RunSettings, diff, explain, run
 from halley.products.term_assurance import VALUATION_DATE
 from halley.runtime import recompute, within
+from test_helpers import run_helpers
 
 
 def test_explain_shows_the_formula_and_every_input(term_run: RunResult) -> None:
@@ -43,6 +44,32 @@ def test_recompute_matches_the_engine_lane_by_lane(term_run: RunResult) -> None:
         for t in (0, 1, 2, 3, 13, 14, 15):
             assert recompute(term_run, "P05", name, t) == term_run.lane(name, "P05")[t], (name, t)
     assert recompute(term_run, "P05", "pv_premiums", 0) == term_run.lane("pv_premiums", "P05")[0]
+
+
+def test_recompute_matches_the_generated_code_for_every_helper(tmp_path: Path) -> None:
+    """The interpreter evaluates each helper's emitted form in the same floating-point order as
+    the backend (D19), so the two agree bit for bit on a model that uses every helper, the
+    three pv_month expansions and both run constants."""
+    res = run_helpers(tmp_path)
+    assert res.graph is not None
+    for name, v in res.graph.variables.items():
+        months = range(res.H + 1) if v.has_time else [0]
+        for pid in res.ids:
+            lane = res.lane(name, pid)
+            for t in months:
+                assert recompute(res, pid, name, t) == lane[t], (name, pid, t)
+    e = explain(res, "H01", "cal_year", 3)
+    assert dict(e.inputs) == {"run.m_val": 12 * 2027 + 1 - 1}
+    assert e.value == 2027
+    assert e.unit == "Int"
+    bel = explain(res, "H01", "bel", 5)
+    assert set(dict(bel.inputs)) == {
+        "bel(t+1)",
+        "v(t+1)",
+        "ann_out(t+1)",
+        "exp_out(t+1)",
+        "claims(t+1)",
+    }
 
 
 def test_diff_locates_the_largest_change(

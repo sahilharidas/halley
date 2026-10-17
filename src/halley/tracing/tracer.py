@@ -17,23 +17,29 @@ from halley import ir
 from halley.authoring.product import (
     ModelPoint,
     Product,
+    RunConstants,
     Scenarios,
     Static,
     Tables,
     VarDef,
 )
-from halley.authoring.units import unit_from_annotation
 from halley.errors import BuildError, HalleyError, Loc
 from halley.ir.units import Unit, unit_from_name
 from halley.tracing.symbolic import Sym, TraceContext, as_node, set_context
 
 
 def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.Graph:
-    """Trace a model class into a graph, with the given build-time settings."""
+    """Trace a model class into a graph, with the given build-time settings. An abstract class
+    (one that sets ``abstract = True`` itself) is refused: only its subclasses are models."""
     if not (
         isinstance(model, type) and issubclass(model, Product)  # pyright: ignore[reportUnnecessaryIsInstance]
     ):
         raise BuildError(f"{model!r} is not a Product subclass")
+    if vars(model).get("abstract", False):
+        raise BuildError(
+            f"{model.__qualname__} is abstract (it sets abstract = True); build one of its "
+            "subclasses"
+        )
     resolved = _resolve_statics(model, statics or {})
     var_defs = _collect_vars(model)
     if not var_defs:
@@ -51,6 +57,7 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     inst.mp = ModelPoint(fields)
     inst.tables = Tables(tables)
     inst.scen = Scenarios(scenarios)
+    inst.run = RunConstants()
 
     variables: dict[str, ir.Variable] = {}
     for vd in var_defs.values():
@@ -146,17 +153,7 @@ def _collect_vars(model: type[Product]) -> dict[str, VarDef]:
 def _trace_var(vd: VarDef, inst: Product, fields: dict[str, ir.FieldDecl]) -> ir.Variable:
     fn = vd.fn
     loc = vd.loc
-    try:
-        hints = typing.get_type_hints(fn)
-    except Exception as exc:
-        raise BuildError(f"cannot resolve the annotations of {vd.name}: {exc}", loc) from exc
-    if "return" not in hints:
-        raise BuildError(
-            f"{vd.name} declares no unit; write def {vd.name}(self, t: Int) -> Money (or "
-            "another unit)",
-            loc,
-        )
-    declared = unit_from_annotation(hints["return"], loc)
+    declared = vd.declared_unit()
     ctx = TraceContext(loc.file, fn.__qualname__, loc.line)
     set_context(ctx)
     try:

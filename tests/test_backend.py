@@ -245,6 +245,46 @@ def test_fixed_month_outside_the_horizon_fails(tmp_path: Path) -> None:
         )
 
 
+def test_run_constants_come_from_the_valuation_date_and_horizon(tmp_path: Path) -> None:
+    class Dated(Growth):
+        @var
+        def cal_year(self, t: Int) -> Int:
+            return (self.run.m_val + t) // 12
+
+        @var
+        def m_val(self) -> Int:
+            return self.run.m_val
+
+        @var
+        def months(self) -> Int:
+            return self.run.horizon
+
+    compiled = build(Dated)
+    assert "R_m_val = inp['run.m_val']" in compiled.source
+    assert "R_horizon = H" in compiled.source
+    assert "V_cal_year[1:H+1] = ((R_m_val + _t[1:H+1]) // 12)" in compiled.source
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),  # 2027-01-01
+        run_dir=tmp_path / "dated",
+    )
+    assert res.arrays["m_val"].shape == (1, 1, 1)
+    assert res.lane("m_val", "S00")[0] == 12 * 2027 + 1 - 1
+    assert res.lane("months", "S00")[0] == 12
+    assert list(res.lane("cal_year", "S00")[1:]) == [2027] * 11 + [2028]
+    assert res.arrays["cal_year"].dtype == np.int64
+    longer = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL.replace(month=11), horizon=20),
+        run_dir=tmp_path / "longer",
+    )
+    assert longer.lane("m_val", "S00")[0] == 12 * 2027 + 11 - 1
+    assert longer.lane("months", "S00")[0] == 20
+    assert longer.run_id != res.run_id
+
+
 def test_the_interpreter_agrees_with_the_generated_code(tmp_path: Path) -> None:
     res = run_growth(tmp_path)
     for pid in res.ids:

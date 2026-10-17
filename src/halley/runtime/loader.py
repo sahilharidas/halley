@@ -386,6 +386,15 @@ def load_scenario(decl: ir.ScenarioDecl, source: Source, lo: int, hi: int) -> Lo
 # ----------------------------------------------------------------------------------- inputs
 
 
+def run_constants(valuation_date: dt.date, horizon: int) -> dict[str, int]:
+    """The run constants a formula reads as ``self.run.<name>``: ``m_val``, the valuation month
+    index ``12 * year + month - 1``, and ``horizon``."""
+    return {
+        "m_val": 12 * valuation_date.year + valuation_date.month - 1,
+        "horizon": horizon,
+    }
+
+
 @dataclass(slots=True)
 class Inputs:
     model_points: ModelPoints
@@ -393,6 +402,8 @@ class Inputs:
     scenarios: dict[str, LoadedScenario]
     n_scenarios: int
     H: int
+    run: dict[str, int] = field(default_factory=dict)
+    """The run constants (:func:`run_constants`), supplied to every batch as ``run.<name>``."""
     extras: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -431,6 +442,8 @@ class Inputs:
         for sname, sc in self.scenarios.items():
             inp[f"scen.{sname}"] = sc.values
             inp[f"scen.{sname}.u0"] = sc.u0
+        for rname, value in self.run.items():
+            inp[f"run.{rname}"] = value
         return inp
 
 
@@ -475,4 +488,6 @@ def load_inputs(
     if len(counts) > 1:
         raise LoadError(f"scenario inputs disagree on the number of scenarios: {sorted(counts)}")
     n_scenarios = counts.pop() if counts else 1
-    return Inputs(mp, loaded_tables, loaded_scen, n_scenarios, horizon)
+    return Inputs(
+        mp, loaded_tables, loaded_scen, n_scenarios, horizon, run_constants(valuation_date, horizon)
+    )

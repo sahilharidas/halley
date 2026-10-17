@@ -7,8 +7,20 @@ from typing import Any
 import pytest
 
 from halley import BuildError, Count, Int, Money, Product, Static, build, trace, var, where
-from halley.ir import MpField, VarRead, graph_hash, render
+from halley.ir import MpField, RunConst, VarRead, graph_hash, render, walk
+from halley.products.lifelib_basic_term import BasicTerm
+from halley.products.term_assurance import TermAssurance
 from models import SIMPLE_SCHEMA, Growth
+
+TERM_ASSURANCE_HASH = "33e332cf057ec6340f79c6d88e0750a82d3b641608ce4a1c86d83e83d3bb5a14"
+BASIC_TERM_HASH = "acc1e97143421b336d55ebb3c10b4a1fc17405a3e5a3992ff71f0929f383e1c0"
+
+
+def test_reference_model_graph_hashes_are_pinned() -> None:
+    """The graphs of the two reference models (D22, D23) do not change under engine work: a
+    different hash here means every existing run of them gets a new run id (D21)."""
+    assert graph_hash(trace(TermAssurance)) == TERM_ASSURANCE_HASH
+    assert graph_hash(trace(BasicTerm)) == BASIC_TERM_HASH
 
 
 def test_graph_captures_variables_offsets_and_boundaries() -> None:
@@ -102,6 +114,120 @@ def test_time_offsets_must_be_constants() -> None:
 
     with pytest.raises(BuildError, match=r"at\(x, 5\)"):
         trace(Absolute)
+
+
+def _offsets(model: type[Product], name: str) -> list[int]:
+    return [n.offset for n in walk(trace(model).variables[name].expr) if isinstance(n, VarRead)]
+
+
+def test_time_offsets_fold_add_and_sub_trees() -> None:
+    """An add/sub tree over one ``t`` and integer constants is one constant offset."""
+    lag_m = 3
+
+    class Folded(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+        @var
+        def y(self, t: Int) -> Money:
+            return (
+                self.x((t - 3) - 12)
+                + self.x(t - (lag_m + 12))
+                + self.x(t + 1 - 1)
+                + self.x(1 + t)
+                + self.x((2 + t) - 1)
+                + self.x(t - 3 + 1 - 1)
+            )
+
+    assert _offsets(Folded, "y") == [-15, -15, 0, 1, 1, -3]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["t * 1", "t - (t - 1)", "t + 0.5", "t - mp.k", "-t + 2 * t"],
+)
+def test_time_offsets_that_are_not_one_t_plus_a_constant_are_rejected(case: str) -> None:
+    class Bad(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+        @var
+        def y(self, t: Int) -> Money:
+            if case == "t * 1":
+                return self.x(t * 1)
+            if case == "t - (t - 1)":
+                return self.x(t - (t - 1))
+            if case == "t + 0.5":
+                return self.x(t + 0.5)  # type: ignore[operator]
+            if case == "t - mp.k":
+                return self.x(t - self.mp.k)
+            return self.x(-t + 2 * t)
+
+    with pytest.raises(BuildError, match="the time offset of x must be a constant") as info:
+        trace(Bad)
+    assert "lag()" in str(info.value)
+    assert "at(x, k)" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Bad.y")
+
+
+def test_run_constants_are_read_as_self_run() -> None:
+    class Dated(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def cal_year(self, t: Int) -> Int:
+            return (self.run.m_val + t) // 12
+
+        @var
+        def months(self) -> Int:
+            return self.run.horizon
+
+    g = trace(Dated)
+    assert render(g.variables["cal_year"].expr) == "((run.m_val + t) // 12)"
+    assert isinstance(g.variables["months"].expr, RunConst)
+    assert graph_hash(g) != graph_hash(trace(Growth))
+
+    class Unknown(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self) -> Int:
+            return self.run.valuation_year
+
+    with pytest.raises(BuildError, match="the run has no constant 'valuation_year'") as info:
+        trace(Unknown)
+    assert "m_val, horizon" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Unknown.x")
+
+
+def test_abstract_classes_are_refused_and_the_flag_is_not_inherited() -> None:
+    class Base(Product):
+        abstract = True
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    class Concrete(Base):
+        pass
+
+    class AbstractAgain(Concrete):
+        abstract = True
+
+    with pytest.raises(BuildError, match="Base is abstract"):
+        build(Base)
+    assert render(build(Concrete).graph.variables["x"].expr) == "(mp.premium * mp.pols_if_init)"
+    with pytest.raises(BuildError, match="AbstractAgain is abstract"):
+        trace(AbstractAgain)
 
 
 def test_unknown_and_unreadable_fields() -> None:

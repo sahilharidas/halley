@@ -9,7 +9,11 @@ the type checker.
 v1 units (D11): ``Money``, ``MoneyPerPolicy``, ``Count``, ``Prob`` with a period tag,
 ``Rate[Annual]`` and ``Rate[Monthly]``. The dimensionless ``Factor`` (also written ``Fraction``)
 and the exact types ``Int`` and ``Bool`` are the extensions the term assurance spec needs (its
-section 15.4). A unit mismatch is always an error, never a warning.
+section 15.4). The annuity spec adds ``Index`` (a price index level), ``CoverageUnits`` (the
+IFRS 17 coverage units, which are not money) and the compounding tag on annual rates:
+``Rate[Annual]`` is the effective rate (also written ``Rate[Annual, Effective]``), and
+``Rate[Annual, Continuous]`` the continuously compounded one, which accumulates only through
+``cc_discount()``. A unit mismatch is always an error, never a warning.
 """
 
 from __future__ import annotations
@@ -37,8 +41,15 @@ PROB: Final = Unit("Prob")
 PROB_ANNUAL: Final = Unit("Prob[Annual]")
 PROB_MONTHLY: Final = Unit("Prob[Monthly]")
 RATE_ANNUAL: Final = Unit("Rate[Annual]")
+"""The effective annual rate. ``Rate[Annual, Effective]`` is a second spelling of this tag."""
+RATE_ANNUAL_CC: Final = Unit("Rate[Annual, Continuous]")
+"""A continuously compounded annual rate (a force): ``1 + rate`` has no meaning for it."""
 RATE_MONTHLY: Final = Unit("Rate[Monthly]")
 FACTOR: Final = Unit("Factor")
+INDEX: Final = Unit("Index")
+"""A price index level (CPI). Only ratios and differences of two levels have a meaning."""
+COVERAGE_UNITS: Final = Unit("CoverageUnits")
+"""IFRS 17 coverage units: a quantity of service, not money; ``as_cu()`` converts an amount."""
 INT: Final = Unit("Int")
 BOOL: Final = Unit("Bool")
 NUMBER: Final = Unit("number")
@@ -49,11 +60,15 @@ ENUM: Final = Unit("enum")
 """A string value: a table key or the operand of an equality test, nothing else."""
 
 PROBS: Final = frozenset({PROB, PROB_ANNUAL, PROB_MONTHLY})
-RATES: Final = frozenset({RATE_ANNUAL, RATE_MONTHLY})
+RATES_EFFECTIVE: Final = frozenset({RATE_ANNUAL, RATE_MONTHLY})
+"""Effective rates: ``1 + rate`` is their accumulation factor."""
+RATES: Final = RATES_EFFECTIVE | {RATE_ANNUAL_CC}
 LITERALS: Final = frozenset({NUMBER, INTEGER})
-SCALED: Final = frozenset({MONEY, MONEY_PP, COUNT, FACTOR} | RATES | PROBS)
+SCALED: Final = frozenset({MONEY, MONEY_PP, COUNT, FACTOR, INDEX, COVERAGE_UNITS} | RATES | PROBS)
 """Units a dimensionless factor or a literal scales without changing them."""
 INT_LIKE: Final = frozenset({INT, INTEGER})
+SUMMABLE: Final = frozenset({MONEY, MONEY_PP, COUNT, FACTOR, COVERAGE_UNITS})
+"""Units ``sum_t()`` adds over time. An ``Index`` level is not summed."""
 
 ALL_UNITS: Final = (
     MONEY,
@@ -63,8 +78,11 @@ ALL_UNITS: Final = (
     PROB_ANNUAL,
     PROB_MONTHLY,
     RATE_ANNUAL,
+    RATE_ANNUAL_CC,
     RATE_MONTHLY,
     FACTOR,
+    INDEX,
+    COVERAGE_UNITS,
     INT,
     BOOL,
     ENUM,
@@ -94,6 +112,8 @@ _PRODUCTS: Final[dict[frozenset[Unit], Unit]] = {
     frozenset({RATE_MONTHLY, MONEY}): MONEY,
     frozenset({RATE_MONTHLY, MONEY_PP}): MONEY_PP,
     frozenset({PROB_MONTHLY, MONEY_PP}): MONEY_PP,
+    frozenset({INDEX, FACTOR}): INDEX,
+    frozenset({COVERAGE_UNITS, FACTOR}): COVERAGE_UNITS,
     frozenset({INT}): INT,
 }
 
@@ -104,6 +124,8 @@ _QUOTIENTS: Final[dict[tuple[Unit, Unit], Unit]] = {
     (COUNT, COUNT): FACTOR,
     (FACTOR, FACTOR): FACTOR,
     (INT, INT): FACTOR,
+    (INDEX, INDEX): FACTOR,
+    (COVERAGE_UNITS, COVERAGE_UNITS): FACTOR,
     (MONEY, FACTOR): MONEY,
     (MONEY_PP, FACTOR): MONEY_PP,
     (COUNT, FACTOR): COUNT,
@@ -111,8 +133,14 @@ _QUOTIENTS: Final[dict[tuple[Unit, Unit], Unit]] = {
     (PROB_ANNUAL, FACTOR): PROB_ANNUAL,
     (PROB_MONTHLY, FACTOR): PROB_MONTHLY,
     (RATE_ANNUAL, FACTOR): RATE_ANNUAL,
+    (RATE_ANNUAL_CC, FACTOR): RATE_ANNUAL_CC,
     (RATE_MONTHLY, FACTOR): RATE_MONTHLY,
+    (INDEX, FACTOR): INDEX,
+    (COVERAGE_UNITS, FACTOR): COVERAGE_UNITS,
 }
+
+_CC_HINT: Final = "a continuously compounded rate accumulates through cc_discount()"
+_CU_HINT: Final = "coverage units are not money; convert with as_cu()"
 
 _HINTS: Final[dict[tuple[str, frozenset[Unit]], str]] = {
     ("mul", frozenset({COUNT, PROB_ANNUAL})): "an annual probability cannot multiply a count in "
@@ -131,6 +159,12 @@ _HINTS: Final[dict[tuple[str, frozenset[Unit]], str]] = {
     "added",
     ("sub", frozenset({MONEY, MONEY_PP})): "an in-force total and a per-policy amount cannot be "
     "subtracted",
+    ("add", frozenset({MONEY, COVERAGE_UNITS})): _CU_HINT,
+    ("sub", frozenset({MONEY, COVERAGE_UNITS})): _CU_HINT,
+    ("add", frozenset({NUMBER, RATE_ANNUAL_CC})): _CC_HINT,
+    ("add", frozenset({INTEGER, RATE_ANNUAL_CC})): _CC_HINT,
+    ("sub", frozenset({NUMBER, RATE_ANNUAL_CC})): _CC_HINT,
+    ("sub", frozenset({INTEGER, RATE_ANNUAL_CC})): _CC_HINT,
 }
 
 _SYMBOLS: Final[dict[str, str]] = {
@@ -171,7 +205,7 @@ def binary_unit(op: str, a: Unit, b: Unit, loc: Loc | None = None) -> Unit:
             other = b if is_literal(a) else a
             if other == FACTOR or other in PROBS:
                 return other
-            if other in RATES:
+            if other in RATES_EFFECTIVE:
                 return FACTOR  # 1 + i and 1 + i_m are accumulation factors (term spec 15.4 (c))
         raise _fail(op, a, b, loc)
     if op == "mul":
@@ -269,7 +303,19 @@ def where_unit(cond: Unit, a: Unit, b: Unit, loc: Loc | None = None) -> Unit:
     return branch_unit(a, b, loc, "where()")
 
 
+def _takes(fn: str, arg: Unit, wanted: Unit, what: str, loc: Loc | None) -> None:
+    """``fn`` converts a ``wanted`` quantity (or a literal, which adopts it)."""
+    if arg != wanted and not is_literal(arg):
+        raise UnitError(f"{fn}() {what}, not a {arg}", loc)
+
+
+def _month_arg(fn: str, arg: Unit, what: str, loc: Loc | None) -> None:
+    if arg not in INT_LIKE:
+        raise UnitError(f"the {what} in {fn}() is an Int, not a {arg}", loc)
+
+
 def call_unit(fn: str, args: tuple[Unit, ...], loc: Loc | None = None) -> Unit:
+    """The unit of a formula function applied to arguments of the given units."""
     if fn in ("exp", "log", "expm1", "log1p", "sqrt"):
         (a,) = args
         if a == FACTOR or is_literal(a):
@@ -280,7 +326,44 @@ def call_unit(fn: str, args: tuple[Unit, ...], loc: Loc | None = None) -> Unit:
         return branch_unit(a, b, loc, f"{fn}()")
     if fn == "abs":
         (a,) = args
-        return a
+        if a in SCALED or a == INT or is_literal(a):
+            return a
+        raise UnitError(f"abs() takes a quantity, not a {a}", loc)
+    if fn == "to_monthly":
+        (a,) = args
+        _takes(fn, a, RATE_ANNUAL, "converts an effective Rate[Annual]", loc)
+        return RATE_MONTHLY
+    if fn == "to_monthly_prob":
+        (a,) = args
+        _takes(fn, a, PROB_ANNUAL, "converts a Prob[Annual]", loc)
+        return PROB_MONTHLY
+    if fn == "to_monthly_cf":
+        (a,) = args
+        _takes(fn, a, PROB_ANNUAL, "converts a Prob[Annual]", loc)
+        return PROB_MONTHLY
+    if fn == "annual_step":
+        (a,) = args
+        _takes(fn, a, RATE_ANNUAL, "converts an effective Rate[Annual]", loc)
+        return FACTOR
+    if fn == "cc_discount":
+        s, m = args
+        _takes(fn, s, RATE_ANNUAL_CC, "discounts with a Rate[Annual, Continuous]", loc)
+        _month_arg(fn, m, "months", loc)
+        return FACTOR
+    if fn in ("fwd_rate", "ann_fwd"):
+        p0, p1 = args
+        for p in (p0, p1):
+            _takes(fn, p, FACTOR, "takes two discount factors (Factor)", loc)
+        return RATE_MONTHLY if fn == "fwd_rate" else RATE_ANNUAL
+    if fn == "ann_spot":
+        p, m = args
+        _takes(fn, p, FACTOR, "takes a discount factor (Factor)", loc)
+        _month_arg(fn, m, "month", loc)
+        return RATE_ANNUAL
+    if fn == "as_cu":
+        (a,) = args
+        _takes(fn, a, MONEY, "converts Money to coverage units", loc)
+        return COVERAGE_UNITS
     raise UnitError(f"unknown function {fn}()", loc)
 
 
@@ -298,6 +381,7 @@ def unit_from_name(name: str) -> Unit:
     table: dict[str, Unit] = {u.name: u for u in ALL_UNITS}
     table["Fraction"] = FACTOR
     table["PerPolicy[Money]"] = MONEY_PP
+    table["Rate[Annual, Effective]"] = RATE_ANNUAL
     if name not in table:
         raise ValueError(f"unknown unit {name!r}; one of {', '.join(sorted(table))}")
     return table[name]

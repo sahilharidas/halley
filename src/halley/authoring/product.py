@@ -10,12 +10,15 @@ error until the subclass resolves it (D9).
 from __future__ import annotations
 
 import inspect
+import typing
 from collections.abc import Callable
 from typing import Any, ClassVar, cast, overload
 
 from halley import ir
 from halley.authoring.contracts import ScenarioInput, Schema, Table
+from halley.authoring.units import Int, unit_from_annotation
 from halley.errors import BuildError, Loc
+from halley.ir.units import Unit
 from halley.tracing.symbolic import Sym, as_node, current_loc, offset_of
 
 type Static[T] = T
@@ -25,6 +28,9 @@ an ``if self.has_waiver:`` is ordinary Python and the unused branch never enters
 TIMINGS = ("start", "mid", "end")
 ROLES = ("in_force", "decrement", "reserve")
 DOMAINS = ("state", "month")
+RUN_CONSTANTS = ("m_val", "horizon")
+"""The run constants a formula reads as ``self.run.<name>``: ``m_val`` is the valuation month
+index ``12 * year + month - 1`` and ``horizon`` the run's ``H``. Both are scalar ``Int``."""
 
 
 class VarDef:
@@ -66,6 +72,23 @@ class VarDef:
     def loc(self) -> Loc:
         code = self.fn.__code__
         return Loc(code.co_filename, code.co_firstlineno, self.fn.__qualname__)
+
+    def declared_unit(self) -> Unit:
+        """The unit of the method's return annotation, resolved when asked for (the annotation
+        may be a string under ``from __future__ import annotations``)."""
+        try:
+            hints = typing.get_type_hints(self.fn)
+        except Exception as exc:
+            raise BuildError(
+                f"cannot resolve the annotations of {self.name}: {exc}", self.loc
+            ) from exc
+        if "return" not in hints:
+            raise BuildError(
+                f"{self.name} declares no unit; write def {self.name}(self, t: Int) -> Money (or "
+                "another unit)",
+                self.loc,
+            )
+        return unit_from_annotation(hints["return"], self.loc)
 
     def __set_name__(self, owner: type, name: str) -> None:
         self.name = name
@@ -279,6 +302,25 @@ class Scenarios:
         return ScenarioAccess(decl)
 
 
+class RunConstants:
+    """``self.run``: the run's constants (:data:`RUN_CONSTANTS`), scalar ``Int`` values the
+    loader fills from the valuation date and the horizon. ``self.run.m_val`` is the valuation
+    month index, ``self.run.horizon`` the run's ``H``; boundary values may read them."""
+
+    m_val: Int
+    horizon: Int
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        loc = current_loc()
+        if name not in RUN_CONSTANTS:
+            raise BuildError(
+                f"the run has no constant {name!r}; it has: {', '.join(RUN_CONSTANTS)}", loc
+            )
+        return Sym(ir.RunConst(loc, name))
+
+
 # -------------------------------------------------------------------------------- Product
 
 
@@ -291,7 +333,9 @@ class Product:
     * ``assumption_tables``: the :class:`~halley.authoring.contracts.Table` contracts it reads;
     * ``scenario_inputs``: the :class:`~halley.authoring.contracts.ScenarioInput` contracts;
     * ``outputs``: the variables a run stores (``None`` stores them all);
-    * ``tolerance_scales``: per unit, the model point field that scales invariant tolerances.
+    * ``tolerance_scales``: per unit, the model point field that scales invariant tolerances;
+    * ``abstract``: ``True`` on a class that only exists to be subclassed; ``build()`` refuses
+      it. The flag is not inherited: a class is abstract only when it sets it itself.
     """
 
     model_point: ClassVar[Schema | None] = None
@@ -299,10 +343,12 @@ class Product:
     scenario_inputs: ClassVar[tuple[ScenarioInput, ...]] = ()
     outputs: ClassVar[tuple[str, ...] | None] = None
     tolerance_scales: ClassVar[dict[str, str]] = {}
+    abstract: ClassVar[bool] = False
 
     mp: ModelPoint
     tables: Tables
     scen: Scenarios
+    run: RunConstants
 
     def __init__(self) -> None:
         raise TypeError(

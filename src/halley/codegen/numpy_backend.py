@@ -292,6 +292,8 @@ class _Generator:
                 f"_scen_at(Z_{node.name}, {self.expr(node.index, ctx)}, u0_{node.name}, "
                 f"{node.name!r}, {self.current!r}, {_loc_str(node.loc)!r})"
             )
+        if isinstance(node, ir.RunConst):
+            return f"R_{node.name}"
         if isinstance(node, ir.Unary):
             op = "-" if node.op == "neg" else "~"
             return f"({op}{self.expr(node.a, ctx)})"
@@ -304,12 +306,35 @@ class _Generator:
             )
         if isinstance(node, ir.Call):
             args = [self.expr(a, ctx) for a in node.args]
-            if node.fn == "to_monthly":
-                return f"(((1 + {args[0]}) ** (1/12)) - 1)"
-            if node.fn == "to_monthly_prob":
-                return f"(1 - ((1 - {args[0]}) ** (1/12)))"
-            return f"{_CALLS[node.fn]}({', '.join(args)})"
+            return self.call(node.fn, args)
         raise BuildError(f"unknown node {type(node).__name__}", node.loc)
+
+    @staticmethod
+    def call(fn: str, args: list[str]) -> str:
+        """The fixed emitted form of each formula function (annuity spec, "Compounding and unit
+        conversions"); the ``explain`` interpreter evaluates the same expressions."""
+        if fn == "to_monthly":
+            return f"(((1 + {args[0]}) ** (1/12)) - 1)"
+        if fn == "to_monthly_prob":
+            return f"(1 - ((1 - {args[0]}) ** (1/12)))"
+        if fn == "to_monthly_cf":
+            q = args[0]
+            return (
+                f"np.where({q} >= 1, 1.0, -np.expm1(np.log1p(-np.where({q} >= 1, 0.0, {q})) / 12))"
+            )
+        if fn == "annual_step":
+            return f"(1 + {args[0]})"
+        if fn == "cc_discount":
+            return f"np.exp(((-{args[0]}) * {args[1]}) / 12)"
+        if fn == "fwd_rate":
+            return f"(({args[0]} / {args[1]}) - 1)"
+        if fn == "ann_fwd":
+            return f"((({args[0]} / {args[1]}) ** 12) - 1)"
+        if fn == "ann_spot":
+            return f"(({args[0]} ** (-12 / {args[1]})) - 1)"
+        if fn == "as_cu":
+            return args[0]
+        return f"{_CALLS[fn]}({', '.join(args)})"
 
     def var_read(self, node: ir.VarRead, ctx: _Ctx) -> str:
         v = self.vars[node.name]
@@ -382,6 +407,8 @@ class _Generator:
         for sname in g.scenarios:
             self.emit(f"Z_{sname} = inp['scen.{sname}']")
             self.emit(f"u0_{sname} = inp['scen.{sname}.u0']")
+        for rname in self.run_constants():
+            self.emit(f"R_{rname} = H" if rname == "horizon" else f"R_{rname} = inp['run.{rname}']")
         self.emit("with np.errstate(all='ignore'):")
         for name in sorted(self.schedule.needed):
             v = self.vars[name]
@@ -415,6 +442,17 @@ class _Generator:
         items = ", ".join(f"{n!r}: {self.arr(n)}" for n in sorted(self.schedule.needed))
         self.emit(f"return {{{items}}}")
         return "\n".join(self.lines) + "\n"
+
+    def run_constants(self) -> list[str]:
+        """The run constants the needed variables read, in a fixed order."""
+        names: set[str] = set()
+        for name in self.schedule.needed:
+            v = self.vars[name]
+            for expr in (v.expr, v.init, v.terminal):
+                if expr is None:
+                    continue
+                names.update(n.name for n in ir.walk(expr) if isinstance(n, ir.RunConst))
+        return sorted(names)
 
     def whole(self, name: str) -> None:
         v = self.vars[name]

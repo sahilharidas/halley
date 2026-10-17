@@ -119,6 +119,14 @@ class ScenAt(Node):
 
 
 @dataclass(eq=False, slots=True)
+class RunConst(Node):
+    """``run.<name>``: a scalar ``Int`` constant of the run, with no dimensions. ``m_val`` is
+    the valuation month index ``12 * year + month - 1`` and ``horizon`` the run's ``H``."""
+
+    name: str
+
+
+@dataclass(eq=False, slots=True)
 class Unary(Node):
     op: str  # neg, not
     a: Node
@@ -151,7 +159,11 @@ class Where(Node):
 
 @dataclass(eq=False, slots=True)
 class Call(Node):
-    fn: str  # exp log expm1 log1p sqrt minimum maximum abs
+    """A formula function with a fixed emitted form: ``exp log expm1 log1p sqrt minimum maximum
+    abs`` and the conversions ``to_monthly to_monthly_prob to_monthly_cf annual_step cc_discount
+    fwd_rate ann_fwd ann_spot as_cu``."""
+
+    fn: str
     args: tuple[Node, ...]
 
     def children(self) -> tuple[Node, ...]:
@@ -344,6 +356,8 @@ def render(node: Node) -> str:
         return f"scen.{node.name}(t{node.offset:+d})" if node.offset else f"scen.{node.name}(t)"
     if isinstance(node, ScenAt):
         return f"scen.{node.name}.at({render(node.index)})"
+    if isinstance(node, RunConst):
+        return f"run.{node.name}"
     if isinstance(node, Unary):
         return f"({'-' if node.op == 'neg' else '~'}{render(node.a)})"
     if isinstance(node, Binary):

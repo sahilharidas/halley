@@ -56,10 +56,10 @@ class _Checker:
             return self._var(node.name, loc).declared_unit
         if isinstance(node, ir.SumT):
             unit = self._var(node.name, loc).declared_unit
-            if unit not in (units.MONEY, units.MONEY_PP, units.COUNT, units.FACTOR):
+            if unit not in units.SUMMABLE:
                 raise UnitError(
-                    f"sum_t({node.name}) sums a {unit}; only Money, MoneyPerPolicy, Count and "
-                    "Factor are summed over time",
+                    f"sum_t({node.name}) sums a {unit}; only Money, MoneyPerPolicy, Count, "
+                    "Factor and CoverageUnits are summed over time",
                     loc,
                 )
             return unit
@@ -75,6 +75,8 @@ class _Checker:
         if isinstance(node, ir.ScenAt):
             self._int_index(node.index, loc, f"scen.{node.name}.at(...)")
             return self.graph.scenarios[node.name].unit
+        if isinstance(node, ir.RunConst):
+            return units.INT
         if isinstance(node, ir.Unary):
             return units.unary_unit(node.op, self.unit_of(node.a), loc)
         if isinstance(node, ir.Binary):
@@ -85,16 +87,6 @@ class _Checker:
             )
         if isinstance(node, ir.Call):
             args = tuple(self.unit_of(a) for a in node.args)
-            if node.fn == "to_monthly":
-                (a,) = args
-                if a == units.RATE_ANNUAL or units.is_literal(a):
-                    return units.RATE_MONTHLY
-                raise UnitError(f"to_monthly() converts a Rate[Annual], not a {a}", loc)
-            if node.fn == "to_monthly_prob":
-                (a,) = args
-                if a == units.PROB_ANNUAL or units.is_literal(a):
-                    return units.PROB_MONTHLY
-                raise UnitError(f"to_monthly_prob() converts a Prob[Annual], not a {a}", loc)
             return units.call_unit(node.fn, args, loc)
         raise BuildError(f"unknown node {type(node).__name__}", loc)
 
@@ -172,6 +164,8 @@ class _Checker:
             return frozenset({ir.SCENARIO, ir.TIME})
         if isinstance(node, ir.ScenAt):
             return frozenset({ir.SCENARIO}) | self.dims_of(node.index, dims)
+        if isinstance(node, ir.RunConst):
+            return frozenset()
         out = frozenset()
         for child in node.children():
             out = out | self.dims_of(child, dims)

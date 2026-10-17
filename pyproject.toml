@@ -23,6 +23,9 @@ dependencies = [
     "numpy>=2.0",
     # Parquet / Arrow in and out (D20).
     "pyarrow>=17",
+    # Rate[Annual] defaults its compounding tag to Effective (PEP 696); Python 3.12 evaluates
+    # the annotation at build time, so the TypeVar default needs typing_extensions at run time.
+    "typing-extensions>=4.12",
 ]
 
 [project.optional-dependencies]

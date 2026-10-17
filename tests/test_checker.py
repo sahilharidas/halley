@@ -27,6 +27,7 @@ from halley import (
     var,
     where,
 )
+from halley.ir import units as u
 from halley.products.term_assurance import MORT_TABLE, RATES, SCHEMA, TermAssurance
 from models import SIMPLE_SCHEMA
 
@@ -323,6 +324,40 @@ def test_prob_tag_conversion_is_the_only_path() -> None:
             return self.x(t - 1) * (1 - self.q_a(t))  # type: ignore[operator]
 
     _fails(Bad, "Prob\\[Annual\\]", UnitError)
+
+
+def test_run_constants_are_scalar_ints() -> None:
+    class Dated(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def cal_year(self, t: Int) -> Int:
+            return (self.run.m_val + t) // 12
+
+        @var
+        def months(self) -> Int:
+            return self.run.horizon
+
+        @var
+        def half(self) -> Factor:
+            return self.run.horizon / 2
+
+    g = check(trace(Dated))
+    assert g.variables["months"].expr.unit == u.INT
+    assert g.variables["cal_year"].unit == u.INT
+    assert g.variables["months"].dims == frozenset()
+    assert g.variables["half"].dims == frozenset()
+    assert g.variables["cal_year"].dims == {"time"}
+    assert g.variables["cal_year"].start == 1
+
+    class Bad(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self) -> Money:
+            return self.run.m_val * self.mp.premium  # type: ignore[operator, return-value]
+
+    _fails(Bad, "unit mismatch: Int \\* MoneyPerPolicy", UnitError)
 
 
 def test_model_point_needs_schema_and_unit_fields() -> None:
