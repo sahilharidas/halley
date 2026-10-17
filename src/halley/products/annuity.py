@@ -150,6 +150,7 @@ SCHEMA = Schema(
         Derived("scale_money", "Money", _scale_money, kind="number", ge=0),
     ),
     rules=(
+        Rule("portfolio non-empty", lambda c: c.portfolio != "", "group key"),
         Rule("cohort = year(issue_date)", lambda c: c.cohort == year(c.issue_date), "para 22"),
         Rule("issue_date <= V", lambda c: c.issue_date <= c.valuation),
         Rule("issue_date < annuity_start_date", lambda c: c.issue_date < c.annuity_start_date),
@@ -310,9 +311,18 @@ def _price_base_is_the_valuation_month(v: InputView) -> bool:
     return v.tables["expense"].metadata["price_base"] == f"{d.year:04d}-{d.month:02d}"
 
 
-def _last_year_inside_mort_cif(v: InputView) -> bool:
+def _years_read_inside_mort_cif(v: InputView) -> bool:
+    """The spec's load-time key check: ``cal_year(t)`` is monotone in t, so the first month and
+    the last month read, ``(m_val + 1) // 12`` and ``(m_val + H) // 12``, bound every lookup."""
     lo, hi = v.tables["mort_cif"].key_range("year")
-    return lo <= (v.valuation_month + v.horizon) // 12 <= hi
+    first, last = (v.valuation_month + 1) // 12, (v.valuation_month + v.horizon) // 12
+    return lo <= first and last <= hi
+
+
+def _horizon_covers_every_run_off(v: InputView) -> NDArray[Any]:
+    """A horizon given in the run settings must reach every policy's ``t_end``: a shorter run
+    takes ``bel(H) = 0`` as terminal while lives are still in force (D11)."""
+    return v.horizon >= v.model_points.t_end
 
 
 INPUT_RULES = (
@@ -338,9 +348,14 @@ INPUT_RULES = (
         "maint_pm is in the prices of month u = 0",
     ),
     InputRule(
-        "the last calendar year read is inside mort_cif",
-        _last_year_inside_mort_cif,
-        "(m_val + H) // 12 within the year key's range",
+        "the calendar years read are inside mort_cif",
+        _years_read_inside_mort_cif,
+        "(m_val + 1) // 12 and (m_val + H) // 12 within the year key's range",
+    ),
+    InputRule(
+        "the horizon covers every policy's run-off month",
+        _horizon_covers_every_run_off,
+        "a run shorter than t_end truncates the valuation",
     ),
 )
 

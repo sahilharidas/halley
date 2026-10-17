@@ -7,8 +7,10 @@ improvement factors, the expense, investment-expense, illiquidity-premium and ri
 tables, the risk-free discount file and the CPI file, and the four example model points as three
 class files. Every formula is written in the evaluation order the spec prints, so each value
 equals ``docs/spec/in_force_group_numbers.py`` bit for bit (tests/test_annuity.py).
-``docs/spec/annuity_inputs.py`` writes the tables to Parquet beside the spec. pyarrow has no type
-stubs, so this module is checked in pyright's basic mode; the model itself stays strict.
+``docs/spec/annuity_inputs.py`` writes the tables to Parquet beside the spec. pyarrow ships no
+type stubs, so, by the convention of every module that builds or reads Arrow tables
+(``runtime/loader.py``, ``runtime/run.py``, ``products/term_assurance_data.py``), this one is
+checked in pyright's basic mode and its builders return ``Any``; the model itself stays strict.
 """
 
 from __future__ import annotations

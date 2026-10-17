@@ -32,7 +32,9 @@ from halley import (
     Monthly,
     Product,
     Rate,
+    RunError,
     RunSettings,
+    as_cu,
     build,
     check,
     pv_month,
@@ -40,8 +42,9 @@ from halley import (
     to_monthly,
     trace,
     var,
+    where,
 )
-from halley.authoring import Column, Key, Table, int_field
+from halley.authoring import Column, CoverageUnits, Key, Table, int_field
 from halley.errors import Loc
 from halley.products import annuity_data as data
 from halley.products.annuity import (
@@ -287,13 +290,14 @@ def _load(
     tables: dict[str, Any] | None = None,
     scenarios: dict[str, Any] | None = None,
     valuation_date: Any = VALUATION_DATE,
+    horizon: int | None = None,
 ) -> Any:
     return run(
         compiled,
         model_points=data.model_points_table(rows or [_row()]),
         tables={**data.reference_tables(), **(tables or {})},
         scenarios={**data.reference_scenarios(), **(scenarios or {})},
-        settings=RunSettings(valuation_date=valuation_date),
+        settings=RunSettings(valuation_date=valuation_date, horizon=horizon),
         run_dir=tmp_path / "run",
     )
 
@@ -350,9 +354,48 @@ def test_mort_cif_must_cover_the_last_calendar_year_read(tmp_path: Path) -> None
     short = full.filter(pc.field("year") <= 2060).replace_schema_metadata(full.schema.metadata)
     with pytest.raises(
         LoadError,
-        match=r"input rule the last calendar year read is inside mort_cif fails \(\(m_val \+ H\)",
+        match=r"input rule the calendar years read are inside mort_cif fails \(\(m_val \+ 1\) // 12"
+        r" and \(m_val \+ H\) // 12 within",
     ):
         _load(build(Narrow), tmp_path, tables={"mort_cif": short})
+
+
+def test_mort_cif_must_cover_the_first_calendar_year_read(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
+    """The other end of the spec's key check: a valuation date in 2024 reads year 2024 in month
+    1, before the 2025-based table starts. Every other contract is met (the policy issued at V,
+    the expense table in June 2024 prices, the files long enough for the older life)."""
+    row = _row(issue_date=dt.date(2024, 6, 30), cohort=2024, annuity_start_date=dt.date(2024, 7, 1))
+    with pytest.raises(
+        LoadError, match=r"input rule the calendar years read are inside mort_cif fails"
+    ):
+        _load(
+            compiled_annuity["level"],
+            tmp_path,
+            rows=[row],
+            tables={"expense": data.expense_table(price_base="2024-06")},
+            scenarios={"rf_df": data.discount_table(t_max=673), "cpi": data.cpi_table(u_hi=673)},
+            valuation_date=dt.date(2024, 6, 30),
+        )
+
+
+def test_the_horizon_must_cover_every_run_off_month(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
+    """A horizon given in the settings that stops before a policy's t_end fails at load, naming
+    the rule and the first failing policy (D11), not inside an invariant after a truncated
+    valuation: policy 1 runs off at 655, policy 3 at 591, and H = 600 covers only the latter."""
+    rows = [_row(), data.example_policy(3)]
+    with pytest.raises(
+        LoadError,
+        match=r"input rule the horizon covers every policy's run-off month fails for 1 of 2 "
+        r"values, first for policy 1 \(a run shorter than t_end truncates the valuation\)",
+    ):
+        _load(compiled_annuity["level"], tmp_path, rows=rows, horizon=600)
+    with pytest.raises(LoadError, match=r"input rule the horizon covers every policy's run-off"):
+        _load(compiled_annuity["level"], tmp_path, horizon=300)
+    assert _load(compiled_annuity["level"], tmp_path, rows=rows, horizon=655).H == 655
 
 
 def test_cif_at_the_limiting_age_is_one(
@@ -469,6 +512,8 @@ def test_the_other_table_rules_and_metadata(
 
 def test_the_model_point_rules(compiled_annuity: dict[str, CompiledModel], tmp_path: Path) -> None:
     compiled = compiled_annuity["level"]
+    with pytest.raises(LoadError, match=r"rule portfolio non-empty fails for policies 1 \(group"):
+        _load(compiled, tmp_path, rows=[_row(portfolio="")])
     with pytest.raises(
         LoadError, match=r"rule cohort = year\(issue_date\) fails for policies 1 \(para 22\)"
     ):
@@ -498,6 +543,42 @@ def test_the_model_point_rules(compiled_annuity: dict[str, CompiledModel], tmp_p
             settings=RunSettings(valuation_date=VALUATION_DATE),
             run_dir=tmp_path / "fixed",
         )
+
+
+# --------------------------------------------------------------- invariants are live checks
+
+
+def test_a_wrong_cpi_lag_fails_i9_at_the_first_anniversary(tmp_path: Path) -> None:
+    """I9 rebuilds ann_pp from the CPI path at the declared lag; a model escalating at lag 2
+    while declaring 3 passes the build and fails the run at policy 3's first anniversary, the
+    error located at the invariant's declaration in the product module."""
+
+    class WrongLag(CPILinkedAnnuity):
+        @var
+        def esc_factor(self, t: Int) -> Factor:
+            return where(self.anniv(t), self.scen.cpi(t - 2) / self.scen.cpi(t - 14), 1.0)
+
+    with pytest.raises(
+        RunError,
+        match=r"invariant I9 ann_pp telescopes along the CPI path failed: policy 3, t = 13",
+    ) as info:
+        _load(build(WrongLag), tmp_path, rows=[data.example_policy(3)])
+    assert info.value.loc is not None
+    assert Path(info.value.loc.file) == Path(inspect.getsourcefile(LevelAnnuity) or "")
+
+
+def test_coverage_units_other_than_the_payment_fail_i10(tmp_path: Path) -> None:
+    class ExpenseUnits(LevelAnnuity):
+        @var
+        def cu(self, t: Int) -> CoverageUnits:
+            return as_cu(self.exp_out(t))
+
+    with pytest.raises(
+        RunError, match=r"invariant I10 cu = ann_out failed: policy 1, t = 1"
+    ) as info:
+        _load(build(ExpenseUnits), tmp_path)
+    assert info.value.loc is not None
+    assert Path(info.value.loc.file) == Path(inspect.getsourcefile(LevelAnnuity) or "")
 
 
 def test_the_level_class_uses_every_variable_and_the_cpi_class_needs_cpi_lag(
