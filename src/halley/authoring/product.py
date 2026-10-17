@@ -163,13 +163,17 @@ def var[F: Callable[..., Any]](
 ) -> F | Callable[[F], F]:
     """Declare a model variable.
 
-    ``init`` gives the value at ``t = 0`` of a forward-recursive variable (a number, or a
-    function of the model point); ``terminal`` the value at the horizon of a backward-recursive
-    one. ``timing`` says when within month ``t`` a cash flow is paid: ``start``, ``mid`` or
-    ``end``. ``role`` names the in-force count, the decrements and the reserve for the built-in
-    invariants. ``domain="state"`` declares a value defined from ``t = 0`` (a variable with an
-    init or terminal value, or one another formula needs at ``t = 0``, is a state without
-    saying so); every other variable is a month quantity, defined from ``t = 1``.
+    ``init`` gives the value at ``t = 0`` of a forward-recursive variable; ``terminal`` the
+    value at the horizon of a backward-recursive one. Each is a number or a function of the
+    :class:`BoundaryScope`: model point fields (``lambda mp: mp.pols_if_init``) and the model's
+    variables, read as a scalar (``lambda g: g.csm_0()``) or at a fixed month (``lambda g:
+    at(g.fcf_g, 0)``), never relative to ``t``; a boundary may not read a fixed month of a
+    member of its own recursive component. ``timing`` says when within month ``t`` a cash flow
+    is paid: ``start``, ``mid`` or ``end``. ``role`` names the in-force count, the decrements
+    and the reserve for the built-in invariants. ``domain="state"`` declares a value defined
+    from ``t = 0`` (a variable with an init or terminal value, or one another formula needs at
+    ``t = 0``, is a state without saying so); every other variable is a month quantity, defined
+    from ``t = 1``.
     """
 
     def wrap(f: F) -> F:
@@ -204,6 +208,35 @@ class ModelPoint:
                 loc,
             )
         return Sym(ir.MpField(loc, name))
+
+
+class BoundaryScope(ModelPoint):
+    """The object an ``init`` or ``terminal`` callable receives. A name is a model point field
+    first (``lambda mp: mp.pols_if_init``) and otherwise a variable of the model, as a
+    :class:`BoundVar` (``lambda g: g.csm_0()`` for a scalar, ``at(g.fcf_g, 0)`` for a fixed
+    month); a name in neither namespace is an error that lists both. A name that is both a field
+    and a variable is the field, so a model whose boundaries read variables keeps the two
+    namespaces apart where they meet."""
+
+    def __init__(self, fields: dict[str, ir.FieldDecl], variables: dict[str, VarDef]) -> None:
+        super().__init__(fields)
+        self._variables = variables
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in self._fields:
+            return super().__getattr__(name)
+        var = self._variables.get(name)
+        if var is not None:
+            return BoundVar(var)
+        fields = ", ".join(sorted(self._fields))
+        variables = ", ".join(self._variables)
+        raise BuildError(
+            f"a boundary value reads {name!r}, which is neither a model point field ({fields}) "
+            f"nor a variable of the model ({variables})",
+            current_loc(),
+        )
 
 
 class TableColumn:
@@ -306,7 +339,7 @@ class RunConstants:
     """``self.run``: the run's constants (:data:`RUN_CONSTANTS`), scalar ``Int`` values the
     loader fills from the valuation date and the horizon. ``self.run.m_val`` is the valuation
     month index, ``self.run.horizon`` the run's ``H``. Formulas read them; an ``init`` or
-    ``terminal`` callable receives the model point only and cannot (yet)."""
+    ``terminal`` callable reaches them through a variable without a time dimension."""
 
     m_val: Int
     horizon: Int

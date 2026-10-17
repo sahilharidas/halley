@@ -301,12 +301,28 @@ def _check_units(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
                     f"the {what} value of {v.name} is {bunit}, not {v.declared_unit}", v.loc
                 )
             for n in ir.walk(node):
-                if isinstance(n, (ir.TimeIndex, ir.VarRead, ir.ScenRead)):
+                if _relative_to_time(n, variables):
                     raise BuildError(
-                        f"the {what} value of {v.name} reads {ir.render(n)}; a boundary value "
-                        "depends only on the model point, tables and fixed months",
+                        f"the {what} value of {v.name} reads {ir.render(n)}; a boundary value is "
+                        "fixed before the months run, from the model point, tables, run "
+                        "constants, variables without a time dimension and fixed months "
+                        "(at(x, k), scen.x.at(k) with a constant k)",
                         v.loc,
                     )
+
+
+def _relative_to_time(node: ir.Node, variables: dict[str, ir.Variable]) -> bool:
+    """Whether a node's value moves with ``t``: ``t`` itself, a relative read of a time variable
+    or a scenario input, or a fixed read whose month is not a constant. Everything else (fields,
+    tables, run constants, scalar variables, ``at``/``sum_t``/``scen.x.at`` with constant
+    months, arithmetic, ``where`` and calls) may form a boundary value."""
+    if isinstance(node, (ir.TimeIndex, ir.ScenRead)):
+        return True
+    if isinstance(node, ir.VarRead):
+        return variables[node.name].has_time
+    if isinstance(node, (ir.VarAt, ir.ScenAt)):
+        return not isinstance(node.index, ir.Const)
+    return False
 
 
 def _check_roles(graph: ir.Graph) -> None:
@@ -484,6 +500,16 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
     complete = [e for e in scc.edges if e.offset is None]
     if complete:
         e = complete[0]
+        boundary = _boundary_of(variables[e.reader], e.node)
+        if boundary is not None:
+            # conservative: at(y, 0) of a member of the same component is rejected even when
+            # y(0) would be computable, because the boundary is written before the loop runs
+            raise BuildError(
+                f"the {boundary} value of {e.reader} reads {ir.render(e.node)}, and {e.target} "
+                f"depends on {e.reader}: compute the boundary from a variable outside the "
+                "component",
+                e.node.loc,
+            )
         raise BuildError(
             f"{e.reader} reads all of {e.target} ({ir.render(e.node)}), and {e.target} depends "
             f"on {e.reader}: a complete read cannot be part of a recursion",
@@ -524,18 +550,16 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
                 e.node.loc,
             )
     scc.direction = ir.FORWARD if hi <= 0 else ir.BACKWARD
+    # A member read at +k needs no terminal of its own: _check_domains has placed every +k read
+    # at a month <= H inside the target's domain (its formula reaches H, or its terminal sits
+    # there), and the offset-0 acyclicity check above orders the members without a terminal so
+    # that the backend evaluates them at t = H before the loop (the annuity's {bel, inv_exp}).
     for e in scc.edges:
         target = variables[e.target]
         if e.offset is not None and e.offset < 0 and target.init is None:
             raise BuildError(
                 f"{e.target} is forward recursive ({e.reader} reads {ir.render(e.node)}) and "
                 f"needs an init value: @var(init=...)",
-                target.loc,
-            )
-        if e.offset is not None and e.offset > 0 and target.terminal is None:
-            raise BuildError(
-                f"{e.target} is backward recursive ({e.reader} reads {ir.render(e.node)}) and "
-                f"needs a terminal value: @var(terminal=...)",
                 target.loc,
             )
     for name in scc.members:
@@ -550,6 +574,15 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
                 f"{name} has an init value but sits in the backward component {{{members}}}",
                 v.loc,
             )
+
+
+def _boundary_of(v: ir.Variable, node: ir.Node) -> str | None:
+    """``"init"`` or ``"terminal"`` when ``node`` sits in that boundary value of ``v``, else
+    ``None`` (it sits in the formula)."""
+    for what, expr in (("init", v.init), ("terminal", v.terminal)):
+        if expr is not None and any(n is node for n in ir.walk(expr)):
+            return what
+    return None
 
 
 def _same_period_order(scc: _Scc) -> list[str]:

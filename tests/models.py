@@ -12,21 +12,27 @@ import numpy as np
 import pyarrow as pa
 
 from halley import (
+    Column,
     Count,
     Factor,
     Field,
     Int,
     Money,
     MoneyPerPolicy,
+    Monthly,
     Product,
+    Rate,
     RunResult,
     RunSettings,
     ScenarioInput,
     Schema,
+    Table,
     at,
     build,
+    pv_month,
     run,
     sum_t,
+    to_monthly,
     var,
     where,
 )
@@ -125,6 +131,89 @@ class Indexed(Product):
         return self.mp.pols_if_init * self.ann_pp(t)
 
 
+class Expensed(Product):
+    """A backward component of two members, the annuity's ``{bel, inv_exp}``: the reserve reads
+    next month's investment expense, which is charged on the closing reserve of its own month.
+    ``inv_exp`` carries no terminal; its formula reaches ``H``, where the backend evaluates it
+    before the loop steps both members back together."""
+
+    model_point = SIMPLE_SCHEMA
+
+    @var(init=lambda mp: mp.pols_if_init)
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.99
+
+    @var(timing="start")
+    def cf(self, t: Int) -> Money:
+        return self.x(t - 1) * self.mp.premium
+
+    @var
+    def v_m(self) -> Factor:
+        return 1.04 ** (-1 / 12)
+
+    @var
+    def v(self, t: Int) -> Factor:
+        return self.v_m()
+
+    @var
+    def ie_m(self) -> Rate[Monthly]:
+        return to_monthly(0.012)
+
+    @var(terminal=0)
+    def bel(self, t: Int) -> Money:
+        return (pv_month(self.cf, t + 1, self.v) + pv_month(self.inv_exp, t + 1, self.v)) + (
+            self.v(t + 1) * self.bel(t + 1)
+        )
+
+    @var(timing="end")
+    def inv_exp(self, t: Int) -> Money:
+        return self.ie_m() * self.bel(t)
+
+
+MARGIN = Table("margin", keys=(), columns=(Column("share", "Factor", ge=0, le=1),))
+
+
+class Margin(Product):
+    """Boundary values computed from other variables (the M7 shape): ``csm`` starts at
+    ``csm_0``, a scalar formed from the premium, a fixed month of the backward ``fcf`` and a
+    table value; ``lc`` starts at ``at(fcf, 0)``, a backward variable outside its component."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (MARGIN,)
+
+    @var(init=lambda mp: mp.pols_if_init)
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.99
+
+    @var
+    def cf(self, t: Int) -> Money:
+        return self.x(t - 1) * self.mp.premium
+
+    @var(terminal=0)
+    def fcf(self, t: Int) -> Money:
+        return (self.fcf(t + 1) + self.cf(t + 1)) * 0.9
+
+    @var
+    def premium_total(self) -> Money:
+        return self.mp.pols_if_init * self.mp.premium
+
+    @var
+    def csm_0(self) -> Money:
+        return (self.premium_total() - at(self.fcf, 0)) * self.tables.margin.share
+
+    @var(init=lambda g: g.csm_0())
+    def csm(self, t: Int) -> Money:
+        return self.csm(t - 1) * 0.95
+
+    @var(init=lambda g: at(g.fcf, 0))
+    def lc(self, t: Int) -> Money:
+        return self.lc(t - 1) * 0.9
+
+
+def margin_table(share: float = 0.5) -> Any:
+    return pa.table({"share": pa.array([share], pa.float64())})
+
+
 def scenario_file(
     name: str, u_lo: int, u_hi: int, n_scen: int, fn: Callable[[int, int], float]
 ) -> Any:
@@ -165,3 +254,23 @@ def closed_form_growth(x0: float, premium: float, horizon: int) -> dict[str, np.
     for t in range(horizon - 1, -1, -1):
         r[t] = (r[t + 1] + cf[t + 1]) * 0.5
     return {"x": x, "cf": cf, "r": r}
+
+
+def closed_form_expensed(x0: float, premium: float, horizon: int) -> dict[str, np.ndarray]:
+    """What ``Expensed`` computes, written independently with plain floats: the investment
+    expense at ``H`` is its formula on the terminal reserve, then both recursions step back,
+    the reserve first because the expense of a month is charged on that month's reserve."""
+    v = 1.04 ** (-1 / 12)
+    ie = ((1 + 0.012) ** (1 / 12)) - 1
+    x = np.array([x0 * 0.99**t for t in range(horizon + 1)])
+    cf = np.zeros(horizon + 1)
+    for t in range(1, horizon + 1):
+        cf[t] = x[t - 1] * premium
+    bel = np.zeros(horizon + 1)
+    inv_exp = np.zeros(horizon + 1)
+    inv_exp[horizon] = ie * bel[horizon]
+    for t in range(horizon - 1, -1, -1):
+        bel[t] = (cf[t + 1] + inv_exp[t + 1] * v) + v * bel[t + 1]
+        if t >= 1:
+            inv_exp[t] = ie * bel[t]
+    return {"x": x, "cf": cf, "bel": bel, "inv_exp": inv_exp}

@@ -15,6 +15,7 @@ from typing import Any
 
 from halley import ir
 from halley.authoring.product import (
+    BoundaryScope,
     ModelPoint,
     Product,
     RunConstants,
@@ -58,10 +59,11 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     inst.tables = Tables(tables)
     inst.scen = Scenarios(scenarios)
     inst.run = RunConstants()
+    scope = BoundaryScope(fields, var_defs)
 
     variables: dict[str, ir.Variable] = {}
     for vd in var_defs.values():
-        variables[vd.name] = _trace_var(vd, inst, fields)
+        variables[vd.name] = _trace_var(vd, inst, scope)
 
     outputs = model.outputs
     if outputs is not None:
@@ -171,7 +173,7 @@ def _collect_vars(model: type[Product]) -> dict[str, VarDef]:
     return out
 
 
-def _trace_var(vd: VarDef, inst: Product, fields: dict[str, ir.FieldDecl]) -> ir.Variable:
+def _trace_var(vd: VarDef, inst: Product, scope: BoundaryScope) -> ir.Variable:
     fn = vd.fn
     loc = vd.loc
     declared = vd.declared_unit()
@@ -180,8 +182,8 @@ def _trace_var(vd: VarDef, inst: Product, fields: dict[str, ir.FieldDecl]) -> ir
     try:
         result = fn(inst, Sym(ir.TimeIndex(loc))) if vd.has_time else fn(inst)
         expr = as_node(result, loc)
-        init = _boundary(vd.init, inst, loc, "init")
-        terminal = _boundary(vd.terminal, inst, loc, "terminal")
+        init = _boundary(vd.init, scope, loc, "init")
+        terminal = _boundary(vd.terminal, scope, loc, "terminal")
     except HalleyError:
         raise
     except Exception as exc:
@@ -210,14 +212,19 @@ def _trace_var(vd: VarDef, inst: Product, fields: dict[str, ir.FieldDecl]) -> ir
     )
 
 
-def _boundary(value: object, inst: Product, loc: Loc, what: str) -> ir.Node | None:
+def _boundary(value: object, scope: BoundaryScope, loc: Loc, what: str) -> ir.Node | None:
+    """The ``init`` or ``terminal`` node: a number, or the callable applied to the boundary
+    scope (model point fields first, the model's variables second)."""
     if value is None:
         return None
     if callable(value):
         fn: Callable[[Any], Any] = value
-        return as_node(fn(inst.mp), loc)
+        return as_node(fn(scope), loc)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise BuildError(f"{what} is a number or a function of the model point", loc)
+        raise BuildError(
+            f"{what} is a number or a function of the model point and the model's variables",
+            loc,
+        )
     return ir.Const(loc, value)
 
 

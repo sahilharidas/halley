@@ -30,7 +30,7 @@ from halley import (
 from halley.authoring import int_field
 from halley.products.term_assurance import VALUATION_DATE
 from halley.runtime import recompute, within
-from models import VAL
+from models import VAL, Expensed, Margin, margin_table, simple_model_points
 from test_helpers import run_helpers
 
 
@@ -89,6 +89,42 @@ def test_recompute_matches_the_generated_code_for_every_helper(tmp_path: Path) -
         "exp_out(t+1)",
         "claims(t+1)",
     }
+
+
+def test_explain_a_member_without_a_terminal_at_the_horizon(tmp_path: Path) -> None:
+    """``inv_exp(H)`` is its formula on the terminal reserve, not a boundary value, so explain
+    lists its inputs there and recompute evaluates the formula."""
+    res = run(
+        build(Expensed),
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "expensed",
+    )
+    e = explain(res, "S01", "inv_exp", res.H)
+    assert e.value == 0.0
+    assert dict(e.inputs)["bel(t)"] == 0.0
+    assert dict(e.inputs)["ie_m(t)"] == res.lane("ie_m", "S01")[0]
+    assert recompute(res, "S01", "inv_exp", res.H) == 0.0
+    e1 = explain(res, "S01", "bel", res.H - 1)
+    assert dict(e1.inputs)["inv_exp(t+1)"] == 0.0
+    assert dict(e1.inputs)["cf(t+1)"] == res.lane("cf", "S01")[res.H]
+
+
+def test_explain_a_variable_whose_init_reads_another(tmp_path: Path) -> None:
+    res = run(
+        build(Margin),
+        model_points=simple_model_points(),
+        tables={"margin": margin_table()},
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "margin",
+    )
+    csm_0 = res.lane("csm_0", "S02")[0]
+    e = explain(res, "S02", "csm", 1)
+    assert dict(e.inputs) == {"csm(t-1)": csm_0}
+    assert e.value == csm_0 * 0.95
+    assert "init=lambda g: g.csm_0()" in str(e)
+    assert recompute(res, "S02", "csm", 0) == csm_0
+    assert recompute(res, "S02", "lc", 0) == res.lane("fcf", "S02")[0]
 
 
 MID_SCHEMA = Schema(

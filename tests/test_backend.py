@@ -34,9 +34,13 @@ from halley.runtime import recompute, within
 from models import (
     SIMPLE_SCHEMA,
     VAL,
+    Expensed,
     Growth,
     Indexed,
+    Margin,
+    closed_form_expensed,
     closed_form_growth,
+    margin_table,
     run_growth,
     scenario_file,
     simple_model_points,
@@ -283,6 +287,75 @@ def test_run_constants_come_from_the_valuation_date_and_horizon(tmp_path: Path) 
     assert longer.lane("m_val", "S00")[0] == 12 * 2027 + 11 - 1
     assert longer.lane("months", "S00")[0] == 20
     assert longer.run_id != res.run_id
+
+
+def test_a_backward_component_of_two_members_steps_from_the_horizon(tmp_path: Path) -> None:
+    """The annuity's {bel, inv_exp} (design section 4): the member without a terminal is
+    evaluated at t = H before the loop, in same-period order after the terminal it reads, and
+    both members then step back together with the existing start guards."""
+    compiled = build(Expensed)
+    source = compiled.source
+    terminal = source.index("V_bel[H] = 0")
+    pre = source.index("V_inv_exp[H] = (V_ie_m[0] * V_bel[t])")
+    loop = source.index("for t in range(H - 1, -1, -1):")
+    assert terminal < pre < loop
+    assert "t = H\n" in source[terminal:pre]
+    assert (
+        "V_bel[t] = ((V_cf[t+1] + (V_inv_exp[t+1] * V_v[t+1])) + (V_v[t+1] * V_bel[t+1]))"
+        in source[loop:]
+    )
+    assert "if t >= 1:\n                V_inv_exp[t] = (V_ie_m[0] * V_bel[t])" in source[loop:]
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "expensed",
+    )
+    for i, pid in enumerate(res.ids):
+        want = closed_form_expensed(1.0 + i, 10.0 * (i + 1), res.H)
+        bel, inv_exp = res.lane("bel", pid), res.lane("inv_exp", pid)
+        np.testing.assert_allclose(bel, want["bel"], rtol=1e-12, atol=0)
+        np.testing.assert_allclose(inv_exp, want["inv_exp"], rtol=1e-12, atol=0)
+        assert bel[res.H] == 0.0  # the terminal
+        assert inv_exp[res.H] == 0.0  # the formula at H, on the terminal reserve
+        assert inv_exp[0] == 0.0  # a month quantity
+        assert inv_exp[1] == res.lane("ie_m", pid)[0] * bel[1]
+        for name in ("bel", "inv_exp"):
+            for t in range(res.H + 1):
+                assert recompute(res, pid, name, t) == res.lane(name, pid)[t], (name, t)
+
+
+def test_boundary_values_from_variables_are_computed_before_the_recursion(
+    tmp_path: Path,
+) -> None:
+    """``csm`` starts at the scalar ``csm_0`` and ``lc`` at ``at(fcf, 0)`` (design section 5):
+    the generated code assigns both inits after the variables they read and before the loops."""
+    compiled = build(Margin)
+    source = compiled.source
+    fcf_loop = source.index("for t in range(H - 1, -1, -1):")
+    csm_0 = source.index("V_csm_0[...] = ((V_premium_total - _at(V_fcf, 0, H, 0, 'fcf', 'csm_0'")
+    csm_init = source.index("V_csm[0] = V_csm_0")
+    lc_init = source.index("V_lc[0] = _at(V_fcf, 0, H, 0, 'fcf', 'lc', 'Margin.<lambda>")
+    assert fcf_loop < csm_0 < csm_init
+    assert fcf_loop < lc_init
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        tables={"margin": margin_table(0.5)},
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "margin",
+    )
+    for i, pid in enumerate(res.ids):
+        fcf0 = res.lane("fcf", pid)[0]
+        want_csm_0 = ((1.0 + i) * (10.0 * (i + 1)) - fcf0) * 0.5
+        assert res.lane("csm_0", pid)[0] == want_csm_0
+        assert res.lane("csm", pid)[0] == want_csm_0
+        assert res.lane("csm", pid)[1] == want_csm_0 * 0.95
+        assert res.lane("lc", pid)[0] == fcf0
+        assert res.lane("lc", pid)[1] == fcf0 * 0.9
+        assert recompute(res, pid, "csm", 0) == want_csm_0
+        assert recompute(res, pid, "lc", 0) == fcf0
+    assert res.arrays["csm_0"].shape == (1, 3, 1)
 
 
 def test_the_interpreter_agrees_with_the_generated_code(tmp_path: Path) -> None:

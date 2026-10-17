@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from halley import (
@@ -19,8 +21,10 @@ from halley import (
     Product,
     Rate,
     UnitError,
+    at,
     build,
     check,
+    ir,
     sum_t,
     to_monthly_prob,
     trace,
@@ -29,7 +33,7 @@ from halley import (
 )
 from halley.ir import units as u
 from halley.products.term_assurance import MORT_TABLE, RATES, SCHEMA, TermAssurance
-from models import SIMPLE_SCHEMA
+from models import SIMPLE_SCHEMA, Expensed, Margin
 
 
 def _fails(model: type[Product], match: str, error: type[Exception] = BuildError) -> Exception:
@@ -40,6 +44,12 @@ def _fails(model: type[Product], match: str, error: type[Exception] = BuildError
     assert loc is not None, "every checker error carries a model source location"
     assert loc.file.endswith(("test_checker.py", "term_assurance.py"))
     return exc
+
+
+def _init(graph: ir.Graph, name: str) -> ir.Node:
+    node = graph.variables[name].init
+    assert node is not None
+    return node
 
 
 def test_term_assurance_builds_clean() -> None:
@@ -268,7 +278,7 @@ def test_unused_variable_warns_and_is_left_out_of_generated_code() -> None:
     assert "V_reserve" in compiled.source
 
 
-def test_init_may_not_depend_on_time_or_other_variables() -> None:
+def test_init_value_must_have_the_declared_unit() -> None:
     class Bad(Product):
         model_point = SIMPLE_SCHEMA
 
@@ -281,6 +291,214 @@ def test_init_may_not_depend_on_time_or_other_variables() -> None:
             return self.x(t - 1) * 1.0
 
     _fails(Bad, "init value of x is Money", UnitError)
+
+
+def test_boundary_values_read_fields_first_and_variables_second() -> None:
+    """An init or terminal callable receives the boundary scope: a name is a model point field
+    first and otherwise a variable, read as a scalar or at a fixed month (design section 5)."""
+    g = check(trace(Margin))
+    assert ir.render(_init(g, "csm")) == "csm_0(t)"
+    assert ir.render(_init(g, "lc")) == "at(fcf, 0)"
+    assert g.variables["csm"].unit == u.MONEY
+    assert g.variables["fcf"].start == 0  # the terminal, and at(fcf, 0) from lc's init
+    # boundary reads are edges: csm_0 is scheduled before csm, fcf before lc
+    index = {name: i for i, comp in enumerate(g.components) for name in comp}
+    assert index["csm_0"] < index["csm"]
+    assert index["fcf"] < index["lc"]
+    assert index["fcf"] < index["csm_0"]
+
+    class FieldWins(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def premium(self) -> MoneyPerPolicy:
+            return self.mp.premium * 2.0
+
+        @var(init=lambda g: g.premium * g.pols_if_init)
+        def x(self, t: Int) -> Money:
+            return self.x(t - 1) * 0.9
+
+    g2 = check(trace(FieldWins))
+    assert ir.render(_init(g2, "x")) == "(mp.premium * mp.pols_if_init)"
+
+    class Neither(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def csm_0(self) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+        @var(init=lambda g: g.csm_zero())
+        def x(self, t: Int) -> Money:
+            return self.x(t - 1) * 0.9
+
+    exc = _fails(
+        Neither,
+        r"a boundary value reads 'csm_zero', which is neither a model point field \(k, "
+        r"policy_id, pols_if_init, premium, rem_m\) nor a variable of the model \(csm_0, x\)",
+    )
+    loc = getattr(exc, "loc", None)
+    assert loc is not None
+    assert loc.function.endswith("Neither.<lambda>")
+
+
+def test_boundary_values_reject_what_moves_with_time() -> None:
+    """The checker allows fields, tables, run constants, scalar variables, ``at``/``sum_t``/
+    ``scen.x.at`` with constant months, arithmetic, ``where`` and calls in a boundary; it rejects
+    ``t``, relative reads of time variables and scenario inputs, and fixed reads whose month is
+    not a constant."""
+    fixed = (
+        "a boundary value is fixed before the months run, from the model point, tables, run "
+        r"constants, variables without a time dimension and fixed months \(at\(x, k\), "
+        r"scen.x.at\(k\) with a constant k\)"
+    )
+
+    class PerPolicyMonth(Margin):
+        @var(init=lambda g: at(g.fcf, g.k))
+        def lc(self, t: Int) -> Money:
+            return self.lc(t - 1) * 0.9
+
+    _fails(PerPolicyMonth, rf"the init value of lc reads at\(fcf, mp.k\); {fixed}")
+
+    class Allowed(Margin):
+        @var(init=lambda g: where(g.csm_0() > 0, g.csm_0(), sum_t(g.cf) * 0.0))
+        def csm(self, t: Int) -> Money:
+            return self.csm(t - 1) * 0.95
+
+    check(trace(Allowed))
+
+    # the authoring API cannot write these into a boundary (no t, no scenario accessor there);
+    # the checker still refuses them at the IR level
+    for node, text in (
+        (
+            ir.Where(
+                None,
+                ir.Binary(None, "gt", ir.TimeIndex(None), ir.Const(None, 0)),
+                ir.VarRead(None, "csm_0", 0),
+                ir.Const(None, 0.0),
+            ),
+            "t",
+        ),
+        (ir.VarRead(None, "cf", -1), r"cf\(t-1\)"),
+        (ir.VarRead(None, "fcf", 0), r"fcf\(t\)"),
+        (ir.ScenAt(None, "cpi", ir.MpField(None, "k")), r"scen.cpi.at\(mp.k\)"),
+    ):
+        g = trace(Margin)
+        g.scenarios["cpi"] = ir.ScenarioDecl("cpi", u.MONEY)
+        g.variables["lc"].init = node
+        with pytest.raises(BuildError, match=rf"the init value of lc reads {text}; {fixed}"):
+            check(g)
+
+
+def test_a_boundary_may_not_read_a_member_of_its_own_component() -> None:
+    class Bad(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var(init=lambda g: at(g.y, 0))
+        def x(self, t: Int) -> Money:
+            return self.x(t - 1) * 0.9
+
+        @var(domain="state")
+        def y(self, t: Int) -> Money:
+            return self.x(t) * 2.0
+
+    exc = _fails(
+        Bad,
+        r"the init value of x reads at\(y, 0\), and y depends on x: compute the boundary from a "
+        "variable outside the component",
+    )
+    loc = getattr(exc, "loc", None)
+    assert loc is not None
+    assert loc.function.endswith("Bad.<lambda>")
+
+
+def test_a_backward_component_member_without_a_terminal_reaches_the_horizon() -> None:
+    """The annuity's {bel, inv_exp}: bel reads inv_exp(t+1) and inv_exp reads bel(t). Only bel
+    carries a terminal; inv_exp's formula reaches H and the backend evaluates it there before
+    the loop (design section 4)."""
+    g = check(trace(Expensed))
+    assert ["bel", "inv_exp"] in g.components
+    assert (g.variables["bel"].direction, g.variables["bel"].start) == ("backward", 0)
+    assert (g.variables["inv_exp"].direction, g.variables["inv_exp"].start) == ("backward", 1)
+    assert g.variables["inv_exp"].terminal is None
+    assert g.variables["inv_exp"].formula_range == (1, "H")
+    assert g.variables["bel"].formula_range == (0, "H-1")
+
+
+def test_a_read_at_t_plus_one_from_a_formula_that_reaches_the_horizon_fails() -> None:
+    """Without rule 7's terminal demand, _check_domains alone keeps a backward component sound:
+    a member whose formula reaches H may not read t + 1, whatever it reads."""
+    outside = (
+        "{reader} reads {read}, which is outside the domain of {target} at t = H; a variable "
+        "that reads a later month is backward recursive and declares a terminal value"
+    )
+
+    class StartOneReadsStartOne(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var(terminal=0)
+        def bel(self, t: Int) -> Money:
+            return (self.inv_exp(t + 1) * 0.9) + (self.bel(t + 1) * 0.9)
+
+        @var
+        def inv_exp(self, t: Int) -> Money:
+            return (self.bel(t) * 0.01) + (self.fee(t + 1) * 0.5)
+
+        @var
+        def fee(self, t: Int) -> Money:
+            return self.inv_exp(t) * 0.1
+
+    _fails(
+        StartOneReadsStartOne,
+        re.escape(outside.format(reader="inv_exp", read="fee(t+1)", target="fee")),
+    )
+
+    class StateReadsTerminal(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var(terminal=0)
+        def bel(self, t: Int) -> Money:
+            return (self.inv_exp(t + 1) * 0.9) + (self.bel(t + 1) * 0.9)
+
+        @var(domain="state")
+        def inv_exp(self, t: Int) -> Money:
+            return self.bel(t + 1) * 0.01
+
+    _fails(
+        StateReadsTerminal,
+        re.escape(outside.format(reader="inv_exp", read="bel(t+1)", target="bel")),
+    )
+
+    class StartOneReadsTerminal(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var(terminal=0)
+        def bel(self, t: Int) -> Money:
+            return (self.inv_exp(t + 1) * 0.9) + (self.bel(t + 1) * 0.9)
+
+        @var
+        def inv_exp(self, t: Int) -> Money:
+            return self.bel(t + 1) * 0.01
+
+    _fails(
+        StartOneReadsTerminal,
+        re.escape(outside.format(reader="inv_exp", read="bel(t+1)", target="bel")),
+    )
+
+    class NoTerminal(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def bel(self, t: Int) -> Money:
+            return (self.inv_exp(t + 1) * 0.9) + (self.bel(t + 1) * 0.9)
+
+        @var
+        def inv_exp(self, t: Int) -> Money:
+            return self.bel(t) * 0.01
+
+    _fails(
+        NoTerminal, re.escape(outside.format(reader="bel", read="inv_exp(t+1)", target="inv_exp"))
+    )
 
 
 def test_complete_reads_cannot_be_recursive() -> None:

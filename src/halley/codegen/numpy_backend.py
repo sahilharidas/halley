@@ -491,6 +491,16 @@ class _Generator:
                 self.set_current(name, 3)
                 self.emit(f"{self.arr(name)}[t] = {self.expr(self.vars[name].expr, step)}", 3)
         else:
+            # the mirror of the forward pre-loop: a member without a terminal is defined at
+            # t = H by its formula (the checker lets it read the others only within the month),
+            # so it is evaluated there first, in same-period order, before the loop reads it at
+            # t + 1 (the annuity's {bel, inv_exp})
+            for name in members:
+                v = self.vars[name]
+                if v.terminal is None:
+                    self.set_current(name, 2)
+                    self.emit("t = H", 2)
+                    self.emit(f"{self.arr(name)}[H] = {self.expr(v.expr, step)}", 2)
             self.emit("for t in range(H - 1, -1, -1):", 2)
             for name in members:
                 v = self.vars[name]
