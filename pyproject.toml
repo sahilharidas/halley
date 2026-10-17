@@ -25,6 +25,10 @@ dependencies = [
     "pyarrow>=17",
 ]
 
+[project.optional-dependencies]
+# The multicore CPU backend (D16): pip install halley[numba].
+numba = ["numba>=0.61"]
+
 [project.urls]
 Homepage = "https://halley.kndra.co.za"
 Documentation = "https://halley.kndra.co.za"
@@ -37,6 +41,12 @@ dev = [
     "ruff>=0.6",
     # Units are typed operator overloads; pyright flags mismatches in the editor before a build.
     "pyright>=1.1.380",
+    # The reference spreadsheets (D22) are written with openpyxl and recalculated in Excel on
+    # Windows through COM (pywin32) so that their cached values can be read back by the tests.
+    "openpyxl>=3.1",
+    "pywin32>=306; sys_platform == 'win32'",
+    # The Numba backend (M6) is tested against the NumPy reference (D16).
+    "numba>=0.61",
 ]
 # Reference case 2 (D23) reconciles to lifelib's BasicTerm_ME. lifelib (MIT) runs on modelx
 # (GPL-3.0); neither is a dependency of halley or of the test suite, which reads the committed
@@ -78,6 +88,12 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "C4", "PT", "T20"]
 "docs/spec/in_force_group_numbers.py" = ["T20", "E501", "N803", "N806"]
 # The lifelib fixture generator reports what it wrote and the versions it ran.
 "tests/data/lifelib/make_reference.py" = ["T20"]
+# The reference workbook builders and the Excel recalculation tool report what they wrote.
+"docs/spec/*_workbook.py" = ["T20"]
+"docs/spec/recalc_excel.py" = ["T20"]
+# The in-force input writer reports what it wrote.
+"docs/spec/in_force_group_inputs.py" = ["T20"]
+"docs/spec/annuity_inputs.py" = ["T20"]
 
 [tool.ruff.format]
 line-ending = "lf"
