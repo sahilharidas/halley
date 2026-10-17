@@ -5,6 +5,8 @@ ignore comments on its deliberate mistakes are themselves checked for being nece
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 
 from halley import (
@@ -232,11 +234,15 @@ def test_annotations_resolve_to_tags() -> None:
 
 def test_rate_compounding_tags() -> None:
     """``Rate[Annual]`` is the effective rate and one Unit object, so hashes and messages that
-    print it are unchanged; ``Rate[Annual, Effective]`` is a second spelling of it."""
+    print it are unchanged; ``Rate[Annual, Effective]`` is a second spelling of it. The PEP 696
+    default is filled into ``__args__``, so ``Rate[Monthly, Effective]`` is the very annotation
+    ``Rate[Monthly]`` is and resolves the same (a recorded deviation from the design's "takes no
+    second tag": the resolver cannot tell the two apart); ``Rate[Monthly, Continuous]`` fails."""
     assert unit_from_annotation(Rate[Annual]) is u.RATE_ANNUAL
     assert unit_from_annotation(Rate[Annual, Effective]) is u.RATE_ANNUAL
     assert unit_from_annotation(Rate[Annual, Continuous]) is u.RATE_ANNUAL_CC
     assert unit_from_annotation(Rate[Monthly]) is u.RATE_MONTHLY
+    assert get_args(Rate[Monthly]) == get_args(Rate[Monthly, Effective])
     assert unit_from_annotation(Rate[Monthly, Effective]) is u.RATE_MONTHLY
     with pytest.raises(UnitError, match="effective by definition"):
         unit_from_annotation(Rate[Monthly, Continuous])

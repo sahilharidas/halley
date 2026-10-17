@@ -129,7 +129,14 @@ class Lane:
             a = self.eval(node.a, t)
             return -a if node.op == "neg" else (not a)
         if isinstance(node, ir.Binary):
-            return _binary(node.op, self.eval(node.a, t), self.eval(node.b, t))
+            a = self.eval(node.a, t)
+            if (
+                node.op == "pow"
+                and isinstance(node.b, ir.Const)
+                and not isinstance(node.a, ir.Const)
+            ):
+                return _pow_const(a, node.b.value)
+            return _binary(node.op, a, self.eval(node.b, t))
         if isinstance(node, ir.Where):
             a = self.eval(node.a, t)
             b = self.eval(node.b, t)
@@ -141,6 +148,8 @@ class Lane:
 
 
 def _binary(op: str, a: Any, b: Any) -> Any:
+    """A binary operator on two lane values in Python arithmetic, which agrees with NumPy's
+    element loops bit for bit except for the power fast paths :func:`_pow_const` mirrors."""
     try:
         if op == "add":
             return a + b
@@ -175,6 +184,30 @@ def _binary(op: str, a: Any, b: Any) -> Any:
     except ZeroDivisionError:
         return math.nan  # a discarded where() branch may divide by zero
     raise HalleyError(f"unknown operator {op}")
+
+
+def _pow_const(a: Any, exponent: Any) -> Any:
+    """``a ** exponent`` for a constant exponent, through the NumPy loop the generated code runs.
+
+    The emitted exponent of ``x ** 0.5`` is the Python literal in whole and step mode alike, and
+    its base is an array (a variable slice, a model point column, ``_t``), so NumPy evaluates
+    ``ndarray ** scalar``, which takes a fast path for ``** 0.5``, ``** 2`` and ``** -1``
+    (sqrt, square, reciprocal) that differs from libm's pow in the last place for about one
+    value in a thousand. Python's ``a ** b`` is libm's pow, so the interpreter mirrors the
+    array form; the exponent itself is kept a Python scalar as emitted (``np.float64(a) ** b``
+    and ``np.power`` of two scalars take no fast path and would not match).
+
+    Not mirrored: a non-constant exponent is evaluated with Python's ``**`` (see
+    :func:`_binary`). In whole mode the emitted exponent is then an array (``-12 / _t[1:H+1]``
+    in ``ann_spot``), which takes no fast path either, so the two agree; inside a step
+    component the same exponent is a Python float (``ann_spot(df(t), t)`` at ``t = 12`` is
+    ``** -1.0``), and a base built from ``t`` alone (``(t / 12) ** 0.5``) is a Python float
+    there too, so a recursive component that writes either goes through libm's pow in the
+    generated code and would need the reader's direction here to match bit for bit. Neither
+    appears in the shipped products.
+    """
+    with np.errstate(all="ignore"):  # the generated code runs under the same errstate
+        return (np.array([a]) ** exponent).item()
 
 
 def _ufunc(fn: str, x: Any) -> Any:

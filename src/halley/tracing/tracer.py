@@ -124,6 +124,21 @@ def _resolve_statics(model: type[Product], overrides: dict[str, object]) -> dict
 
 _MISSING = object()
 
+_RESERVED_NAMES = {
+    "mp": "the model point accessor",
+    "tables": "the assumption-table accessor",
+    "scen": "the scenario accessor",
+    "run": "the run-constants accessor",
+    "model_point": "a Product class attribute",
+    "assumption_tables": "a Product class attribute",
+    "scenario_inputs": "a Product class attribute",
+    "outputs": "a Product class attribute",
+    "tolerance_scales": "a Product class attribute",
+    "abstract": "a Product class attribute",
+}
+"""Names a variable may not take: the tracer sets the accessors on the instance, where they would
+shadow a ``@var`` of the same name, and ``Product`` reads its class attributes by name."""
+
 
 def _collect_vars(model: type[Product]) -> dict[str, VarDef]:
     """Every ``@var`` visible on the class, with the D9 conflict rule."""
@@ -136,6 +151,12 @@ def _collect_vars(model: type[Product]) -> dict[str, VarDef]:
     for name in names:
         definers = [k for k in model.__mro__ if isinstance(vars(k).get(name), VarDef)]
         effective = definers[0]
+        reserved = _RESERVED_NAMES.get(name)
+        if reserved is not None:
+            raise BuildError(
+                f"{name} is {reserved} (self.{name}); rename the variable",
+                vars(effective)[name].loc,
+            )
         if effective is not model:
             for i, d1 in enumerate(definers):
                 for d2 in definers[i + 1 :]:

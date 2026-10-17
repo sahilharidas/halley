@@ -305,7 +305,8 @@ class Scenarios:
 class RunConstants:
     """``self.run``: the run's constants (:data:`RUN_CONSTANTS`), scalar ``Int`` values the
     loader fills from the valuation date and the horizon. ``self.run.m_val`` is the valuation
-    month index, ``self.run.horizon`` the run's ``H``; boundary values may read them."""
+    month index, ``self.run.horizon`` the run's ``H``. Formulas read them; an ``init`` or
+    ``terminal`` callable receives the model point only and cannot (yet)."""
 
     m_val: Int
     horizon: Int

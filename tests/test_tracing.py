@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -206,6 +206,26 @@ def test_run_constants_are_read_as_self_run() -> None:
     assert "m_val, horizon" in str(info.value)
     assert info.value.loc is not None
     assert info.value.loc.function.endswith("Unknown.x")
+
+
+@pytest.mark.parametrize("name", ["mp", "tables", "scen", "run", "outputs"])
+def test_a_variable_may_not_take_an_accessor_or_class_attribute_name(name: str) -> None:
+    """The tracer sets ``self.mp``, ``self.tables``, ``self.scen`` and ``self.run`` on the
+    instance, where they would silently shadow a ``@var`` of the same name (``VarDef`` is a
+    non-data descriptor), and ``Product`` reads ``outputs`` and its other class attributes by
+    name; a variable so named is a build error at its definition."""
+
+    @var
+    def shadow(self: Product, t: Int) -> Int:
+        return t + 1
+
+    bad = cast(type[Product], type("Bad", (Product,), {"model_point": SIMPLE_SCHEMA, name: shadow}))
+    with pytest.raises(BuildError, match=f"{name} is .*; rename the variable") as info:
+        trace(bad)
+    assert f"self.{name}" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("shadow")
+    assert info.value.loc.file.endswith("test_tracing.py")
 
 
 def test_abstract_classes_are_refused_and_the_flag_is_not_inherited() -> None:

@@ -10,7 +10,10 @@ in their place and the checker applies the rule table to the graph.
 (PEP 696), so ``Rate[Annual]`` and ``Rate[Annual, Effective]`` are the same annotation and the
 same unit; ``Rate[Annual, Continuous]`` is the continuously compounded rate. Python 3.12 needs
 ``typing_extensions.TypeVar`` for the default because ``get_type_hints`` evaluates the annotation
-at build time.
+at build time. The default is filled into the annotation's ``__args__``, so ``Rate[Monthly]`` and
+``Rate[Monthly, Effective]`` are one and the same object at run time as well as for pyright: the
+monthly rate is effective by definition, and the explicit tag is a redundant spelling the unit
+resolver cannot tell apart, not an error. ``Rate[Monthly, Continuous]`` is.
 """
 
 from __future__ import annotations
@@ -629,6 +632,8 @@ _LEGAL = (
 
 
 def _rate_unit(args: tuple[object, ...], loc: Loc | None) -> Unit:
+    # ``args`` already carries the PEP 696 default: ``Rate[Monthly].__args__`` is
+    # ``(Monthly, Effective)``, the same as the explicit spelling.
     period = args[0] if args else None
     compounding = args[1] if len(args) > 1 else Effective
     if period is not Annual and period is not Monthly:

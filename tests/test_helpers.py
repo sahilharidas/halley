@@ -6,6 +6,7 @@ the ``explain`` interpreter (tests/test_explain.py)."""
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ from halley import (
     where,
 )
 from halley.authoring import exp, int_field
+from halley.errors import Loc
 from halley.ir import render
 from halley.ir import units as u
 from models import VAL
@@ -175,14 +177,33 @@ def run_helpers(tmp_path: Path, **settings: Any) -> RunResult:
     )
 
 
-def _fails(model: type[Product], match: str, error: type[Exception] = BuildError) -> Exception:
+def _inside(loc: Loc | None, model: type[Product], variable: str) -> None:
+    """The error points at a line of ``variable``'s method in ``model``'s own source: the right
+    file, the method's qualified name and a line within the decorated method."""
+    assert loc is not None, "every error carries a model source location"
+    fn = vars(model)[variable].fn
+    lines, first = inspect.getsourcelines(fn)
+    assert loc.file == fn.__code__.co_filename, loc
+    assert loc.function.endswith(f"{model.__name__}.{variable}"), loc
+    assert first <= loc.line < first + len(lines), (loc, first, len(lines))
+
+
+def _fails(
+    model: type[Product], variable: str, match: str, error: type[Exception] = BuildError
+) -> Exception:
+    """``check(trace(model))`` raises ``error`` matching ``match``, located inside ``variable``."""
     with pytest.raises(error, match=match) as info:
         check(trace(model))
     exc = info.value
-    loc = getattr(exc, "loc", None)
-    assert loc is not None, "every error carries a model source location"
-    assert loc.file.endswith("test_helpers.py")
+    _inside(getattr(exc, "loc", None), model, variable)
     return exc
+
+
+def _pv_month_fails(model: type[Product], match: str) -> None:
+    """``trace(model)`` fails at the ``pv_month`` call site inside the model's ``bel``."""
+    with pytest.raises(BuildError, match=match) as info:
+        trace(model)
+    _inside(info.value.loc, model, "bel")
 
 
 # --------------------------------------------------------------------------- the Call nodes
@@ -242,7 +263,7 @@ def test_abs_of_a_symbolic_value_keeps_its_unit() -> None:
         def gap(self, t: Int) -> Money:
             return abs(self.pols_if(t) > 0) * self.mp.premium  # type: ignore[operator, return-value]
 
-    _fails(Bad, r"abs\(\) takes a quantity, not a Bool", UnitError)
+    _fails(Bad, "gap", r"abs\(\) takes a quantity, not a Bool", UnitError)
 
 
 @pytest.mark.parametrize(
@@ -304,7 +325,7 @@ def test_helper_unit_mistakes_are_build_errors(name: str, message: str) -> None:
                 return 1 + self.mp.ilp
             return exp(self.scen.cpi(t))
 
-    _fails(Bad, message, UnitError)
+    _fails(Bad, "wrong", message, UnitError)
 
 
 def test_sum_t_accepts_coverage_units_but_not_an_index() -> None:
@@ -326,6 +347,7 @@ def test_sum_t_accepts_coverage_units_but_not_an_index() -> None:
 
     _fails(
         Level,
+        "total",
         r"sum_t\(lvl\) sums a Index; only Money, MoneyPerPolicy, Count, Factor and "
         "CoverageUnits are summed over time",
         UnitError,
@@ -365,42 +387,35 @@ def test_pv_month_needs_a_timed_cash_flow_and_a_factor_discount_variable() -> No
         def bel(self, t: Int) -> Money:
             return self.bel(t + 1) * 0.5 + pv_month(self.gap, t + 1, self.v)
 
-    with pytest.raises(BuildError, match=r"pv_month\(gap, ...\) needs the timing of gap") as info:
-        trace(NoTiming)
-    assert info.value.loc is not None
-    assert info.value.loc.function.endswith("NoTiming.bel")
+    _pv_month_fails(NoTiming, r"pv_month\(gap, ...\) needs the timing of gap")
 
     class ScalarFlow(Helpers):
         @var(terminal=0)
         def bel(self, t: Int) -> Money:
             return self.bel(t + 1) * 0.5 + pv_month(self.cu_total, t + 1, self.v)  # type: ignore[arg-type]
 
-    with pytest.raises(BuildError, match="takes a cash flow variable with a time dimension"):
-        trace(ScalarFlow)
+    _pv_month_fails(ScalarFlow, "takes a cash flow variable with a time dimension")
 
     class ScalarDiscount(Helpers):
         @var(terminal=0)
         def bel(self, t: Int) -> Money:
             return self.bel(t + 1) * 0.5 + pv_month(self.claims, t + 1, self.v_m)  # type: ignore[arg-type]
 
-    with pytest.raises(BuildError, match="discount factor as a variable with a time dimension"):
-        trace(ScalarDiscount)
+    _pv_month_fails(ScalarDiscount, "discount factor as a variable with a time dimension")
 
     class WrongDiscountUnit(Helpers):
         @var(terminal=0)
         def bel(self, t: Int) -> Money:
             return self.bel(t + 1) * 0.5 + pv_month(self.claims, t + 1, self.j)  # type: ignore[arg-type]
 
-    with pytest.raises(BuildError, match="discounts with j, which is declared Rate\\[Monthly\\]"):
-        trace(WrongDiscountUnit)
+    _pv_month_fails(WrongDiscountUnit, r"discounts with j, which is declared Rate\[Monthly\]")
 
     class NotConstant(Helpers):
         @var(terminal=0)
         def bel(self, t: Int) -> Money:
             return self.bel(t + 1) * 0.5 + pv_month(self.claims, t * 2, self.v)
 
-    with pytest.raises(BuildError, match="the time offset of claims must be a constant"):
-        trace(NotConstant)
+    _pv_month_fails(NotConstant, "the time offset of claims must be a constant")
 
 
 # ------------------------------------------------------------------------------- the numbers
