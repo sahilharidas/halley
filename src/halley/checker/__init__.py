@@ -7,7 +7,8 @@ Domains. A variable with a time dimension is a *state*, defined from ``t = 0``, 
 init or terminal value, declares ``domain="state"``, or when another formula needs its value at
 ``t = 0`` (reads it at ``t-1`` from month 1, or at ``t`` from a state, or with ``at(x, 0)``).
 Every other variable is a *month quantity*, defined from ``t = 1`` and stored as 0 at ``t = 0``.
-A read outside a variable's domain is an error.
+A read outside a variable's domain is an error. The group series an aggregation stage reads are
+inputs whose domain the declaration fixes; a read outside it is an error in the same way.
 """
 
 from __future__ import annotations
@@ -75,6 +76,25 @@ class _Checker:
         if isinstance(node, ir.ScenAt):
             self._int_index(node.index, loc, f"scen.{node.name}.at(...)")
             return self.graph.scenarios[node.name].unit
+        if isinstance(node, ir.SeriesRead):
+            decl = self._series(node.name, loc)
+            if not decl.has_time and node.offset != 0:
+                raise BuildError(
+                    f"series {node.name} has no time dimension; read it as "
+                    f"self.series.{node.name}()",
+                    loc,
+                )
+            return decl.unit
+        if isinstance(node, ir.SeriesAt):
+            decl = self._series(node.name, loc)
+            if not decl.has_time:
+                raise BuildError(
+                    f"series {node.name} has no time dimension; read it as "
+                    f"self.series.{node.name}(), not at a month",
+                    loc,
+                )
+            self._int_index(node.index, loc, f"series.{node.name}.at(...)")
+            return decl.unit
         if isinstance(node, ir.RunConst):
             return units.INT
         if isinstance(node, ir.Unary):
@@ -95,6 +115,12 @@ class _Checker:
             return self.vars[name]
         except KeyError:
             raise BuildError(f"no variable {name!r}", loc) from None
+
+    def _series(self, name: str, loc: Loc | None) -> ir.SeriesDecl:
+        try:
+            return self.graph.series[name]
+        except KeyError:
+            raise BuildError(f"no series {name!r}", loc) from None
 
     def _int_index(self, index: ir.Node, loc: Loc | None, what: str) -> None:
         unit = self.unit_of(index)
@@ -164,6 +190,12 @@ class _Checker:
             return frozenset({ir.SCENARIO, ir.TIME})
         if isinstance(node, ir.ScenAt):
             return frozenset({ir.SCENARIO}) | self.dims_of(node.index, dims)
+        if isinstance(node, ir.SeriesRead):
+            # fixed by the declaration, never by J: the scenario axis is there after a mean too
+            group = frozenset({ir.POLICY, ir.SCENARIO})
+            return (group | {ir.TIME}) if self.graph.series[node.name].has_time else group
+        if isinstance(node, ir.SeriesAt):
+            return frozenset({ir.POLICY, ir.SCENARIO}) | self.dims_of(node.index, dims)
         if isinstance(node, ir.RunConst):
             return frozenset()
         out = frozenset()
@@ -242,6 +274,7 @@ def check(graph: ir.Graph) -> ir.Graph:
     _check_dims(chk, variables)
     edges: list[_Edge] = _edges(graph)
     _check_domains(variables, edges)
+    _check_series_domains(graph)
 
     # strongly connected components, direction and cycles
     succ: dict[str, list[str]] = {name: [] for name in order}
@@ -314,10 +347,10 @@ def _check_units(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
 def _relative_to_time(node: ir.Node, variables: dict[str, ir.Variable]) -> bool:
     """Whether a node may not form a boundary value because its value moves with ``t``. An
     allow-list: fields, tables, run constants, constants, ``sum_t``, arithmetic, ``where`` and
-    calls are fixed; a variable read is fixed when the variable has no time dimension; ``at``
-    and ``scen.x.at`` are fixed when their month is a constant. Everything else, ``t`` itself,
-    a relative read of a scenario input and any node kind added later (a series read), is
-    rejected until it is admitted here on purpose."""
+    calls are fixed; a variable read is fixed when the variable has no time dimension; ``at``,
+    ``scen.x.at`` and ``series.x.at`` are fixed when their month is a constant. Everything
+    else, ``t`` itself, a relative read of a scenario input or of a group series, and any node
+    kind added later, is rejected until it is admitted here on purpose."""
     if isinstance(
         node,
         (
@@ -335,7 +368,7 @@ def _relative_to_time(node: ir.Node, variables: dict[str, ir.Variable]) -> bool:
         return False
     if isinstance(node, ir.VarRead):
         return variables[node.name].has_time
-    if isinstance(node, (ir.VarAt, ir.ScenAt)):
+    if isinstance(node, (ir.VarAt, ir.ScenAt, ir.SeriesAt)):
         return not isinstance(node.index, ir.Const)
     return True
 
@@ -383,7 +416,7 @@ def _check_dims(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
             culprit = next(
                 ir.render(n)
                 for n in ir.walk(v.expr)
-                if isinstance(n, (ir.VarRead, ir.ScenRead, ir.TimeIndex))
+                if isinstance(n, (ir.VarRead, ir.ScenRead, ir.SeriesRead, ir.TimeIndex))
                 and ir.TIME in (n.dims or frozenset())
             )
             raise BuildError(
@@ -506,6 +539,68 @@ def _check_domains(variables: dict[str, ir.Variable], edges: list[_Edge]) -> Non
                 "recursive and declares a terminal value",
                 e.node.loc,
             )
+
+
+def _check_series_domains(graph: ir.Graph) -> None:
+    """Group series reads stay inside the series' domain, as variable reads do: with ``(first,
+    last)`` the reader's formula range, a relative read needs ``first + offset >= start`` and
+    ``offset <= 0`` (``1`` from a formula that stops at ``H - 1``, a backward recursion's), and a
+    fixed month ``at(k)`` needs ``k >= start``. A series is an input, so a read before its start
+    is an error rather than a demand that lowers it: a sum of states declares ``start=0`` on its
+    ``GroupSum``. Months beyond the horizon of a fixed read are checked when the run loads."""
+    for v in graph.variables.values():
+        for expr in (v.expr, v.init, v.terminal):
+            if expr is None:
+                continue
+            for node in ir.walk(expr):
+                if isinstance(node, ir.SeriesRead):
+                    decl = graph.series[node.name]
+                    if decl.has_time and v.has_time and expr is v.expr:
+                        _check_series_offset(v, node, decl)
+                elif (
+                    isinstance(node, ir.SeriesAt)
+                    and isinstance(node.index, ir.Const)
+                    and not isinstance(node.index.value, bool)
+                ):
+                    k = int(node.index.value)
+                    decl = graph.series[node.name]
+                    if k < 0:
+                        raise BuildError(
+                            f"{v.name} reads {ir.render(node)}, which is before t = 0", node.loc
+                        )
+                    if k < decl.start:
+                        raise BuildError(
+                            f"{v.name} reads {ir.render(node)}, which is before the start of "
+                            f"series {node.name} at t = {decl.start}; a sum of states declares "
+                            "GroupSum(..., start=0)",
+                            node.loc,
+                        )
+
+
+def _check_series_offset(v: ir.Variable, node: ir.SeriesRead, decl: ir.SeriesDecl) -> None:
+    first, last = v.formula_range
+    need = first + node.offset
+    if need < decl.start:
+        if need < 0:
+            raise BuildError(
+                f"{v.name} reads {ir.render(node)}, which is before t = 0 at t = {first}; a "
+                "series starts at t = 0 at the earliest",
+                node.loc,
+            )
+        raise BuildError(
+            f"{v.name} reads {ir.render(node)}, which is outside the domain of series "
+            f"{node.name} at t = {first}: the series starts at t = {decl.start}; a sum of states "
+            "declares GroupSum(..., start=0)",
+            node.loc,
+        )
+    max_offset = 0 if last == "H" else 1
+    if node.offset > max_offset:
+        raise BuildError(
+            f"{v.name} reads {ir.render(node)}, which is outside the domain of series "
+            f"{node.name} at t = {last}; a variable that reads a later month is backward "
+            "recursive and declares a terminal value",
+            node.loc,
+        )
 
 
 def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:

@@ -119,6 +119,29 @@ class ScenAt(Node):
 
 
 @dataclass(eq=False, slots=True)
+class SeriesRead(Node):
+    """``series.<name>(t + offset)``: a group series of an aggregation stage at a relative
+    month, or ``series.<name>()`` for a series without a time dimension (offset 0). Its
+    dimensions are fixed by the declaration (:class:`SeriesDecl`): group and scenario, and time
+    when the series has it."""
+
+    name: str
+    offset: int
+
+
+@dataclass(eq=False, slots=True)
+class SeriesAt(Node):
+    """``series.<name>.at(index)``: a group series at an absolute month, constant or per
+    group."""
+
+    name: str
+    index: Node
+
+    def children(self) -> tuple[Node, ...]:
+        return (self.index,)
+
+
+@dataclass(eq=False, slots=True)
 class RunConst(Node):
     """``run.<name>``: a scalar ``Int`` constant of the run, with no dimensions. ``m_val`` is
     the valuation month index ``12 * year + month - 1`` and ``horizon`` the run's ``H``."""
@@ -285,6 +308,23 @@ class ScenarioDecl:
     doc: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class SeriesDecl:
+    """A group series an aggregation stage reads (design section 9): a sum over each group's
+    members of one or more projection outputs, supplied as a dense ``(Tn | 1, groups,
+    scenarios)`` array. ``has_time`` says whether it has a month axis; ``start`` is the first
+    month of its domain (0 for a sum of states, 1 for a sum of month quantities); ``scenario``
+    is true when it keeps the basis's scenarios (``"each"``) and false for their mean, whose
+    scenario axis has size 1. The scenario axis exists either way (D4)."""
+
+    name: str
+    unit: Unit
+    has_time: bool
+    start: int
+    scenario: bool
+    doc: str = ""
+
+
 @dataclass(slots=True)
 class Graph:
     model: str
@@ -303,6 +343,8 @@ class Graph:
     """Checked: the variables of each component, in schedule order."""
     invariant_reads: frozenset[str] = frozenset()
     """Variables the product's invariants read; kept generated, not part of the hash."""
+    series: dict[str, SeriesDecl] = field(default_factory=lambda: {})
+    """The group series an aggregation stage reads; empty for a projection."""
 
     def reads(self, var: Variable) -> Iterator[tuple[Node, str, int | None]]:
         """Every variable read in ``var``'s formula and boundary values: ``(node, name,
@@ -358,6 +400,12 @@ def render(node: Node) -> str:
         return f"scen.{node.name}(t{node.offset:+d})" if node.offset else f"scen.{node.name}(t)"
     if isinstance(node, ScenAt):
         return f"scen.{node.name}.at({render(node.index)})"
+    if isinstance(node, SeriesRead):
+        if node.offset == 0:
+            return f"series.{node.name}(t)"
+        return f"series.{node.name}(t{node.offset:+d})"
+    if isinstance(node, SeriesAt):
+        return f"series.{node.name}.at({render(node.index)})"
     if isinstance(node, RunConst):
         return f"run.{node.name}"
     if isinstance(node, Unary):
@@ -394,6 +442,9 @@ def graph_hash(graph: Graph) -> str:
         parts.append(f"table {graph.tables[name]!r}")
     for name in sorted(graph.scenarios):
         parts.append(f"scenario {graph.scenarios[name]!r}")
+    # a projection declares no series, so its hash is what it was before stages existed
+    for name in sorted(graph.series):
+        parts.append(f"series {graph.series[name]!r}")
     parts.append(f"horizon {graph.horizon_field}")
     parts.append(f"outputs {graph.outputs}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()

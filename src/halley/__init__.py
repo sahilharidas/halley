@@ -12,6 +12,7 @@ Typical use::
 
 from __future__ import annotations
 
+from halley.aggregation import Aggregation, Basis, GroupSum
 from halley.authoring import (
     Annual,
     Bool,
@@ -77,7 +78,9 @@ def build(model: type[_Product], **statics: object) -> CompiledModel:
 
 
 __all__ = [
+    "Aggregation",
     "Annual",
+    "Basis",
     "Bool",
     "BuildError",
     "BuildWarning",
@@ -91,6 +94,7 @@ __all__ = [
     "Factor",
     "Field",
     "Fraction",
+    "GroupSum",
     "HalleyError",
     "Index",
     "InputRule",

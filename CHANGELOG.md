@@ -45,6 +45,48 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   writing into one raises instead of changing the inputs of the later batches and of the run's
   result.
 
+### The aggregation stage's language
+
+- `halley.Aggregation` is the base class of an aggregation stage: a `Product` whose model points
+  are groups (`self.group` reads a group's field, as `self.mp` does) and whose extra inputs are
+  group series. It declares `bases`, a tuple of `Basis(name)`, and `series`, a tuple of
+  `GroupSum(name, basis, variables, unit, scenarios="mean" | "each", *, time=True, start=1)`.
+  A formula reads a series as `self.series.<name>(t + k)`, `self.series.<name>.at(k)` or, for a
+  series declared `time=False`, `self.series.<name>()`. The checker checks every read like a
+  variable read: the unit is the declared one, the dimensions are fixed by the declaration
+  (group, scenario and, with `time`, month; the scenario axis exists after a mean too), a
+  relative read stays inside the series' domain (from `start`, which a sum of states declares
+  as 0, up to `H`, or `H - 1` from a backward recursion), a boundary reads a series only at a
+  constant month, and a series of an undeclared basis or a read of an undeclared series is a
+  BuildError at the model line.
+- `halley.aggregation.group_series(stage, bases, members)` sums each series from projection runs
+  of the session: each named variable over a group's members in ascending policy id across the
+  basis's runs, sequentially, several variables' totals added left to right per scenario, then
+  the mean over scenarios as `cumsum_s((1.0 / J) * x)[-1]` for `scenarios="mean"`. Every
+  variable must be stored by the runs with the declared unit and time dimension, and a basis's
+  runs must share the valuation date, horizon and J and hold disjoint policies
+  (`Basis.check`); a LoadError otherwise. `run(..., series=...)` runs a stage on them; a
+  series read relatively is cut to the stage's horizon, which its basis must reach, and a
+  constant `.at(k)` must be a month the series covers. A stage that reads a mean runs at one
+  scenario: its own scenario inputs and its per-scenario series pass `require_deterministic`
+  when it loads.
+- A stage's run directory keeps a copy of every series it read, `inputs/series/<name>.parquet`
+  with the columns `<id field>`, `scenario`, `t`, `value`. The manifest records it under
+  `inputs.series.<name>` (`basis`, `variables`, `basis_scenarios`, `source_runs` with each run's
+  `run_id`, `dir` and `manifest_sha256`, `copy`, `sha256`, `unit`, `time`, `start`,
+  `scenarios`, `months`) and marks the outputs `outputs.kind = "aggregation"`, keyed on the
+  group schema's id field. The run id covers each series' hash, not its source runs'
+  directories. A projection's run id and graph hash are unchanged.
+- `RunResult.variable_info(name)` returns a `VariableInfo(time, unit, start, role)` read from the
+  manifest, for a run of the session and a loaded one alike.
+- `require_deterministic(source, what, reason, error)` takes anything with `n_scenarios` (a run,
+  a scenario input, a group series) and raises `error` (a RunError by default); its message now
+  names the mean as the way a J > 1 basis reaches a stage.
+- Removed: `halley.aggregation.AggregationInputs`, which took several runs of the same policies;
+  a `Basis` takes the runs of disjoint policies instead.
+- A variable may not be named `series_declarations` (a `Product` class method) and, in a stage,
+  `group`, `series` or `bases`.
+
 ### Notes on determinism
 
 - A power whose exponent is not a literal, such as `x(t) ** self.mp.k`, can differ in the last

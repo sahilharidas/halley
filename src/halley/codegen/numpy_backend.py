@@ -5,7 +5,9 @@ of policies by scenarios, one array per variable shaped ``(time, policy, scenari
 axis for each dimension the variable does not have. Non-recursive components are evaluated for
 all months at once; recursive ones step month by month, forward from ``t = 1`` or backward from
 the horizon. The source keeps the model's own grouping of every expression, so float64 results
-have the order the model wrote (D19), and it is saved beside the run for inspection.
+have the order the model wrote (D19), and it is saved beside the run for inspection. In an
+aggregation stage the policies of a batch are groups, and each group series the stage reads
+arrives as one more input array, ``Y_<name>``, shaped like a variable of its dimensions.
 
 Run-time checks live here too: probabilities in [0, 1], lookup keys inside their table, results
 finite. Each failure is a :class:`~halley.errors.RunError` that names the variable and its source
@@ -151,6 +153,36 @@ def _scen_at(values: NDArray[Any], index: Any, u0: int, name: str, variable: str
     return np.take_along_axis(values, _index3(idx), axis=0)
 
 
+def _series_at(
+    values: NDArray[Any], index: Any, start: int, name: str, variable: str, loc: str
+) -> Any:
+    """A group series at a fixed month, constant or per group. The series covers months
+    ``0..len - 1`` of its basis, which a series read only at fixed months may extend beyond the
+    stage's horizon; its domain starts at ``start``."""
+    idx = np.asarray(index)
+    last = values.shape[0] - 1
+    if idx.ndim == 0:
+        i = int(idx)
+        if i < start or i > last:
+            raise LaneError(
+                f"series.{name}.at({i}) is outside the months of series {name}, {start}..{last}",
+                variable,
+                loc,
+                np.ones((), dtype=bool),
+            )
+        return values[i]
+    bad = (idx < start) | (idx > last)
+    if bad.any():
+        raise LaneError(
+            f"series.{name}.at(...) reads a month outside the months of series {name}, "
+            f"{start}..{last}",
+            variable,
+            loc,
+            _lanes(bad),
+        )
+    return np.take_along_axis(values, _index3(idx), axis=0)
+
+
 def _sum_t(values: NDArray[Any], start: int, horizon: int) -> NDArray[Any]:
     """Sequential sum over months ``start..horizon`` in ascending order (D19)."""
     return np.cumsum(values[start : horizon + 1], axis=0)[-1:]
@@ -186,6 +218,7 @@ _HELPERS: dict[str, object] = {
     "_ck": _ck,
     "_at": _at,
     "_scen_at": _scen_at,
+    "_series_at": _series_at,
     "_sum_t": _sum_t,
     "_check_prob": _check_prob,
     "_check_finite": _check_finite,
@@ -256,7 +289,7 @@ def value_kind(node: ir.Node, step: bool) -> str:
         if node.fn == "as_cu":
             return kinds[0]  # emitted as its argument
         return ZERO_D if node.fn == "to_monthly_cf" else SCALAR  # to_monthly_cf is an np.where
-    return ARRAY  # VarRead, VarAt, SumT, MpField, ScenRead, ScenAt
+    return ARRAY  # VarRead, VarAt, SumT, MpField, ScenRead, ScenAt, SeriesRead, SeriesAt
 
 
 def backend_scalar(node: ir.Node, step: bool) -> bool:
@@ -305,6 +338,10 @@ class _Generator:
     @staticmethod
     def mp(name: str, ctx: _Ctx) -> str:
         return f"m_{name}" if ctx.mode == "step" else f"M_{name}"
+
+    @staticmethod
+    def series(name: str) -> str:
+        return f"Y_{name}"
 
     # ------------------------------------------------------------------ expressions
     def expr(self, node: ir.Node, ctx: _Ctx) -> str:
@@ -365,6 +402,14 @@ class _Generator:
                 f"_scen_at(Z_{node.name}, {self.expr(node.index, ctx)}, u0_{node.name}, "
                 f"{node.name!r}, {self.current!r}, {_loc_str(node.loc)!r})"
             )
+        if isinstance(node, ir.SeriesRead):
+            return self.series_read(node, ctx)
+        if isinstance(node, ir.SeriesAt):
+            decl = self.graph.series[node.name]
+            return (
+                f"_series_at({self.series(node.name)}, {self.expr(node.index, ctx)}, "
+                f"{decl.start}, {node.name!r}, {self.current!r}, {_loc_str(node.loc)!r})"
+            )
         if isinstance(node, ir.RunConst):
             return f"R_{node.name}"
         if isinstance(node, ir.Unary):
@@ -420,6 +465,22 @@ class _Generator:
         if ctx.mode == "whole":
             return f"{name}[{ctx.first + k}:{_bound(ctx.last, k)}]"
         raise BuildError(f"{node.name}(t) appears in a variable without a time dimension", node.loc)
+
+    def series_read(self, node: ir.SeriesRead, ctx: _Ctx) -> str:
+        """A group series, ``(Tn | 1, g, S)`` in the batch: read like a variable of the same
+        dimensions, never through the scenario inputs' ``Z_``/``u0`` path (its rows are months
+        ``0..H`` of the stage)."""
+        name = self.series(node.name)
+        if not self.graph.series[node.name].has_time:
+            return f"{name}[0]" if ctx.mode == "step" else name
+        k = node.offset
+        if ctx.mode == "step":
+            return f"{name}[t{k:+d}]" if k else f"{name}[t]"
+        if ctx.mode == "whole":
+            return f"{name}[{ctx.first + k}:{_bound(ctx.last, k)}]"
+        raise BuildError(
+            f"series.{node.name}(t) appears in a variable without a time dimension", node.loc
+        )
 
     def lookup(self, node: ir.TableLookup, ctx: _Ctx) -> str:
         decl = self.graph.tables[node.table]
@@ -480,6 +541,8 @@ class _Generator:
         for sname in g.scenarios:
             self.emit(f"Z_{sname} = inp['scen.{sname}']")
             self.emit(f"u0_{sname} = inp['scen.{sname}.u0']")
+        for yname in g.series:
+            self.emit(f"{self.series(yname)} = inp['series.{yname}']")
         for rname in self.run_constants():
             self.emit(f"R_{rname} = H" if rname == "horizon" else f"R_{rname} = inp['run.{rname}']")
         self.emit("with np.errstate(all='ignore'):")

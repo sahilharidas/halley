@@ -73,6 +73,15 @@ class Lane:
         si = self.s if a.shape[2] > 1 else 0
         return a[ti, pi, si].item()
 
+    def series_at(self, name: str, u: int) -> float:
+        """A group series of the stage at month ``u`` for this lane's group and scenario (the
+        scenario axis has size 1 after a mean)."""
+        values = self.inputs.series[name].values
+        if not 0 <= u < values.shape[0]:
+            raise HalleyError(f"series.{name} read at t = {u}, outside 0..{values.shape[0] - 1}")
+        si = self.s if values.shape[2] > 1 else 0
+        return values[u, self.p, si].item()
+
     def eval(self, node: ir.Node, t: int | None, step: bool = False) -> Any:
         """The value of ``node`` for this lane at month ``t``. ``step`` says whether the reader
         is a member of a recursive component, which decides the path a power takes in the
@@ -127,6 +136,14 @@ class Lane:
         if isinstance(node, ir.ScenAt):
             sc = self.inputs.scenarios[node.name]
             return sc.values[int(self.eval(node.index, t, step)) - sc.u0, 0, self.s].item()
+        if isinstance(node, ir.SeriesRead):
+            if not self.graph.series[node.name].has_time:
+                return self.series_at(node.name, 0)
+            if t is None:
+                raise HalleyError(f"series.{node.name}(t) read without a month")
+            return self.series_at(node.name, t + node.offset)
+        if isinstance(node, ir.SeriesAt):
+            return self.series_at(node.name, int(self.eval(node.index, t, step)))
         if isinstance(node, ir.RunConst):
             return self.inputs.run[node.name]
         if isinstance(node, ir.Unary):
@@ -291,6 +308,8 @@ def _leaves(node: ir.Node) -> list[ir.Node]:
                 ir.TableLookup,
                 ir.ScenRead,
                 ir.ScenAt,
+                ir.SeriesRead,
+                ir.SeriesAt,
                 ir.RunConst,
             ),
         ):

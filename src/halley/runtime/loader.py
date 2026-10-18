@@ -1,10 +1,12 @@
 # pyright: basic
-"""Loader: read and validate model points, assumption tables and scenario files.
+"""Loader: read and validate model points, assumption tables, scenario files and the group
+series of an aggregation stage.
 
 Everything is checked against the contracts the model declares before a batch runs: field types
 and ranges, cross-field rules, derived fields, table key coverage, value ranges, metadata and
-rules, scenario coverage of every month the model reads, value ranges and rules, and the
-product's input rules once everything is loaded. A failure is a
+rules, scenario coverage of every month the model reads, value ranges and rules, each group
+series' unit, domain, scenarios and groups, and the product's input rules once everything is
+loaded. A failure is a
 :class:`~halley.errors.LoadError` that names the file, the row or policy and the rule. Nothing
 is adjusted silently.
 """
@@ -534,6 +536,186 @@ def load_scenario(
     return loaded
 
 
+# ----------------------------------------------------------------------------------- series
+
+
+@dataclass(slots=True)
+class LoadedSeries:
+    """A group series an aggregation stage reads (design section 9): each group's members
+    summed over one or more outputs of a basis's projection runs, sequentially in ascending
+    ``policy_id`` (D19).
+
+    ``values`` is dense, shaped ``(Tn | 1, groups, scenarios)``: months ``0..H`` of the basis
+    (one row for a series without a time dimension), the groups in ascending ``group_ids``, and
+    the basis's scenarios, or one after a mean (``scenarios == "mean"``). ``unit`` and
+    ``start`` are what the source runs recorded (the latest start of the variables summed);
+    ``provenance`` is what the run manifest records about where the values came from."""
+
+    name: str
+    values: NDArray[np.float64]
+    unit: units.Unit
+    has_time: bool
+    start: int
+    group_ids: NDArray[Any]
+    scenarios: str
+    """``"mean"`` (one scenario, the mean over the basis's) or ``"each"``."""
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_scenarios(self) -> int:
+        return int(self.values.shape[2])
+
+    @property
+    def horizon(self) -> int:
+        """The last month the series covers (0 without a time dimension)."""
+        return int(self.values.shape[0]) - 1
+
+
+def _relatively_read(graph: ir.Graph) -> set[str]:
+    """The series some formula reads at a relative month, ``series.x(t + k)``."""
+    names: set[str] = set()
+    for v in graph.variables.values():
+        for expr in (v.expr, v.init, v.terminal):
+            if expr is not None:
+                names.update(n.name for n in ir.walk(expr) if isinstance(n, ir.SeriesRead))
+    return names
+
+
+def _fixed_months(graph: ir.Graph) -> dict[str, set[int]]:
+    """The constant months some formula or boundary reads a series at, ``series.x.at(k)``."""
+    months: dict[str, set[int]] = {}
+    for v in graph.variables.values():
+        for expr in (v.expr, v.init, v.terminal):
+            if expr is None:
+                continue
+            for n in ir.walk(expr):
+                if (
+                    isinstance(n, ir.SeriesAt)
+                    and isinstance(n.index, ir.Const)
+                    and not isinstance(n.index.value, bool)
+                ):
+                    months.setdefault(n.name, set()).add(int(n.index.value))
+    return months
+
+
+def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int | None:
+    """A stage's default horizon: the shortest series read relatively (every basis covers the
+    stage), else the shortest series with a time dimension; ``None`` without either."""
+    relative = _relatively_read(graph)
+    timed = [series[n] for n in graph.series if n in series and graph.series[n].has_time]
+    read = [s for s in timed if s.name in relative] or timed
+    return min(s.horizon for s in read) if read else None
+
+
+def load_series(
+    graph: ir.Graph, series: Mapping[str, LoadedSeries], ids: NDArray[Any], horizon: int
+) -> dict[str, LoadedSeries]:
+    """Check every group series the stage declares against what was supplied: one per
+    declaration and no other, the declared unit (D11 across runs), time dimension, domain and
+    scenario treatment, the stage's groups in its order, finite values; then cut a series read
+    relatively to months ``0..H``, which its basis must cover. A series read only at fixed
+    months keeps every month of its basis, and each constant ``at(k)`` must be one of the
+    months the series then covers (a per-group month is checked when the batch runs)."""
+    for name in graph.series:
+        if name not in series:
+            raise LoadError(f"the stage reads series {name!r}, which was not given")
+    for name in series:
+        if name not in graph.series:
+            raise LoadError(f"series {name!r} was given but the stage declares no such series")
+    relative = _relatively_read(graph)
+    fixed = _fixed_months(graph)
+    out: dict[str, LoadedSeries] = {}
+    for name, decl in graph.series.items():
+        s = series[name]
+        label = f"series {name}"
+        if s.unit != decl.unit:
+            raise LoadError(
+                f"{label}: the stage declares it {decl.unit} but its basis records {s.unit} "
+                "(D11 across runs)"
+            )
+        if s.has_time != decl.has_time:
+            had = "has" if s.has_time else "has no"
+            raise LoadError(
+                f"{label}: the stage declares it {'with' if decl.has_time else 'without'} a time "
+                f"dimension but it {had} one"
+            )
+        if s.start > decl.start:
+            raise LoadError(
+                f"{label}: the stage reads it from t = {decl.start} but it is defined from "
+                f"t = {s.start}"
+            )
+        want = "each" if decl.scenario else "mean"
+        if s.scenarios != want:
+            raise LoadError(f"{label}: the stage declares scenarios={want!r}, not {s.scenarios!r}")
+        if not np.array_equal(np.asarray(s.group_ids, dtype=object), np.asarray(ids, dtype=object)):
+            raise LoadError(
+                f"{label}: it covers groups {', '.join(map(str, s.group_ids))} but the model "
+                f"points are {', '.join(map(str, ids))}"
+            )
+        values = s.values
+        if values.ndim != 3 or values.shape[1] != len(ids):
+            raise LoadError(
+                f"{label}: values must be shaped (months, {len(ids)} groups, scenarios), not "
+                f"{values.shape}"
+            )
+        if not decl.has_time and values.shape[0] != 1:
+            raise LoadError(f"{label}: a series without a time dimension has one row")
+        if not decl.scenario and values.shape[2] != 1:
+            raise LoadError(f"{label}: a mean over scenarios has one scenario")
+        if not np.isfinite(values).all():
+            raise LoadError(f"{label}: non-finite values")
+        if decl.has_time and name in relative:
+            if s.horizon < horizon:
+                raise LoadError(
+                    f"{label}: it covers months 0..{s.horizon} but the stage runs to H = "
+                    f"{horizon}; a series read relatively comes from a basis whose horizon is at "
+                    "least the stage's"
+                )
+            values = values[: horizon + 1]
+        last = int(values.shape[0]) - 1
+        late = [k for k in sorted(fixed.get(name, ())) if k > last] if decl.has_time else []
+        if late:
+            basis = s.provenance.get("basis")
+            whose = f"basis {basis}" if basis is not None else "its basis"
+            why = (
+                f"it is also read relatively, so it is cut to the stage's horizon, 0..{last}"
+                if last < s.horizon
+                else f"{whose} covers months 0..{last}"
+            )
+            raise LoadError(
+                f"{label}: the stage reads series.{name}.at({late[0]}), but {why}; a series read "
+                "at month k comes from a basis whose horizon is at least k"
+            )
+        out[name] = LoadedSeries(
+            name, values, s.unit, s.has_time, s.start, s.group_ids, s.scenarios, s.provenance
+        )
+    return out
+
+
+def _stage_scenarios(
+    graph: ir.Graph, scenarios: Mapping[str, LoadedScenario], series: Mapping[str, LoadedSeries]
+) -> int:
+    """The number of scenarios a run has: the scenario inputs' and the per-scenario series'
+    common J, or 1 without either. A stage that reads a mean over scenarios runs at S = 1, so
+    then every scenario input and every per-scenario series it reads is deterministic: one
+    check, :func:`~halley.aggregation.require_deterministic` (D4)."""
+    means = [name for name, d in graph.series.items() if not d.scenario]
+    each = [series[name] for name, d in graph.series.items() if d.scenario]
+    if means:
+        from halley.aggregation import require_deterministic  # the one J = 1 check
+
+        reason = f"the stage reads the mean series {means[0]}, so it runs at S = 1"
+        for name, sc in scenarios.items():
+            require_deterministic(sc, f"scenario input {name}", reason, LoadError)
+        for s in each:
+            require_deterministic(s, f"series {s.name}", reason, LoadError)
+    counts = {s.n_scenarios for s in scenarios.values()} | {s.n_scenarios for s in each}
+    if len(counts) > 1:
+        what = "scenario inputs and per-scenario series" if each else "scenario inputs"
+        raise LoadError(f"{what} disagree on the number of scenarios: {sorted(counts)}")
+    return counts.pop() if counts else 1
+
+
 # ----------------------------------------------------------------------------------- inputs
 
 
@@ -556,6 +738,9 @@ class Inputs:
     run: dict[str, int] = field(default_factory=dict)
     """The run constants (:func:`run_constants`), supplied to every batch as ``run.<name>``."""
     extras: dict[str, Any] = field(default_factory=dict)
+    series: dict[str, LoadedSeries] = field(default_factory=dict)
+    """An aggregation stage's group series (:func:`load_series`), supplied to every batch as
+    ``series.<name>`` sliced to the batch's groups."""
 
     @property
     def ids(self) -> NDArray[Any]:
@@ -607,6 +792,8 @@ class Inputs:
             inp[f"scen.{sname}.u0"] = sc.u0
         for rname, value in self.run.items():
             inp[f"run.{rname}"] = value
+        for yname, s in self.series.items():
+            inp[f"series.{yname}"] = s.values[:, lo:hi, :]  # the groups are the batch's policies
         return inp
 
 
@@ -622,13 +809,16 @@ def load_inputs(
     table_contracts: Mapping[str, Table] | None = None,
     scenario_contracts: Mapping[str, ScenarioInput] | None = None,
     input_rules: Sequence[InputRule] = (),
+    series: Mapping[str, LoadedSeries] | None = None,
 ) -> Inputs:
-    """Load every input the model reads, in order: model points, tables, the horizon, scenario
-    files, then the product's input rules over all of them. The contracts, when given, add the
-    tables' required metadata and rules, the scenario inputs' column names, bounds, coverage and
-    rules."""
+    """Load every input the model reads, in order: model points, tables, the horizon, an
+    aggregation stage's group series, scenario files, then the product's input rules over all of
+    them. The contracts, when given, add the tables' required metadata and rules, the scenario
+    inputs' column names, bounds, coverage and rules. A stage's horizon defaults to its series'
+    (:func:`_stage_horizon`) when its schema names no horizon field."""
     table_contracts = table_contracts or {}
     scenario_contracts = scenario_contracts or {}
+    series = series or {}
     mp = load_model_points(graph, schema, model_points, valuation_date)
     tables = tables or {}
     loaded_tables: dict[str, LoadedTable] = {}
@@ -640,11 +830,15 @@ def load_inputs(
         if name not in graph.tables:
             raise LoadError(f"table {name!r} was given but the model declares no such table")
     if horizon is None:
-        if schema.horizon is None:
-            raise LoadError("the run needs a horizon: the schema names no horizon field")
-        horizon = int(mp.columns[schema.horizon].max())
+        if schema.horizon is not None:
+            horizon = int(mp.columns[schema.horizon].max())
+        else:
+            horizon = _stage_horizon(graph, series)
+            if horizon is None:
+                raise LoadError("the run needs a horizon: the schema names no horizon field")
     if horizon < 1:
         raise LoadError(f"the horizon must be at least 1 month, not {horizon}")
+    loaded_series = load_series(graph, series, mp.ids, horizon)
     scenarios = scenarios or {}
     req = scenario_requirements(graph, horizon)
     loaded_scen: dict[str, LoadedScenario] = {}
@@ -660,12 +854,15 @@ def load_inputs(
     for name in scenarios:
         if name not in graph.scenarios:
             raise LoadError(f"scenario input {name!r} was given but the model declares none")
-    counts = {s.n_scenarios for s in loaded_scen.values()}
-    if len(counts) > 1:
-        raise LoadError(f"scenario inputs disagree on the number of scenarios: {sorted(counts)}")
-    n_scenarios = counts.pop() if counts else 1
+    n_scenarios = _stage_scenarios(graph, loaded_scen, loaded_series)
     inputs = Inputs(
-        mp, loaded_tables, loaded_scen, n_scenarios, horizon, run_constants(valuation_date, horizon)
+        mp,
+        loaded_tables,
+        loaded_scen,
+        n_scenarios,
+        horizon,
+        run_constants(valuation_date, horizon),
+        series=loaded_series,
     )
     if input_rules:
         view = inputs.view(valuation_date)

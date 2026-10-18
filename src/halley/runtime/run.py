@@ -8,7 +8,10 @@ versioned schema, and the invariant results. The manifest records the model sour
 commit, the IR hash, every input's hash and ``halley.*`` metadata, the backend and its versions,
 the settings, and per stored variable its unit, domain start and role. The run id is a hash of
 the IR, the inputs' hashes (not their paths, so the same bytes anywhere give the same id), the
-settings and the backend.
+settings and the backend. An aggregation stage runs through the same function: its model points
+are groups, its run directory also keeps a copy of every group series it read under
+``inputs/series/`` with the series' provenance in the manifest, and its outputs are marked
+``outputs.kind = "aggregation"``.
 """
 
 from __future__ import annotations
@@ -16,11 +19,13 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import importlib.metadata
+import io
 import json
 import platform
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,7 +46,7 @@ from halley.runtime.invariants import (
     check_declared,
     merge_results,
 )
-from halley.runtime.loader import Inputs, ReadFile, Source, load_inputs
+from halley.runtime.loader import Inputs, LoadedSeries, ReadFile, Source, load_inputs
 
 OUTPUT_SCHEMA_VERSION = 1
 """Bumped when the layout of the output files changes. A later aggregation stage reads a
@@ -73,6 +78,19 @@ class RunSettings:
             "outputs": list(self.outputs) if self.outputs is not None else None,
             "label": self.label,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class VariableInfo:
+    """What a run's manifest records about a stored variable (``outputs.variables.<name>``):
+    whether it has a time dimension, its unit's name, the first month of its domain and its
+    role. An aggregation stage checks a group series' declared unit and takes its domain from
+    here, for a run of this session and a loaded one alike."""
+
+    time: bool
+    unit: str
+    start: int
+    role: str | None
 
 
 @dataclass(slots=True)
@@ -114,6 +132,25 @@ class RunResult:
     def lane(self, name: str, policy_id: object, scenario: int = 0) -> NDArray[Any]:
         """One policy's values over time (or its single value for a scalar variable)."""
         return self.var(name)[:, self.index(policy_id), scenario]
+
+    def variable_info(self, name: str) -> VariableInfo:
+        """What the manifest records about a stored variable; a LoadError for one the run did
+        not store, or for a manifest written before units and domains were recorded."""
+        info = self.manifest.get("outputs", {}).get("variables", {}).get(name)
+        if info is None:
+            raise LoadError(f"run {self.run_id} did not store {name}; add it to outputs")
+        if "unit" not in info or "start" not in info:
+            raise LoadError(
+                f"run {self.run_id} records no unit or domain for {name}: its manifest predates "
+                "them; rerun it"
+            )
+        role = info.get("role")
+        return VariableInfo(
+            bool(info["time"]),
+            str(info["unit"]),
+            int(info["start"]),
+            None if role is None else str(role),
+        )
 
 
 def _git_commit(path: Path) -> str | None:
@@ -177,11 +214,47 @@ def _without_paths(inputs: dict[str, Any]) -> dict[str, Any]:
     def entry(e: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in e.items() if k != "path"}
 
-    return {
+    out = {
         "model_points": entry(inputs["model_points"]),
         "tables": {name: entry(e) for name, e in inputs["tables"].items()},
         "scenarios": {name: entry(e) for name, e in inputs["scenarios"].items()},
     }
+    if "series" in inputs:  # an aggregation stage: each series by its hash, not its sources' dirs
+        out["series"] = {
+            name: {k: v for k, v in e.items() if k != "source_runs"}
+            for name, e in inputs["series"].items()
+        }
+    return out
+
+
+def _series_table(s: LoadedSeries, id_field: str) -> pa.Table:
+    """A group series in long form for the run directory (design section 9): the group id,
+    ``scenario``, ``t`` and ``value``, group-major, then month, then scenario."""
+    n_t, n_g, n_s = s.values.shape
+    meta = {
+        b"halley.series": s.name.encode(),
+        b"halley.unit": s.unit.name.encode(),
+        b"halley.start": str(s.start).encode(),
+        b"halley.scenarios": s.scenarios.encode(),
+    }
+    return pa.table(
+        {
+            id_field: np.repeat(np.asarray(s.group_ids, dtype=object), n_t * n_s),
+            "scenario": np.tile(np.arange(n_s, dtype=np.int32), n_g * n_t),
+            "t": np.tile(np.repeat(np.arange(n_t, dtype=np.int32), n_s), n_g),
+            "value": np.ascontiguousarray(s.values.transpose(1, 0, 2)).reshape(-1),
+        }
+    ).replace_schema_metadata(meta)
+
+
+def _write_series(s: LoadedSeries, id_field: str, dest: Path) -> str:
+    """Write a group series' copy and return the sha256 of its bytes, which the run id uses."""
+    buf = io.BytesIO()
+    pq.write_table(_series_table(s, id_field), buf)
+    raw = buf.getvalue()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def run(
@@ -192,14 +265,23 @@ def run(
     scenarios: dict[str, Source] | None = None,
     settings: RunSettings,
     run_dir: str | Path,
+    series: Mapping[str, LoadedSeries] | None = None,
 ) -> RunResult:
     """Load and validate the inputs, project every policy in batches, check the built-in and
-    the product's invariants on every batch, and write the run directory."""
+    the product's invariants on every batch, and write the run directory.
+
+    An aggregation stage runs the same way with its groups as the model points and its group
+    series in ``series`` (:func:`~halley.aggregation.group_series`); its run directory keeps a
+    copy of every series and its outputs are keyed on the groups' id field, with
+    ``outputs.kind`` ``"aggregation"``."""
     graph = compiled.graph
     model = compiled.model
     run_path = Path(run_dir)
     if (run_path / "manifest.json").exists():
         raise LoadError(f"{run_path} already holds a run; use a new directory for each run")
+    stage = model.series_declarations() is not None
+    if series and not stage:
+        raise LoadError(f"{graph.model} is a projection; group series are read by a stage")
     inputs = load_inputs(
         graph,
         compiled.schema,
@@ -211,6 +293,7 @@ def run(
         table_contracts={t.name: t for t in model.assumption_tables},
         scenario_contracts={s.name: s for s in model.scenario_inputs},
         input_rules=model.input_rules,
+        series=series,
     )
     horizon = inputs.H
     n_pol = len(inputs.ids)
@@ -256,9 +339,22 @@ def run(
         _copy_input(t.file, run_path / "inputs" / "tables" / f"{name}.parquet")
     for name, s in inputs.scenarios.items():
         _copy_input(s.file, run_path / "inputs" / "scenarios" / f"{name}.parquet")
+    id_field = compiled.schema.id_field
+    series_inputs: dict[str, Any] = {}
+    for name, y in inputs.series.items():
+        copy = f"inputs/series/{name}.parquet"
+        series_inputs[name] = {
+            **y.provenance,  # basis, variables, source runs
+            "copy": copy,
+            "sha256": _write_series(y, id_field, run_path / copy),
+            "unit": y.unit.name,
+            "time": y.has_time,
+            "start": y.start,
+            "scenarios": y.scenarios,
+            "months": [0, y.horizon],
+        }
 
     source_path = Path(graph.source_file)
-    id_field = compiled.schema.id_field
     manifest: dict[str, Any] = {
         "halley": _halley_version(),
         "output_schema": OUTPUT_SCHEMA_VERSION,
@@ -301,9 +397,10 @@ def run(
                 )
                 for name, s in inputs.scenarios.items()
             },
+            **({"series": series_inputs} if stage else {}),
         },
         "outputs": {
-            "kind": "projection",
+            "kind": "aggregation" if stage else "projection",
             "id_field": id_field,
             "monthly": "outputs/monthly.parquet",
             "scalars": "outputs/scalars.parquet",

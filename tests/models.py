@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 from collections.abc import Callable
 from pathlib import Path
 from statistics import NormalDist
@@ -13,11 +14,16 @@ import numpy as np
 import pyarrow as pa
 
 from halley import (
+    Aggregation,
     Annual,
+    Basis,
     Column,
+    CompiledModel,
     Count,
+    CoverageUnits,
     Factor,
     Field,
+    GroupSum,
     InputRule,
     Int,
     Key,
@@ -34,6 +40,7 @@ from halley import (
     Schema,
     Table,
     TableRule,
+    as_cu,
     at,
     build,
     pv_month,
@@ -544,4 +551,218 @@ def powered_model_points(js: list[int], ks: list[int], rem_m: int = 12) -> Any:
             "j": pa.array(js, pa.int32()),
             "rem_m": pa.array([rem_m] * n, pa.int32()),
         }
+    )
+
+
+# ------------------------------------------------------------ the aggregation stage (B1)
+
+
+class Covered(Product):
+    """A projection whose outputs a stage sums: coverage units (a month quantity), fulfilment
+    cash flows (a backward state, so its domain starts at t = 0) and the premium (a scalar). A
+    scenario input scales the claims, so a run may carry several scenarios."""
+
+    model_point = SIMPLE_SCHEMA
+    scenario_inputs = (ScenarioInput("shock", "Factor"),)
+    outputs = ("x", "cf", "cu", "fcf", "premium_total")
+
+    @var(init=lambda mp: mp.pols_if_init, role="in_force")
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.98
+
+    @var
+    def cf(self, t: Int) -> Money:
+        return (self.x(t - 1) * self.mp.premium) * self.scen.shock(t)
+
+    @var
+    def cu(self, t: Int) -> CoverageUnits:
+        return as_cu(self.x(t - 1) * self.mp.premium)
+
+    @var(terminal=0)
+    def fcf(self, t: Int) -> Money:
+        return (self.fcf(t + 1) + self.cf(t + 1)) * 0.995
+
+    @var
+    def premium_total(self) -> Money:
+        return (self.mp.pols_if_init * self.mp.premium) * 14.0
+
+
+def covered_points(
+    prefix: str, n: int = 3, rem_m: int = 12, scale: float = 1.0, ids: list[str] | None = None
+) -> Any:
+    """``SIMPLE_SCHEMA`` model points ``<prefix>00, <prefix>01, ...`` (or ``ids``) for
+    ``Covered``."""
+    names = ids if ids is not None else [f"{prefix}{i:02d}" for i in range(n)]
+    n = len(names)
+    return pa.table(
+        {
+            "policy_id": pa.array(names, pa.string()),
+            "k": pa.array([2 + i for i in range(n)], pa.int32()),
+            "premium": pa.array([scale * (10.0 + 3.0 * i) for i in range(n)], pa.float64()),
+            "pols_if_init": pa.array([1.0 + 0.5 * i for i in range(n)], pa.float64()),
+            "rem_m": pa.array([rem_m] * n, pa.int32()),
+        }
+    )
+
+
+@functools.cache
+def compiled_covered() -> CompiledModel:
+    return build(Covered)
+
+
+def run_covered(
+    tmp_path: Path,
+    name: str,
+    points: Any,
+    shocks: tuple[float, ...] = (1.0,),
+    valuation_date: dt.date = VAL,
+    **settings: Any,
+) -> RunResult:
+    """One ``Covered`` run, one scenario per shock (constant over the months; the file reaches
+    month 60, so a run may set a longer horizon)."""
+    shock = scenario_file("shock", 0, 60, len(shocks), lambda s, u: shocks[s])
+    return run(
+        compiled_covered(),
+        model_points=points,
+        scenarios={"shock": shock},
+        settings=RunSettings(valuation_date=valuation_date, **settings),
+        run_dir=tmp_path / name,
+    )
+
+
+STAGE_SCHEMA = Schema(
+    fields=(
+        Field("group_id", "string", unique=True),
+        Field("j", "number", "Rate[Monthly]", ge=0, le=0.1),
+    ),
+    id_field="group_id",
+)
+
+MEMBERS = {"G0": ["B01", "A00", "A02"], "G1": ["A01", "B00", "B02"]}
+"""Two groups across two class runs (``A..`` and ``B..``), members listed out of order."""
+
+
+def stage_groups(ids: tuple[str, ...] = ("G1", "G0"), j: tuple[float, ...] = (0.004, 0.002)) -> Any:
+    """The stage's model points: one row per group, listed out of order."""
+    return pa.table(
+        {"group_id": pa.array(list(ids), pa.string()), "j": pa.array(list(j), pa.float64())}
+    )
+
+
+class Release(Aggregation):
+    """A toy CSM roll-forward (design section 9's ``CsmRollForward`` in miniature): a backward
+    recursion over a group series (``cu_next``) feeds the forward ones (``csm``, ``lc``), whose
+    inits are scalars formed from a scalar series and a fixed month of another."""
+
+    model_point = STAGE_SCHEMA
+    bases = (Basis("cur"),)
+    series = (
+        GroupSum("cu_g", "cur", "cu", "CoverageUnits"),
+        GroupSum("fcf_g", "cur", "fcf", "Money", start=0),
+        GroupSum("p_g", "cur", "premium_total", "Money", time=False),
+    )
+
+    @var
+    def d(self) -> Factor:
+        return 1.0 / (1 + self.group.j)
+
+    @var(terminal=0)
+    def cu_next(self, t: Int) -> CoverageUnits:
+        return self.series.cu_g(t + 1) + self.d() * self.cu_next(t + 1)
+
+    @var
+    def units(self, t: Int) -> CoverageUnits:
+        return self.series.cu_g(t) + self.cu_next(t)
+
+    @var
+    def csm_0(self) -> Money:
+        gap = self.series.p_g() - self.series.fcf_g.at(0)
+        return where(gap > 0, gap, 0.0)
+
+    @var
+    def lc_0(self) -> Money:
+        gap = self.series.fcf_g.at(0) - self.series.p_g()
+        return where(gap > 0, gap, 0.0)
+
+    @var
+    def acc(self, t: Int) -> Money:
+        return self.group.j * self.csm(t - 1)
+
+    @var
+    def release(self, t: Int) -> Money:
+        u = self.units(t)
+        pre = self.csm(t - 1) + self.acc(t)
+        return where(u > 0, pre * (self.series.cu_g(t) / where(u > 0, u, 1.0)), pre)
+
+    @var(init=lambda g: g.csm_0())
+    def csm(self, t: Int) -> Money:
+        return (self.csm(t - 1) + self.acc(t)) - self.release(t)
+
+    @var(init=lambda g: g.lc_0())
+    def lc(self, t: Int) -> Money:
+        f0 = self.series.fcf_g(t - 1)
+        return where(f0 > 0, self.lc(t - 1) * (self.series.fcf_g(t) / where(f0 > 0, f0, 1.0)), 0.0)
+
+
+def closed_form_release(
+    cu_g: list[float], fcf_g: list[float], p_g: float, j: float
+) -> dict[str, list[float]]:
+    """What ``Release`` computes for one group and scenario, written independently with plain
+    floats in the model's grouping, from the group series."""
+    horizon = len(cu_g) - 1
+    d = 1.0 / (1 + j)
+    cu_next = [0.0] * (horizon + 1)
+    for t in range(horizon - 1, -1, -1):
+        cu_next[t] = cu_g[t + 1] + d * cu_next[t + 1]
+    units = [0.0] + [cu_g[t] + cu_next[t] for t in range(1, horizon + 1)]
+    gap = p_g - fcf_g[0]
+    csm = [gap if gap > 0 else 0.0] + [0.0] * horizon
+    lc = [-gap if -gap > 0 else 0.0] + [0.0] * horizon
+    acc = [0.0] * (horizon + 1)
+    release = [0.0] * (horizon + 1)
+    for t in range(1, horizon + 1):
+        acc[t] = j * csm[t - 1]
+        pre = csm[t - 1] + acc[t]
+        u = units[t]
+        release[t] = pre * (cu_g[t] / u) if u > 0 else pre
+        csm[t] = (csm[t - 1] + acc[t]) - release[t]
+        f0 = fcf_g[t - 1]
+        lc[t] = lc[t - 1] * (fcf_g[t] / f0) if f0 > 0 else 0.0
+    return {
+        "cu_next": cu_next,
+        "units": units,
+        "acc": acc,
+        "release": release,
+        "csm": csm,
+        "lc": lc,
+    }
+
+
+def release_bases(
+    tmp_path: Path, shocks: tuple[float, ...] = (1.0,), **settings: Any
+) -> dict[str, Any]:
+    """The ``cur`` basis of ``Release``: two class runs with disjoint policies."""
+    a = run_covered(tmp_path, f"class-a-{len(shocks)}", covered_points("A"), shocks, **settings)
+    b = run_covered(
+        tmp_path, f"class-b-{len(shocks)}", covered_points("B", scale=1.5), shocks, **settings
+    )
+    return {"cur": [a, b]}
+
+
+def run_stage(
+    tmp_path: Path,
+    stage: type[Aggregation],
+    series: dict[str, Any],
+    name: str = "stage",
+    groups: Any = None,
+    scenarios: dict[str, Any] | None = None,
+    **settings: Any,
+) -> RunResult:
+    return run(
+        build(stage),
+        model_points=stage_groups() if groups is None else groups,
+        scenarios=scenarios,
+        series=series,
+        settings=RunSettings(valuation_date=VAL, **settings),
+        run_dir=tmp_path / name,
     )

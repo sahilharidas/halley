@@ -21,6 +21,7 @@ from halley.authoring.product import (
     Product,
     RunConstants,
     Scenarios,
+    SeriesAccess,
     Static,
     Tables,
     VarDef,
@@ -55,6 +56,7 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     fields = schema.decls()
     tables = {t.name: t.decl() for t in model.assumption_tables}
     scenarios = {s.name: s.decl() for s in model.scenario_inputs}
+    series = model.series_declarations()  # None for a projection: it has no self.series
 
     inst: Any = model.__new__(model)
     for name, value in resolved.items():
@@ -63,6 +65,8 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     inst.tables = Tables(tables)
     inst.scen = Scenarios(scenarios)
     inst.run = RunConstants()
+    if series is not None:
+        inst.series = SeriesAccess(series)  # shadows the class's tuple of declarations
     scope = BoundaryScope(fields, var_defs)
 
     variables: dict[str, ir.Variable] = {}
@@ -107,6 +111,7 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
         outputs=outputs,
         scale_fields=scales,
         invariant_reads=frozenset(invariant_reads),
+        series=dict(series or {}),
     )
 
 
@@ -182,6 +187,7 @@ _RESERVED_NAMES = {
     "tolerance_scales": "a Product class attribute",
     "invariants": "a Product class attribute",
     "abstract": "a Product class attribute",
+    "series_declarations": "a Product class method",
 }
 """Names a variable may not take: the tracer sets the accessors on the instance, where they would
 shadow a ``@var`` of the same name, and ``Product`` reads its class attributes by name."""

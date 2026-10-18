@@ -1,62 +1,51 @@
 """Aggregation stage: group-level calculations on aggregated policy results (D6).
 
-First use: the portfolio totals of the term assurance spec (section 11.3). The IFRS 17 CSM
-roll-forward for one group comes with the annuity (M7). The input contract already has the shape
-that the in-force groups of M11 and the scenario statistics of M12 need (Roadmap, doors kept open
-for M9 to M12): it takes one or more projection runs, keeps the scenario dimension, and the
-one-scenario requirement of the one-group CSM stage is a single check,
-:func:`require_deterministic`, not a shape assumption.
+First use: the portfolio totals of the term assurance spec (section 11.3). The stage itself is
+written in the same ``@var`` language as a projection and checked by the same checker
+(:mod:`halley.aggregation.stage`, design section 9): an :class:`Aggregation` is a ``Product``
+whose model points are groups and whose extra inputs are group series, each a :class:`GroupSum`
+over the runs of a :class:`Basis`. The scenario dimension is kept throughout (D4): a series is a
+mean over its basis's scenarios or keeps them, and the one-scenario requirement of a stage that
+reads a mean is a single check, :func:`require_deterministic`, not a shape assumption.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
 
+from halley.aggregation.stage import Aggregation, Basis, GroupSum, group_series, sequential_sum
 from halley.errors import HalleyError, RunError
-from halley.runtime.run import RunResult
+
+if TYPE_CHECKING:
+    from halley.runtime.run import RunResult
 
 
-def sequential_sum(values: NDArray[Any], axis: int) -> NDArray[Any]:
-    """Sum along an axis sequentially, in index order, keeping the axis with length 1 (D19:
-    a fixed-order reduction, not pairwise)."""
-    return np.cumsum(values, axis=axis).take([-1], axis=axis)
-
-
-def require_deterministic(result: RunResult) -> None:
-    """The one-group CSM stage reads a deterministic run (annuity spec, G6); M12 lifts the check.
-    One place, one check."""
-    if result.n_scenarios != 1:
-        raise RunError(
-            f"this aggregation reads a deterministic run (J = 1); the run has J = "
-            f"{result.n_scenarios} scenarios. Scenario statistics in the aggregation stage are "
-            "not built yet (roadmap milestone M12)"
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class AggregationInputs:
-    """The projection runs an aggregation reads. The remeasurement of an in-force group (M11)
-    reads a new-basis and an old-basis run of the same policies; the one-group stages read one."""
-
-    runs: tuple[RunResult, ...]
-
-    def __post_init__(self) -> None:
-        if not self.runs:
-            raise HalleyError("an aggregation needs at least one projection run")
-        first = self.runs[0]
-        for other in self.runs[1:]:
-            if not np.array_equal(first.ids, other.ids):
-                raise HalleyError("every run of an aggregation covers the same policies")
-            if other.H != first.H or other.n_scenarios != first.n_scenarios:
-                raise HalleyError("every run of an aggregation has the same horizon and scenarios")
+class HasScenarios(Protocol):
+    """Anything with a number of scenarios: a run, a scenario input, a group series."""
 
     @property
-    def primary(self) -> RunResult:
-        return self.runs[0]
+    def n_scenarios(self) -> int: ...
+
+
+def require_deterministic(
+    source: HasScenarios,
+    what: str = "the run",
+    reason: str = "this aggregation reads a deterministic run (J = 1)",
+    error: type[HalleyError] = RunError,
+) -> None:
+    """``source`` has one scenario (J = 1). The one check of D4: a stage that reads a mean over
+    scenarios runs at S = 1, so its own scenario inputs and every per-scenario series it reads
+    must be deterministic (the loader raises a LoadError through this); a projection run read
+    as deterministic must be too (annuity spec, G6). One place, one check."""
+    n = source.n_scenarios
+    if n != 1:
+        raise error(
+            f"{reason}; {what} has J = {n} scenarios, and a basis with J > 1 reaches a stage "
+            'only through a mean, GroupSum(..., scenarios="mean") (require_deterministic)'
+        )
 
 
 def portfolio_totals(result: RunResult, variables: list[str]) -> dict[str, NDArray[Any]]:
@@ -69,3 +58,15 @@ def portfolio_totals(result: RunResult, variables: list[str]) -> dict[str, NDArr
             raise HalleyError(f"the run has no variable {name!r}")
         out[name] = sequential_sum(np.asarray(result.var(name), dtype=np.float64), axis=1)
     return out
+
+
+__all__ = [
+    "Aggregation",
+    "Basis",
+    "GroupSum",
+    "HasScenarios",
+    "group_series",
+    "portfolio_totals",
+    "require_deterministic",
+    "sequential_sum",
+]

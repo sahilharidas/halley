@@ -335,6 +335,66 @@ class Scenarios:
         return ScenarioAccess(decl)
 
 
+class GroupSeries:
+    """``self.series.<name>`` inside a stage's formula: ``(t + k)`` reads a relative month,
+    ``.at(k)`` a fixed one, and ``()`` a series without a time dimension."""
+
+    def __init__(self, decl: ir.SeriesDecl) -> None:
+        self._decl = decl
+
+    def __call__(self, *args: object) -> Any:
+        loc = current_loc()
+        name = self._decl.name
+        if not self._decl.has_time:
+            if args:
+                raise BuildError(
+                    f"series.{name} has no time dimension; read it as self.series.{name}()", loc
+                )
+            return Sym(ir.SeriesRead(loc, name, 0))
+        if len(args) != 1:
+            raise BuildError(
+                f"series.{name}(t) takes the time index with a constant offset, as "
+                f"self.series.{name}(t - 1)",
+                loc,
+            )
+        arg = args[0]
+        if isinstance(arg, int) and not isinstance(arg, bool):
+            raise BuildError(
+                f"series.{name}({arg}) reads a fixed month; write self.series.{name}.at({arg}) "
+                f"for that, or self.series.{name}(t) for the current month",
+                loc,
+            )
+        return Sym(ir.SeriesRead(loc, name, offset_of(arg, loc, f"series.{name}")))
+
+    def at(self, index: object) -> Any:
+        loc = current_loc()
+        name = self._decl.name
+        if not self._decl.has_time:
+            raise BuildError(
+                f"series.{name} has no time dimension; read it as self.series.{name}()", loc
+            )
+        return Sym(ir.SeriesAt(loc, name, as_node(index, loc)))
+
+
+class SeriesAccess:
+    """``self.series`` inside a stage's formula: the group series the stage declares, by name
+    (:meth:`Product.series_declarations`)."""
+
+    def __init__(self, series: dict[str, ir.SeriesDecl]) -> None:
+        self._series = series
+
+    def __getattr__(self, name: str) -> GroupSeries:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        decl = self._series.get(name)
+        if decl is None:
+            known = ", ".join(sorted(self._series)) or "none"
+            raise BuildError(
+                f"the stage declares no series {name!r}; it declares: {known}", current_loc()
+            )
+        return GroupSeries(decl)
+
+
 class RunConstants:
     """``self.run``: the run's constants (:data:`RUN_CONSTANTS`), scalar ``Int`` values the
     loader fills from the valuation date and the horizon. ``self.run.m_val`` is the valuation
@@ -374,6 +434,10 @@ class Product:
       batch after the built-in ones, in declaration order;
     * ``abstract``: ``True`` on a class that only exists to be subclassed; ``build()`` refuses
       it. The flag is not inherited: a class is abstract only when it sets it itself.
+
+    A projection reads no group series; an aggregation stage
+    (:class:`~halley.aggregation.stage.Aggregation`) does, through ``self.series``, and says
+    which in :meth:`series_declarations`.
     """
 
     model_point: ClassVar[Schema | None] = None
@@ -394,3 +458,10 @@ class Product:
         raise TypeError(
             "a Product is not instantiated directly; halley.build(Model, **statics) traces it"
         )
+
+    @classmethod
+    def series_declarations(cls) -> dict[str, ir.SeriesDecl] | None:
+        """The group series the model reads, by name, validated; ``None`` for a projection,
+        which has no ``self.series`` (reads across policies belong to the aggregation stage).
+        The tracer calls it once, before it traces the formulas."""
+        return None
