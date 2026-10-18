@@ -206,7 +206,7 @@ def _check_finite(values: NDArray[Any], start: int, variable: str, loc: str) -> 
     bad = ~np.isfinite(v)
     if bad.any():
         raise LaneError(
-            f"{variable} is not finite (NaN or infinity) for some policy and month",
+            f"{variable} is not finite (NaN or infinity) at some month",  # the lanes follow
             variable,
             loc,
             _lanes(bad),
@@ -471,9 +471,9 @@ class _Generator:
         dimensions, never through the scenario inputs' ``Z_``/``u0`` path (its rows are months
         ``0..H`` of the stage)."""
         name = self.series(node.name)
-        if not self.graph.series[node.name].has_time:
-            return f"{name}[0]" if ctx.mode == "step" else name
         k = node.offset
+        if k is None:  # a series without a time dimension, (1, g, S)
+            return f"{name}[0]" if ctx.mode == "step" else name
         if ctx.mode == "step":
             return f"{name}[t{k:+d}]" if k else f"{name}[t]"
         if ctx.mode == "whole":
@@ -670,16 +670,17 @@ def compile_source(source: str, model: str) -> BatchFn:
 
 
 def run_batch(
-    fn: BatchFn, graph: ir.Graph, inp: dict[str, Any], horizon: int
+    fn: BatchFn, graph: ir.Graph, inp: dict[str, Any], horizon: int, lanes: str = "policies"
 ) -> dict[str, NDArray[Any]]:
     """Call the generated function; turn a failure into a :class:`RunError` that names the
-    model variable and its source line."""
+    model variable and its source line, and the lanes that failed by their ids under the noun
+    ``lanes`` (``"groups"`` in an aggregation stage, whose model points are groups)."""
     try:
         return fn(inp, horizon)
     except LaneError as exc:
         v = graph.variables.get(exc.variable)
-        lanes = _lane_ids(exc.lanes, inp)
-        raise RunError(f"{exc.message}{lanes}", v.loc if v else None) from None
+        failed = _lane_ids(exc.lanes, inp, lanes)
+        raise RunError(f"{exc.message}{failed}", v.loc if v else None) from None
     except RunError:
         raise
     except Exception as exc:  # map anything else to the model source
@@ -691,7 +692,7 @@ def run_batch(
         ) from exc
 
 
-def _lane_ids(lanes: NDArray[np.bool_], inp: dict[str, Any]) -> str:
+def _lane_ids(lanes: NDArray[np.bool_], inp: dict[str, Any], noun: str) -> str:
     ids = inp.get("policy_ids")
     if ids is None or lanes.ndim == 0 or lanes.shape[0] != len(ids):
         return ""
@@ -699,7 +700,7 @@ def _lane_ids(lanes: NDArray[np.bool_], inp: dict[str, Any]) -> str:
     if not bad:
         return ""
     shown = ", ".join(bad[:5]) + (f" and {len(bad) - 5} more" if len(bad) > 5 else "")
-    return f"; policies {shown}"
+    return f"; {noun} {shown}"
 
 
 def _current_from_traceback(exc: BaseException) -> str | None:

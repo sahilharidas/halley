@@ -350,7 +350,7 @@ class GroupSeries:
                 raise BuildError(
                     f"series.{name} has no time dimension; read it as self.series.{name}()", loc
                 )
-            return Sym(ir.SeriesRead(loc, name, 0))
+            return Sym(ir.SeriesRead(loc, name, None))  # no month to be relative to
         if len(args) != 1:
             raise BuildError(
                 f"series.{name}(t) takes the time index with a constant offset, as "

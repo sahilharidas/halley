@@ -19,24 +19,33 @@ from run directories, with their copies, previous runs and membership checks, co
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import inspect
+import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
-from typing import Any, ClassVar, TypeGuard
+from typing import Any, ClassVar, Final, TypeGuard
 
 import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
 from halley.authoring.product import ModelPoint, Product, VarDef
-from halley.errors import BuildError, LoadError, Loc
+from halley.errors import BuildError, LoadError, Loc, UnitError
+from halley.ir import units
 from halley.ir.units import Unit, unit_from_name
 from halley.runtime.loader import LoadedSeries
 from halley.runtime.run import RunResult
 
 SCENARIO_TREATMENTS = ("mean", "each")
 """What a series does with its basis's scenarios: their mean (one scenario) or each of them."""
+
+GROUP_ADDITIVE: Final = frozenset({units.MONEY, units.COUNT, units.COVERAGE_UNITS})
+"""Units a group sum adds over a group's members (D11): amounts, numbers of policies and
+coverage units. A probability, rate, factor, index level, flag or Int of each member does not
+add up to the group's, and a MoneyPerPolicy is per policy by definition. Narrower than
+:data:`~halley.ir.units.SUMMABLE`, the units ``sum_t()`` adds over the months of one policy."""
 
 _STAGE_NAMES = {
     "group": "the group's fields (self.group)",
@@ -96,12 +105,13 @@ class Basis:
     def __post_init__(self) -> None:
         if self.loc is None:
             object.__setattr__(self, "loc", _declaration_loc())
-        if not self.name.isidentifier():
+        if not _is_name(self.name):
             raise BuildError(f"a basis is named like a variable, not {self.name!r}", self.loc)
 
-    def check(self, runs: Sequence[RunResult]) -> None:
+    def check(self, runs: Sequence[RunResult]) -> dt.date:
         """The runs given for this basis agree on the valuation date, the horizon and J, and
-        hold disjoint policies. A LoadError otherwise."""
+        hold disjoint policies; returns their valuation date, which the stage's must equal
+        (design section 9). A LoadError otherwise."""
         if not runs:
             raise LoadError(f"basis {self.name} has no runs")
         first = runs[0]
@@ -134,10 +144,28 @@ class Basis:
                         "product class)"
                     )
                 seen[pid] = r.run_id
+        return dt.date.fromisoformat(when)
 
 
 def _valuation_date(r: RunResult) -> str:
     return str(r.manifest["settings"]["valuation_date"])
+
+
+def _is_name(value: object) -> bool:
+    return isinstance(value, str) and value.isidentifier()
+
+
+def _is_str(value: object) -> bool:
+    return isinstance(value, str)
+
+
+def _is_bool(value: object) -> bool:
+    return isinstance(value, bool)
+
+
+def _is_start(value: object) -> bool:
+    """0 or 1 as an int: ``True == 1`` and ``1.0 == 1``, but neither is a month."""
+    return isinstance(value, int) and not isinstance(value, bool) and value in (0, 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,10 +176,12 @@ class GroupSum:
     ``scenarios="mean"`` reduces over the scenarios as ``cumsum_s((1.0 / J) * x)[-1]`` in
     ascending ``s``, giving one scenario, and ``"each"`` keeps them.
 
-    ``unit`` must be the unit every source run recorded for every variable (D11 across runs).
-    ``time`` says whether the variables have a time dimension; ``start`` is the first month the
-    stage reads, 1 for a sum of month quantities and 0 for a sum of states (a series read at
-    ``t - 1`` from month 1, or at month 0); the source runs' domains must start no later."""
+    ``unit`` must be the unit every source run recorded for every variable (D11 across runs),
+    and one that adds across policies (:data:`GROUP_ADDITIVE`). ``time`` says whether the
+    variables have a time dimension; ``start`` is the first month the stage reads, 1 (the
+    default) for a sum of month quantities and 0 for a sum of states (a series read at ``t - 1``
+    from month 1, or at month 0); the source runs' domains must start no later. A series
+    without a time dimension has no start to give."""
 
     name: str
     basis: str
@@ -160,7 +190,8 @@ class GroupSum:
     scenarios: str = "mean"
     _: KW_ONLY
     time: bool = True
-    start: int = 1
+    start: int | None = None
+    """1 when left out, for a series with a time dimension."""
     doc: str = ""
     loc: Loc | None = field(default=None, compare=False)
     """Where the series is declared; filled in when left out."""
@@ -168,9 +199,11 @@ class GroupSum:
     def __post_init__(self) -> None:
         if self.loc is None:
             object.__setattr__(self, "loc", _declaration_loc())
-        what = f"series {self.name}"
-        if not self.name.isidentifier():
+        if not _is_name(self.name):
             raise BuildError(f"a series is named like a variable, not {self.name!r}", self.loc)
+        what = f"series {self.name}"
+        if not _is_name(self.basis):
+            raise BuildError(f"{what}: its basis is a Basis name, not {self.basis!r}", self.loc)
         if self.scenarios not in SCENARIO_TREATMENTS:
             raise BuildError(
                 f"{what}: scenarios is 'mean' or 'each', not {self.scenarios!r}", self.loc
@@ -178,16 +211,35 @@ class GroupSum:
         names: object = (self.variables,) if isinstance(self.variables, str) else self.variables
         if not _is_tuple(names) or not names or not all(isinstance(n, str) and n for n in names):
             raise BuildError(f"{what} names its variables, as 'bel' or ('bel', 'ra')", self.loc)
-        if self.start not in (0, 1):
+        # the annotations do not bind a caller; a flag or a month of another type would reach
+        # the declaration's repr, and so the graph hash, as a different series
+        if not _is_bool(self.time):
+            raise BuildError(f"{what}: time is True or False, not {self.time!r}", self.loc)
+        if self.start is not None and not self.time:
+            raise BuildError(
+                f"{what} has no time dimension (time=False), so no start; leave start out",
+                self.loc,
+            )
+        if self.start is not None and not _is_start(self.start):
             raise BuildError(
                 f"{what}: start is 0 (a sum of states) or 1 (a sum of month quantities), not "
                 f"{self.start!r}",
                 self.loc,
             )
+        if not _is_str(self.unit):
+            raise BuildError(
+                f"{what}: unit is a unit's name, as 'Money', not {self.unit!r}", self.loc
+            )
         try:
-            unit_from_name(self.unit)
+            unit = unit_from_name(self.unit)
         except ValueError as exc:
             raise BuildError(f"{what}: {exc}", self.loc) from exc
+        if unit not in GROUP_ADDITIVE:
+            raise UnitError(
+                f"{what} sums {unit} over a group's members; a group sum adds Money, Count or "
+                "CoverageUnits",
+                self.loc,
+            )
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -198,11 +250,24 @@ class GroupSum:
     def declared_unit(self) -> Unit:
         return unit_from_name(self.unit)
 
+    @property
+    def first_month(self) -> int:
+        """The first month of the series' domain: ``start``, 1 when left out, and 0 for a
+        series without a time dimension."""
+        if not self.time:
+            return 0
+        return 1 if self.start is None else self.start
+
     def decl(self) -> ir.SeriesDecl:
         """The IR declaration: dimensions and domain fixed here, at build time, never from J."""
-        start = self.start if self.time else 0
         return ir.SeriesDecl(
-            self.name, self.declared_unit, self.time, start, self.scenarios == "each", self.doc
+            self.name,
+            self.declared_unit,
+            self.time,
+            self.first_month,
+            self.scenarios == "each",
+            self.doc,
+            self.loc,
         )
 
 
@@ -307,13 +372,15 @@ def group_series(
     """Every series ``stage`` declares, summed from projection runs of this session.
 
     ``bases`` gives each declared basis's runs; ``members`` each group's member policy ids, by
-    group id (the stage's model point ids). Every policy of every run belongs to exactly one
-    group, and every member to some run. Each series is a dense ``(Tn | 1, groups, scenarios)``
-    array with the groups in ascending id, as the loader orders the stage's model points, and
-    months ``0..H`` of its basis. A variable a series names must be stored by every run of its
-    basis with the series' unit; its recorded domain start is the series' (the latest over the
-    variables), which the loader requires to be no later than the stage's declared start when
-    the stage runs. A LoadError otherwise."""
+    group id (the stage's model point ids). Every group has members, every policy of every run
+    belongs to exactly one group, every member is in some run, and every group has a member in
+    the runs of each basis a series sums. Each series is a dense ``(Tn | 1, groups,
+    scenarios)`` array with the groups in ascending id, as the loader orders the stage's model
+    points, and months ``0..H`` of its basis. A variable a series names must be stored by every
+    run of its basis with the series' unit; its recorded domain start is the series' (the latest
+    over the variables), which the loader requires to be no later than the stage's declared
+    start when the stage runs. The provenance records the basis's valuation date, which the
+    stage's must equal, and the membership the sums used. A LoadError otherwise."""
     stage.series_declarations()  # the declarations are sound before anything is summed
     declared = {b.name: b for b in _bases(stage)}
     for name in declared:
@@ -324,11 +391,12 @@ def group_series(
             raise LoadError(
                 f"basis {name!r} was given but {stage.__qualname__} declares no such basis"
             )
-    for name, b in declared.items():
-        b.check(bases[name])
+    dates = {name: b.check(bases[name]) for name, b in declared.items()}
     group_ids = _sorted_ids(list(members))
     owner: dict[Any, Any] = {}
     for g in group_ids:
+        if len(members[g]) == 0:
+            raise LoadError(f"group {g} has no members; a group holds at least one policy")
         for pid in members[g]:
             if pid in owner:
                 raise LoadError(
@@ -346,7 +414,22 @@ def group_series(
     for pid, g in owner.items():
         if pid not in found:
             raise LoadError(f"group {g}: member {pid} is in no run of the stage's bases")
-    return {s.name: _summed(s, bases[s.basis], group_ids, members) for s in _sums(stage)}
+    sums = _sums(stage)
+    for name in dict.fromkeys(s.basis for s in sums):  # each basis a series sums, in order
+        held = {pid for r in bases[name] for pid in r.ids.tolist()}
+        for g in group_ids:
+            if not any(pid in held for pid in members[g]):
+                raise LoadError(
+                    f"group {g} has no member in the runs of basis {name}, which a series of "
+                    "the stage sums; its sums there would be zero by omission"
+                )
+    membership = [
+        [_plain(g), [_plain(p) for p in _sorted_ids(list(members[g]))]] for g in group_ids
+    ]
+    return {
+        s.name: _summed(s, bases[s.basis], group_ids, members, dates[s.basis], membership)
+        for s in sums
+    }
 
 
 def _sorted_ids(ids: list[Any]) -> NDArray[Any]:
@@ -355,8 +438,23 @@ def _sorted_ids(ids: list[Any]) -> NDArray[Any]:
     return arr[np.argsort(arr, kind="stable")]
 
 
+def _plain(value: object) -> object:
+    """An id as a plain Python value, for the manifest's JSON: a NumPy integer (an integer id
+    field's value) as an int, a NumPy string as a str."""
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, str):
+        return str(value)
+    return value
+
+
 def _summed(
-    s: GroupSum, runs: Sequence[RunResult], group_ids: NDArray[Any], members: Mapping[Any, Any]
+    s: GroupSum,
+    runs: Sequence[RunResult],
+    group_ids: NDArray[Any],
+    members: Mapping[Any, Any],
+    valuation_date: dt.date,
+    membership: list[list[Any]],
 ) -> LoadedSeries:
     start = 0
     for var in s.names:
@@ -388,7 +486,9 @@ def _summed(
         "basis": s.basis,
         "variables": list(s.names),
         "basis_scenarios": n_scen,
+        "valuation_date": valuation_date.isoformat(),
         "source_runs": [_source_run(s, r) for r in runs],
+        "members": membership,  # [group id, its member ids ascending], groups ascending
     }
     return LoadedSeries(
         s.name,
@@ -422,14 +522,13 @@ def _group_totals(
     var: str, runs: Sequence[RunResult], group_ids: NDArray[Any], members: Mapping[Any, Any]
 ) -> NDArray[np.float64]:
     """``var`` summed over each group's members in ascending ``policy_id`` across the runs,
-    sequentially: ``(Tn | 1, groups, scenarios)``. A group with no member in these runs sums to
-    zero."""
+    sequentially, whatever the order of the runs and of the rows in them: ``(Tn | 1, groups,
+    scenarios)``. Every group has a member in these runs (:func:`group_series`)."""
     arrays = [np.asarray(r.var(var), dtype=np.float64) for r in runs]
     where: dict[Any, tuple[int, int]] = {}
     for i, r in enumerate(runs):
         for j, pid in enumerate(r.ids.tolist()):
             where[pid] = (i, j)
-    n_t, _, n_s = arrays[0].shape
     columns: list[NDArray[np.float64]] = []
     for g in group_ids:
         lanes = [
@@ -437,8 +536,5 @@ def _group_totals(
             for pid in _sorted_ids(list(members[g]))
             if pid in where
         ]
-        if lanes:
-            columns.append(sequential_sum(np.stack(lanes, axis=1), axis=1))
-        else:
-            columns.append(np.zeros((n_t, 1, n_s), dtype=np.float64))
+        columns.append(sequential_sum(np.stack(lanes, axis=1), axis=1))
     return np.concatenate(columns, axis=1)

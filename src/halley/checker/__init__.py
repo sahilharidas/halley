@@ -1,7 +1,8 @@
 """Checker: units, dimensions, time references, domains, recursion direction and cycles.
 
-Every rule here is a build error (Spec, Checker rules), except an unused variable, which is a
-warning. Errors point at the model source through the nodes' recorded locations.
+Every rule here is a build error (Spec, Checker rules), except an unused variable and a group
+series no formula reads, which are warnings. Errors point at the model source through the nodes'
+recorded locations.
 
 Domains. A variable with a time dimension is a *state*, defined from ``t = 0``, when it has an
 init or terminal value, declares ``domain="state"``, or when another formula needs its value at
@@ -78,10 +79,16 @@ class _Checker:
             return self.graph.scenarios[node.name].unit
         if isinstance(node, ir.SeriesRead):
             decl = self._series(node.name, loc)
-            if not decl.has_time and node.offset != 0:
+            if not decl.has_time and node.offset is not None:
                 raise BuildError(
                     f"series {node.name} has no time dimension; read it as "
                     f"self.series.{node.name}()",
+                    loc,
+                )
+            if decl.has_time and node.offset is None:
+                raise BuildError(
+                    f"series {node.name} has a time dimension; read it at a month, as "
+                    f"self.series.{node.name}(t)",
                     loc,
                 )
             return decl.unit
@@ -191,9 +198,10 @@ class _Checker:
         if isinstance(node, ir.ScenAt):
             return frozenset({ir.SCENARIO}) | self.dims_of(node.index, dims)
         if isinstance(node, ir.SeriesRead):
-            # fixed by the declaration, never by J: the scenario axis is there after a mean too
+            # fixed by the declaration, never by J: the scenario axis is there after a mean too;
+            # the units pass has made the offset agree with the declaration's time dimension
             group = frozenset({ir.POLICY, ir.SCENARIO})
-            return (group | {ir.TIME}) if self.graph.series[node.name].has_time else group
+            return group if node.offset is None else group | {ir.TIME}
         if isinstance(node, ir.SeriesAt):
             return frozenset({ir.POLICY, ir.SCENARIO}) | self.dims_of(node.index, dims)
         if isinstance(node, ir.RunConst):
@@ -264,7 +272,7 @@ def _tarjan(names: list[str], succ: dict[str, list[str]]) -> list[list[str]]:
 
 def check(graph: ir.Graph) -> ir.Graph:
     """Check the graph in place and return it. Raises :class:`BuildError` on the first rule
-    broken; warns :class:`BuildWarning` for unused variables."""
+    broken; warns :class:`BuildWarning` for unused variables and unread group series."""
     chk = _Checker(graph)
     variables = graph.variables
     order = list(variables)
@@ -314,6 +322,7 @@ def check(graph: ir.Graph) -> ir.Graph:
             raise BuildError("internal error: the component graph has a cycle")
 
     _warn_unused(graph)
+    _warn_unread_series(graph)
     return graph
 
 
@@ -339,7 +348,7 @@ def _check_units(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
                         f"the {what} value of {v.name} reads {ir.render(n)}; a boundary value is "
                         "fixed before the months run, from the model point, tables, run "
                         "constants, variables without a time dimension and fixed months "
-                        "(at(x, k), scen.x.at(k) with a constant k)",
+                        "(at(x, k), scen.x.at(k), series.x.at(k) with a constant k)",
                         v.loc,
                     )
 
@@ -554,9 +563,8 @@ def _check_series_domains(graph: ir.Graph) -> None:
                 continue
             for node in ir.walk(expr):
                 if isinstance(node, ir.SeriesRead):
-                    decl = graph.series[node.name]
-                    if decl.has_time and v.has_time and expr is v.expr:
-                        _check_series_offset(v, node, decl)
+                    if node.offset is not None and v.has_time and expr is v.expr:
+                        _check_series_offset(v, node, node.offset, graph.series[node.name])
                 elif (
                     isinstance(node, ir.SeriesAt)
                     and isinstance(node.index, ir.Const)
@@ -577,9 +585,11 @@ def _check_series_domains(graph: ir.Graph) -> None:
                         )
 
 
-def _check_series_offset(v: ir.Variable, node: ir.SeriesRead, decl: ir.SeriesDecl) -> None:
+def _check_series_offset(
+    v: ir.Variable, node: ir.SeriesRead, offset: int, decl: ir.SeriesDecl
+) -> None:
     first, last = v.formula_range
-    need = first + node.offset
+    need = first + offset
     if need < decl.start:
         if need < 0:
             raise BuildError(
@@ -594,7 +604,7 @@ def _check_series_offset(v: ir.Variable, node: ir.SeriesRead, decl: ir.SeriesDec
             node.loc,
         )
     max_offset = 0 if last == "H" else 1
-    if node.offset > max_offset:
+    if offset > max_offset:
         raise BuildError(
             f"{v.name} reads {ir.render(node)}, which is outside the domain of series "
             f"{node.name} at t = {last}; a variable that reads a later month is backward "
@@ -737,6 +747,22 @@ def _warn_unused(graph: ir.Graph) -> None:
                 BuildWarning(
                     f"{name} is read by no other variable and is not an output; it is left out "
                     f"of the generated code ({v.loc})"
+                ),
+                stacklevel=3,
+            )
+
+
+def _warn_unread_series(graph: ir.Graph) -> None:
+    """A group series the stage declares and no formula reads. Its declaration is still the
+    stage's input contract, so the run asks for it; the warning says so, as for an unused
+    variable."""
+    read = {node.name for _v, node in graph.series_reads()}
+    for name, decl in graph.series.items():
+        if name not in read:
+            warnings.warn(
+                BuildWarning(
+                    f"series {name} is read by no formula; a run of the stage still needs it "
+                    f"given ({decl.loc})"
                 ),
                 stacklevel=3,
             )

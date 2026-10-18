@@ -121,12 +121,13 @@ class ScenAt(Node):
 @dataclass(eq=False, slots=True)
 class SeriesRead(Node):
     """``series.<name>(t + offset)``: a group series of an aggregation stage at a relative
-    month, or ``series.<name>()`` for a series without a time dimension (offset 0). Its
-    dimensions are fixed by the declaration (:class:`SeriesDecl`): group and scenario, and time
-    when the series has it."""
+    month, or ``series.<name>()`` for a series without a time dimension, whose ``offset`` is
+    ``None`` (there is no month to be relative to). Its dimensions are fixed by the declaration
+    (:class:`SeriesDecl`): group and scenario, and time when the series has it; the checker
+    requires the offset to say the same."""
 
     name: str
-    offset: int
+    offset: int | None
 
 
 @dataclass(eq=False, slots=True)
@@ -315,7 +316,9 @@ class SeriesDecl:
     scenarios)`` array. ``has_time`` says whether it has a month axis; ``start`` is the first
     month of its domain (0 for a sum of states, 1 for a sum of month quantities); ``scenario``
     is true when it keeps the basis's scenarios (``"each"``) and false for their mean, whose
-    scenario axis has size 1. The scenario axis exists either way (D4)."""
+    scenario axis has size 1. The scenario axis exists either way (D4). ``loc`` is the line of
+    the ``GroupSum`` that declares it, for the checker's messages; it is neither compared nor
+    part of the repr, so it stays out of the graph hash."""
 
     name: str
     unit: Unit
@@ -323,6 +326,7 @@ class SeriesDecl:
     start: int
     scenario: bool
     doc: str = ""
+    loc: Loc | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(slots=True)
@@ -356,6 +360,17 @@ class Graph:
                     yield node, node.name, node.offset
                 elif isinstance(node, (VarAt, SumT)):
                     yield node, node.name, None
+
+    def series_reads(self) -> Iterator[tuple[Variable, SeriesRead | SeriesAt]]:
+        """Every group series read in every variable's formula and boundary values, with the
+        variable that reads it."""
+        for var in self.variables.values():
+            for expr in (var.expr, var.init, var.terminal):
+                if expr is None:
+                    continue
+                for node in walk(expr):
+                    if isinstance(node, (SeriesRead, SeriesAt)):
+                        yield var, node
 
 
 SYMBOLS = {
@@ -401,6 +416,8 @@ def render(node: Node) -> str:
     if isinstance(node, ScenAt):
         return f"scen.{node.name}.at({render(node.index)})"
     if isinstance(node, SeriesRead):
+        if node.offset is None:
+            return f"series.{node.name}()"  # a series without a time dimension, as written
         if node.offset == 0:
             return f"series.{node.name}(t)"
         return f"series.{node.name}(t{node.offset:+d})"

@@ -50,33 +50,51 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - `halley.Aggregation` is the base class of an aggregation stage: a `Product` whose model points
   are groups (`self.group` reads a group's field, as `self.mp` does) and whose extra inputs are
   group series. It declares `bases`, a tuple of `Basis(name)`, and `series`, a tuple of
-  `GroupSum(name, basis, variables, unit, scenarios="mean" | "each", *, time=True, start=1)`.
-  A formula reads a series as `self.series.<name>(t + k)`, `self.series.<name>.at(k)` or, for a
-  series declared `time=False`, `self.series.<name>()`. The checker checks every read like a
-  variable read: the unit is the declared one, the dimensions are fixed by the declaration
-  (group, scenario and, with `time`, month; the scenario axis exists after a mean too), a
-  relative read stays inside the series' domain (from `start`, which a sum of states declares
-  as 0, up to `H`, or `H - 1` from a backward recursion), a boundary reads a series only at a
-  constant month, and a series of an undeclared basis or a read of an undeclared series is a
-  BuildError at the model line.
+  `GroupSum(name, basis, variables, unit, scenarios="mean" | "each", *, time=True, start=None)`
+  (`start` is 1 when left out; a series declared `time=False` takes none). A group sum adds
+  `Money`, `Count` or `CoverageUnits` only: another unit, such as a probability, a rate, a
+  factor, an index, a flag or `MoneyPerPolicy`, does not add across a group's members and is a
+  UnitError at the declaration. A name, basis, unit, `time` or `start` of the wrong type
+  (`start=True`, `start=1.0`, `time="yes"`) is a BuildError there too. A formula reads a series
+  as `self.series.<name>(t + k)`, `self.series.<name>.at(k)` or, for a series declared
+  `time=False`, `self.series.<name>()`, which messages and `explain` quote as `series.<name>()`.
+  The checker checks every read like a variable read: the unit is the declared one, the
+  dimensions are fixed by the declaration (group, scenario and, with `time`, month; the
+  scenario axis exists after a mean too), a relative read stays inside the series' domain (from
+  `start`, which a sum of states declares as 0, up to `H`, or `H - 1` from a backward
+  recursion), a boundary reads a series only at a constant month, and a series of an undeclared
+  basis or a read of an undeclared series is a BuildError at the model line. A declared series
+  no formula reads is a BuildWarning naming its declaration; a run still needs it given.
 - `halley.aggregation.group_series(stage, bases, members)` sums each series from projection runs
   of the session: each named variable over a group's members in ascending policy id across the
   basis's runs, sequentially, several variables' totals added left to right per scenario, then
   the mean over scenarios as `cumsum_s((1.0 / J) * x)[-1]` for `scenarios="mean"`. Every
-  variable must be stored by the runs with the declared unit and time dimension, and a basis's
-  runs must share the valuation date, horizon and J and hold disjoint policies
-  (`Basis.check`); a LoadError otherwise. `run(..., series=...)` runs a stage on them; a
-  series read relatively is cut to the stage's horizon, which its basis must reach, and a
-  constant `.at(k)` must be a month the series covers. A stage that reads a mean runs at one
-  scenario: its own scenario inputs and its per-scenario series pass `require_deterministic`
-  when it loads.
+  variable must be stored by the runs with the declared unit and time dimension, a basis's runs
+  must share the valuation date, horizon and J and hold disjoint policies (`Basis.check`,
+  which returns that valuation date), and every group must have members, and a member in the
+  runs of each basis a series sums; a LoadError otherwise. `run(..., series=...)` runs a stage
+  on them. Each series must carry float64 values and its provenance (`basis`, `variables`,
+  `basis_scenarios`, `valuation_date`, `source_runs`, `members`), and every basis must value at
+  the stage's valuation date. The stage's horizon is its `cur` basis's, or `RunSettings.horizon`,
+  which may not exceed it; a series read relatively is cut to that horizon and comes from a
+  basis that reaches it, or the LoadError names the basis; a stage without a `cur` basis whose
+  series disagree on the horizon asks for `RunSettings.horizon`. A constant `.at(k)` must be a
+  month the series covers. A stage that reads a mean runs at one scenario: its own scenario
+  inputs and the per-scenario series it reads pass `require_deterministic` when it loads (a
+  declared series no formula reads does not count). A run-time error in a stage names the
+  failing groups (`; groups G0`), and `explain` says `for group G0`; the not-finite check now
+  says `is not finite (NaN or infinity) at some month`, then the policies or groups.
 - A stage's run directory keeps a copy of every series it read, `inputs/series/<name>.parquet`
   with the columns `<id field>`, `scenario`, `t`, `value`. The manifest records it under
-  `inputs.series.<name>` (`basis`, `variables`, `basis_scenarios`, `source_runs` with each run's
-  `run_id`, `dir` and `manifest_sha256`, `copy`, `sha256`, `unit`, `time`, `start`,
-  `scenarios`, `months`) and marks the outputs `outputs.kind = "aggregation"`, keyed on the
-  group schema's id field. The run id covers each series' hash, not its source runs'
-  directories. A projection's run id and graph hash are unchanged.
+  `inputs.series.<name>` (`basis`, `variables`, `basis_scenarios`, `valuation_date`,
+  `source_runs` with each run's `run_id`, `dir` and `manifest_sha256`, `members` as `[group id,
+  member ids ascending]` per group, `copy`, `sha256` of the copy's bytes, `values_sha256`,
+  `unit`, `time`, `start`, `scenarios`, `months`) and marks the outputs `outputs.kind =
+  "aggregation"`, keyed on the group schema's id field. The run id covers each series by
+  `values_sha256`, a hash of its name, unit, start, scenario treatment, group ids, shape and
+  little-endian float64 values, not by the copy's bytes (which name the parquet writer, so a
+  pyarrow upgrade would move the id) nor its source runs' directories. A projection's run id
+  and graph hash are unchanged.
 - `RunResult.variable_info(name)` returns a `VariableInfo(time, unit, start, role)` read from the
   manifest, for a run of the session and a loaded one alike.
 - `require_deterministic(source, what, reason, error)` takes anything with `n_scenarios` (a run,

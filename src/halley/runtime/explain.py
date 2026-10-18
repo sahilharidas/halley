@@ -34,11 +34,13 @@ class Explanation:
     source: str
     inputs: tuple[tuple[str, float | int | bool | str], ...]
     """Each input the formula read, as written, with its value for this lane."""
+    lane: str = "policy"
+    """What a lane is: ``"policy"``, or ``"group"`` in an aggregation stage's run."""
 
     def __str__(self) -> str:
         when = f" at t = {self.t}" if self.t is not None else ""
         lines = [
-            f"{self.variable}{when} for policy {self.policy_id} = {self.value!r} [{self.unit}]"
+            f"{self.variable}{when} for {self.lane} {self.policy_id} = {self.value!r} [{self.unit}]"
         ]
         lines.append(f"  defined at {self.loc}")
         for line in self.source.strip().splitlines():
@@ -137,7 +139,7 @@ class Lane:
             sc = self.inputs.scenarios[node.name]
             return sc.values[int(self.eval(node.index, t, step)) - sc.u0, 0, self.s].item()
         if isinstance(node, ir.SeriesRead):
-            if not self.graph.series[node.name].has_time:
+            if node.offset is None:  # a series without a time dimension: its one row
                 return self.series_at(node.name, 0)
             if t is None:
                 raise HalleyError(f"series.{node.name}(t) read without a month")
@@ -320,7 +322,8 @@ def _leaves(node: ir.Node) -> list[ir.Node]:
 def explain(
     result: RunResult, policy_id: object, variable: str, t: int | None = None, scenario: int = 0
 ) -> Explanation:
-    """The value of ``variable`` for one policy at month ``t``, its formula and its inputs."""
+    """The value of ``variable`` for one policy (a group, in an aggregation stage's run) at month
+    ``t``, its formula and its inputs."""
     if result.graph is None:
         raise HalleyError("explain needs a run made in this session (load_run has no model)")
     v = result.graph.variables[variable]
@@ -350,6 +353,7 @@ def explain(
         v.loc,
         v.source,
         tuple(seen.items()),
+        "group" if result.manifest.get("outputs", {}).get("kind") == "aggregation" else "policy",
     )
 
 

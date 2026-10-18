@@ -10,8 +10,8 @@ the settings, and per stored variable its unit, domain start and role. The run i
 the IR, the inputs' hashes (not their paths, so the same bytes anywhere give the same id), the
 settings and the backend. An aggregation stage runs through the same function: its model points
 are groups, its run directory also keeps a copy of every group series it read under
-``inputs/series/`` with the series' provenance in the manifest, and its outputs are marked
-``outputs.kind = "aggregation"``.
+``inputs/series/`` with the series' provenance in the manifest, its run id covers each series by
+the hash of its values, and its outputs are marked ``outputs.kind = "aggregation"``.
 """
 
 from __future__ import annotations
@@ -219,9 +219,11 @@ def _without_paths(inputs: dict[str, Any]) -> dict[str, Any]:
         "tables": {name: entry(e) for name, e in inputs["tables"].items()},
         "scenarios": {name: entry(e) for name, e in inputs["scenarios"].items()},
     }
-    if "series" in inputs:  # an aggregation stage: each series by its hash, not its sources' dirs
+    if "series" in inputs:
+        # an aggregation stage: each series by the hash of its values, not its copy's bytes
+        # (which depend on the parquet writer) nor its source runs' directories
         out["series"] = {
-            name: {k: v for k, v in e.items() if k != "source_runs"}
+            name: {k: v for k, v in e.items() if k not in ("source_runs", "sha256")}
             for name, e in inputs["series"].items()
         }
     return out
@@ -248,13 +250,37 @@ def _series_table(s: LoadedSeries, id_field: str) -> pa.Table:
 
 
 def _write_series(s: LoadedSeries, id_field: str, dest: Path) -> str:
-    """Write a group series' copy and return the sha256 of its bytes, which the run id uses."""
+    """Write a group series' copy and return the sha256 of its bytes, which the manifest
+    records for the copy's integrity."""
     buf = io.BytesIO()
     pq.write_table(_series_table(s, id_field), buf)
     raw = buf.getvalue()
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(raw)
     return hashlib.sha256(raw).hexdigest()
+
+
+def _series_values_sha256(s: LoadedSeries) -> str:
+    """The run identity's hash of a group series: what it holds, not the bytes of its copy
+    (D21). The parquet file embeds its writer's version and follows pyarrow's defaults, so a
+    hash of the file would move the run id with a pyarrow upgrade, and a replay that rewrites
+    the copy could too. This one covers the name, the unit, the domain start, the scenario
+    treatment, the group ids in order, the shape and the values as C-order little-endian
+    float64 bytes (so ``-0.0`` and ``0.0`` differ)."""
+    values = np.ascontiguousarray(s.values, dtype="<f8")
+    head = {
+        "name": s.name,
+        "unit": s.unit.name,
+        "start": s.start,
+        "scenarios": s.scenarios,
+        "group_ids": _json_safe(np.asarray(s.group_ids, dtype=object).tolist()),
+        "dtype": "<f8",
+        "shape": list(values.shape),
+    }
+    digest = hashlib.sha256(json.dumps(head, sort_keys=True).encode())
+    digest.update(b"\n")
+    digest.update(values.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def run(
@@ -306,7 +332,7 @@ def run(
     for lo in range(0, n_pol, bs):
         hi = min(lo + bs, n_pol)
         inp = inputs.batch(graph, lo, hi)
-        out = run_batch(compiled.fn, graph, inp, horizon)
+        out = run_batch(compiled.fn, graph, inp, horizon, "groups" if stage else "policies")
         batch_scales = {u: s[lo:hi] for u, s in scales.items()}
         results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales)
         view = BatchView(graph, out, inputs, lo, hi, batch_scales)
@@ -344,9 +370,10 @@ def run(
     for name, y in inputs.series.items():
         copy = f"inputs/series/{name}.parquet"
         series_inputs[name] = {
-            **y.provenance,  # basis, variables, source runs
+            **y.provenance,  # basis, variables, valuation date, source runs, members
             "copy": copy,
-            "sha256": _write_series(y, id_field, run_path / copy),
+            "sha256": _write_series(y, id_field, run_path / copy),  # the copy's bytes
+            "values_sha256": _series_values_sha256(y),  # what the run id covers
             "unit": y.unit.name,
             "time": y.has_time,
             "start": y.start,

@@ -559,12 +559,13 @@ def powered_model_points(js: list[int], ks: list[int], rem_m: int = 12) -> Any:
 
 class Covered(Product):
     """A projection whose outputs a stage sums: coverage units (a month quantity), fulfilment
-    cash flows (a backward state, so its domain starts at t = 0) and the premium (a scalar). A
-    scenario input scales the claims, so a run may carry several scenarios."""
+    cash flows (a backward state, so its domain starts at t = 0), a small expense and the
+    premium (a scalar). A scenario input scales the claims, so a run may carry several
+    scenarios."""
 
     model_point = SIMPLE_SCHEMA
     scenario_inputs = (ScenarioInput("shock", "Factor"),)
-    outputs = ("x", "cf", "cu", "fcf", "premium_total")
+    outputs = ("x", "cf", "cu", "fcf", "fee", "premium_total")
 
     @var(init=lambda mp: mp.pols_if_init, role="in_force")
     def x(self, t: Int) -> Count:
@@ -581,6 +582,11 @@ class Covered(Product):
     @var(terminal=0)
     def fcf(self, t: Int) -> Money:
         return (self.fcf(t + 1) + self.cf(t + 1)) * 0.995
+
+    @var
+    def fee(self, t: Int) -> Money:
+        """Small beside fcf and cf, so that how three group totals are grouped shows."""
+        return (self.x(t - 1) * self.mp.premium) * 0.0137
 
     @var
     def premium_total(self) -> Money:
@@ -756,6 +762,7 @@ def run_stage(
     name: str = "stage",
     groups: Any = None,
     scenarios: dict[str, Any] | None = None,
+    valuation_date: dt.date = VAL,
     **settings: Any,
 ) -> RunResult:
     return run(
@@ -763,6 +770,6 @@ def run_stage(
         model_points=stage_groups() if groups is None else groups,
         scenarios=scenarios,
         series=series,
-        settings=RunSettings(valuation_date=VAL, **settings),
+        settings=RunSettings(valuation_date=valuation_date, **settings),
         run_dir=tmp_path / name,
     )

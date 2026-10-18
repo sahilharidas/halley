@@ -346,11 +346,12 @@ def test_boundary_values_reject_what_moves_with_time() -> None:
     """The checker allows fields, tables, run constants, scalar variables, ``at``/``sum_t``/
     ``scen.x.at`` with constant months, arithmetic, ``where`` and calls in a boundary; it rejects
     ``t``, relative reads of time variables and scenario inputs, and fixed reads whose month is
-    not a constant."""
+    not a constant. The message lists every fixed month a boundary may read, a stage's
+    ``series.x.at(k)`` included."""
     fixed = (
         "a boundary value is fixed before the months run, from the model point, tables, run "
         r"constants, variables without a time dimension and fixed months \(at\(x, k\), "
-        r"scen.x.at\(k\) with a constant k\)"
+        r"scen.x.at\(k\), series.x.at\(k\) with a constant k\)"
     )
 
     class PerPolicyMonth(Margin):
