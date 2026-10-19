@@ -23,6 +23,9 @@ directory is rewritten; compare old runs by their manifests' hashes, not by id.
 - `outputs.kind` (`"projection"`), `outputs.id_field` (the schema's id field, which keys the
   output files), `outputs.monthly_sha256` and `outputs.scalars_sha256` (the written files).
 - `outputs.variables.<name>` gains `unit`, `start` and `role` beside `time`.
+- `invariants_sha256`: the sha256 of `invariants.json`, which `load_run(..., verify=True)` and a
+  later stage that reads the run verify. A run made before has none, and such a stage asks for
+  it to be rerun.
 
 `OUTPUT_SCHEMA_VERSION` stays 1: the row layout is unchanged, and `load_run` reads older
 manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
@@ -128,36 +131,51 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   tables=None, previous=None, settings, run_dir)` runs a stage on its groups file and its bases,
   each a list of projection runs given as `RunResult`s or run directories. Every run is read
   through its directory with every file its manifest records a hash for verified first,
-  including the outputs (`outputs.monthly_sha256`, `outputs.scalars_sha256`): a changed or
-  missing file is a LoadError naming it. Then, in order: the bases are the ones declared, each
-  a list of projection runs that `Basis.check` accepts (a policy in two runs is a LoadError
-  naming it and both runs), at the stage's valuation date; the groups file holds the group key
-  (`portfolio`, `cohort`, `profit_bucket`), `recognition_date` and the stage's fields, never
-  `group_id` (derived as `portfolio-cohort-profit_bucket`) nor a field derived from the previous
-  run, one row per group (a duplicate key names both rows), and passes the in-force 3.3 rules:
-  month-end dates, `prev_valuation_date` at least a month before the valuation date and no
-  earlier than the recognition date, at most one of `csm_prev` and `lc_prev` positive; one
-  group per run (G1, `require_one_group`, the rule's one place); the previous aggregation run
-  named by `prev_run_id`, found by scanning `RunSettings.runs_root/*/manifest.json` (no match or
-  several is a LoadError; `previous=` overrides the search and must hold that run id); G4
-  against its members (every policy at the valuation date was a member, in the same group; the
-  `old` basis holds every member; `new` and `cur` hold the same policies), or one group key per
-  policy across the bases without a previous run; every member, from its run's model point
-  copy, maps to exactly one group row and was issued on its `recognition_date`; the `old` and
-  `new` bases read every financial input (`rf_df`, `cpi`, `ilp`) from one file, the `cur` and
-  `new` bases every other table; the groups file's `discount_rec_sha256`, `ilp_sha256` and
-  `cpi_rec_sha256` equal the metadata of the stage's `p_l` and `p_rec` (`source_sha256`,
-  `ilp_sha256`) and of the locked-in runs' `cpi` file (`rec_sha256`). Each LoadError names the
-  file and the row or key. The group fields `f_prev_0`, `f_prev_tau`, `lc_prev_tau` and
-  `p_g_prev` are read from the previous run (its output of that name, or failing one its copy
-  of the group series, with the unit checked), and `tau0`, `tau`, `i_acc`, `i_rec` derived from
-  the dates; the previous run must value at `prev_valuation_date`, measure the group, reach
-  month `tau` and have closed at `csm_prev` and `lc_prev` (its `csm(0)`, `lc(0)`) within
-  `1e-12 * P_g`.
+  including the outputs (`outputs.monthly_sha256`, `outputs.scalars_sha256`) and the invariant
+  results (`invariants_sha256`): a changed or missing file is a LoadError naming it. What the
+  loader asks of a basis run's inputs (their metadata, hashes and values) it reads from the
+  verified copies, never from the manifest's description of them, which no hash covers. Then,
+  in order: the bases are the ones declared, each a list of projection runs that `Basis.check`
+  accepts (a policy in two runs is a LoadError naming it and both runs), at the stage's
+  valuation date; the groups file holds the group key (`portfolio`, `cohort`,
+  `profit_bucket`), `recognition_date` and the stage's fields, never `group_id` (derived as
+  `portfolio-cohort-profit_bucket`) nor a field derived from the previous run, one row per
+  group (a duplicate key names both rows), and passes the in-force 3.3 rules: month-end dates,
+  `prev_valuation_date` at least a month before the valuation date and no earlier than the
+  recognition date, at most one of `csm_prev` and `lc_prev` positive (the rules check the type
+  of each column they read: a number column of strings names the file and column); one group
+  per run (G1, `require_one_group`, the rule's one place); the previous aggregation run named by
+  `prev_run_id`, found by scanning `RunSettings.runs_root/*/manifest.json` (no match or several
+  is a LoadError; `previous=` overrides the search and must hold that run id), at one scenario
+  (`require_deterministic`, D4) and with its membership recorded; G4 against its members (every
+  policy at the valuation date was a member, in the same group; the `old` basis holds every
+  member; `new` and `cur` hold the same policies), or one group key per policy across the bases
+  without a previous run; every member, from its run's model point copy (which must hold the
+  policies of the run's outputs), maps to exactly one group row and was issued on its
+  `recognition_date`; the `old` and `new` bases read every financial input (`rf_df`, `cpi`,
+  `ilp`) from one file, the `cur` and `new` bases every other table. The groups file's
+  `discount_rec_sha256` and `ilp_sha256` must equal the `source_sha256` and `ilp_sha256`
+  metadata of the stage's `p_l` and `p_rec` and of the `rf_df` (`p_l`) of every run of the
+  `old` and `new` bases, and its `cpi_rec_sha256` the `rec_sha256` of those runs' `cpi`; an
+  input there without the metadata is a LoadError, and so is a hash that no input the stage
+  reads can verify. Each LoadError names the file and the row or key. The group fields
+  `f_prev_0`, `f_prev_tau`, `lc_prev_tau` and `p_g_prev` are read from the previous run (its
+  output of that name, or failing one its copy of the group series), with the unit and the time
+  dimension checked and the month inside the domain the run records (`fcf_g(0)` of a run whose
+  `fcf_g` starts at t = 1 is a LoadError, not the 0.0 stored there; D11), and `tau0`, `tau`,
+  `i_acc`, `i_rec` derived from the dates; the previous run must value at
+  `prev_valuation_date`, measure the group, reach month `tau` and have closed at `csm_prev` and
+  `lc_prev` (its `csm(0)`, `lc(0)`) within `1e-12 * P_g`. The stage's own scenario and table
+  files are read once: the run uses, copies and hashes the bytes the checks read.
 - `halley.authoring.contracts.group_schema(*fields, previous=False, locked_in=False, rules=(),
   valuation_date_rule=<month-end>)` builds a stage's group schema with the in-force 3.3 fields;
   `GROUP_KEY`, `PROFIT_BUCKETS`, `PREVIOUS_FIELDS`, `LOCKED_IN_FIELDS`, `FROM_PREVIOUS_RUN`,
-  `FROM_DATES` and `FROM_PREVIOUS` name them, and `GROUP_ID` is defined there.
+  `FROM_DATES` and `FROM_PREVIOUS` name them, and `GROUP_ID` is defined there. At build, a
+  stage's schema declares the fields the loader fills as it fills them (`tau0`, `tau`, `i_acc`,
+  `i_rec` as `int` fields of unit `Int`; `f_prev_0`, `f_prev_tau`, `lc_prev_tau`, `p_g_prev`,
+  `csm_prev`, `lc_prev` as `number` fields of unit `Money`; none as a schema-derived field),
+  a UnitError or BuildError at the stage class otherwise, and declares `prev_run_id` beside
+  any field derived from the previous run (a BuildError, where it was a LoadError).
 - Provenance: an input that names its source in `halley.rebased_from` or `halley.derived_from`
   metadata (a basis run's copied input or the stage's own file) is recomputed by the helper
   registered for the key with `halley.aggregation.stage.register_provenance(key, helper)` and
@@ -171,13 +189,17 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   `inputs/derived_groups.parquet` (`group_id` and the derived fields) and, beside every mean
   series, `inputs/series/<name>.pathwise.parquet`, the per-scenario group totals it averaged
   (`halley.scenarios = pathwise`; `inputs.series.<name>.pathwise` in the manifest, outside the
-  run id), as does a stage run through `run(..., series=group_series(...))`. Its manifest adds `previous` (`run_id`, `dir`, `manifest_sha256`), `bases` (the same
-  for every run of every basis, with `outputs_sha256`), `membership` (the group key and, per
-  group and basis, the member ids), `locked_in`, `provenance` and `disclosures`
-  (`confidence_level`, alpha of the `cur` basis's `ra_param` copies; `para_120_curve_sha256`,
-  the stage's `df_cur` file; then what the stage declares in the new class attribute
-  `Aggregation.disclosures`). Directories are recorded relative to `runs_root` when they lie
-  under it. `inputs.series.<name>.source_runs` gains `outputs_sha256` beside `run_id`, `dir` and
+  run id), as does a stage run through `run(..., series=group_series(...))`. Its manifest adds
+  `previous` (`run_id`, `dir`, `manifest_sha256`), `bases` (the same for every run of every
+  basis, with `outputs_sha256`), `membership` (the group key and, per group and basis, the
+  member ids), `locked_in` (per group, the three hashes and, under `verified_by`, each hash's
+  verifying files as `file`, `sha256` and `metadata`), `provenance` and `disclosures`
+  (`confidence_level`, alpha of the `cur` basis's `ra_param` copies, a LoadError naming the
+  copy when one holds no single numeric `alpha`; `para_120_curve_sha256`, the stage's `df_cur`
+  file; and what the stage declares in the new class attribute `Aggregation.disclosures`, a
+  dict of strings or tuples of strings that may not name either of those two, checked at
+  build). Directories are recorded relative to `runs_root` when they lie under it.
+  `inputs.series.<name>.source_runs` gains `outputs_sha256` beside `run_id`, `dir` and
   `manifest_sha256`, and `group_series(..., runs_root=None)` records `dir` the same way. Such a
   run's id covers the IR, the groups file's hash, every series' `values_sha256`, every scenario
   and table file's hash, the previous run's id and manifest hash, the settings but `label`,
@@ -185,14 +207,19 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - `halley.aggregation.stage.replay_aggregation(compiled, from_run, *, run_dir)` re-runs an
   aggregation run from its own directory alone, every file verified, the bases and the previous
   run unread: the same run id and the same bits when nothing the id covers changed. The replay's
-  manifest carries the original's blocks and `replayed_from`.
+  manifest carries the original's blocks and `replayed_from`, which records `matches` (the same
+  run id and output hashes) and, when not, `differences` and the `environment` entries of the
+  `backend` block that changed. A run id that differs with the same backend and NumPy, or
+  outputs that differ with nothing in the backend block changed, is a RunError (D21).
 - `RunSettings` gains `runs_root` (a path; recorded, not in the run id) and `workers` (a
   positive int, default 1; recorded, not in the run id; every batch still runs in the calling
   process until the process pool of design section 12), `identity()` (the settings a run id
   covers) and `RunSettings.from_dict(manifest["settings"])`. A projection's run id is unchanged.
 - `load_run(run_dir, verify=True)` checks every file the manifest records a hash for first;
-  `halley.runtime.run.verify_run`, `read_manifest` (the manifest and its bytes' sha256) and
-  `run_files` are the helpers. `RunResult.kind` is `outputs.kind`.
+  `halley.runtime.run.verify_run`, `read_manifest` (the manifest and its bytes' sha256),
+  `write_manifest` and `run_files` are the helpers. `RunResult.kind` is `outputs.kind`.
+- A run's copy of an input is the bytes it read and hashed, not what the file's path holds when
+  the copy is made, and a `ReadFile` already read is accepted as an input source.
 - A variable may not be named `disclosures` in a stage.
 
 ### Notes on determinism

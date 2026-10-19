@@ -42,7 +42,8 @@ from halley.errors import LoadError
 from halley.ir import units
 
 Source = str | Path | Any
-"""A Parquet file path or an in-memory ``pyarrow.Table``."""
+"""A Parquet file path, an in-memory ``pyarrow.Table`` or a :class:`ReadFile` already read (an
+aggregation stage hands the run the files it checked, so that the run uses those bytes)."""
 
 METADATA_PREFIX = "halley."
 
@@ -61,7 +62,10 @@ class ReadFile:
     table: pa.Table
     sha256: str
     path: Path | None
-    raw: bytes | None  # the Parquet bytes of an in-memory table, for the run directory copy
+    raw: bytes | None
+    """The Parquet bytes the table was read from and ``sha256`` hashes (for an in-memory table,
+    the bytes it was written to), which the run directory's copy holds: a file replaced on disk
+    after it was read does not reach the copy."""
     label: str
     metadata: dict[str, str] = field(default_factory=dict)
 
@@ -85,6 +89,13 @@ def _schema_metadata(table: pa.Table) -> dict[str, str]:
 
 
 def read_source(source: Source, label: str) -> ReadFile:
+    """An input as read: a file is read once, and its table parsed from the very bytes its
+    sha256 hashes and the run copies; a :class:`ReadFile` read before is taken as it is, under
+    ``label``."""
+    if isinstance(source, ReadFile):
+        return ReadFile(
+            source.table, source.sha256, source.path, source.raw, label, dict(source.metadata)
+        )
     if isinstance(source, pa.Table):
         buf = io.BytesIO()
         pq.write_table(source, buf)
@@ -97,11 +108,11 @@ def read_source(source: Source, label: str) -> ReadFile:
         raise LoadError(f"{label}: no such file {path}")
     data = path.read_bytes()
     try:
-        table = pq.read_table(path)
+        table = pq.read_table(io.BytesIO(data))
     except (pa.ArrowException, OSError) as exc:
         raise LoadError(f"{label}: {path} is not a Parquet file: {exc}") from exc
     return ReadFile(
-        table, hashlib.sha256(data).hexdigest(), path, None, label, _schema_metadata(table)
+        table, hashlib.sha256(data).hexdigest(), path, data, label, _schema_metadata(table)
     )
 
 
@@ -139,7 +150,7 @@ def read_copy(run_dir: Path, entry: Mapping[str, Any], label: str) -> ReadFile:
         table = pq.read_table(io.BytesIO(data))
     except (pa.ArrowException, OSError) as exc:
         raise LoadError(f"{label}: {run_dir / rel} is not a Parquet file: {exc}") from exc
-    return ReadFile(table, sha, run_dir / rel, None, label, _schema_metadata(table))
+    return ReadFile(table, sha, run_dir / rel, data, label, _schema_metadata(table))
 
 
 def table_columns(f: ReadFile) -> dict[str, NDArray[Any]]:
@@ -231,6 +242,11 @@ def file_difference(f: ReadFile, table: Any) -> str | None:
 def table_of(f: ReadFile) -> Any:
     """The ``pyarrow.Table`` of a file as read."""
     return f.table
+
+
+def column_type(f: ReadFile, name: str) -> str:
+    """The Arrow type of a file's column, for a message (``string``, ``double``)."""
+    return str(f.table.schema.field(name).type)
 
 
 def _ids(values: NDArray[Any], mask: NDArray[np.bool_], limit: int = 5) -> str:

@@ -245,11 +245,13 @@ def _json_safe(value: object) -> object:
 
 
 def _copy_input(f: ReadFile, dest: Path) -> None:
+    """Copy an input into the run directory: the bytes it was read from, which its recorded
+    sha256 hashes, not whatever its path holds by now."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if f.path is not None:
-        shutil.copyfile(f.path, dest)
-    elif f.raw is not None:
+    if f.raw is not None:
         dest.write_bytes(f.raw)
+    elif f.path is not None:
+        shutil.copyfile(f.path, dest)
 
 
 def _input_entry(f: ReadFile, copy_to: str, **extra: Any) -> dict[str, Any]:
@@ -630,9 +632,8 @@ def run(
     (run_path / "invariants.json").write_text(
         json.dumps([r.as_dict() for r in invariants], indent=2), encoding="utf-8"
     )
-    (run_path / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    manifest["invariants_sha256"] = _sha256_file(run_path / "invariants.json")
+    write_manifest(run_path, manifest)
     return RunResult(
         run_path,
         run_id,
@@ -690,6 +691,14 @@ def _write_outputs(
     pq.write_table(pa.table(scalars).replace_schema_metadata(meta), out_dir / "scalars.parquet")
 
 
+def write_manifest(run_dir: str | Path, manifest: dict[str, Any]) -> None:
+    """Write a run's ``manifest.json`` (indented, keys sorted): :func:`run` does, and so does a
+    replay when it records whether it reproduced the run it replays."""
+    (Path(run_dir) / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
 def read_manifest(run_dir: str | Path) -> tuple[dict[str, Any], str]:
     """A run directory's manifest and the sha256 of its bytes, which another run that reads
     this one records (design section 9); a LoadError when there is none or when it was written
@@ -718,7 +727,8 @@ def run_files(manifest: dict[str, Any]) -> list[tuple[str, str, str]]:
     """Every file of a run directory whose sha256 its manifest records, as ``(what, relative
     path, sha256)``: the copied inputs (the model points, every table and scenario file and, for
     a stage, its groups file, its derived groups and every series with a mean's pathwise
-    sibling), then the outputs (``outputs.monthly_sha256``, ``outputs.scalars_sha256``)."""
+    sibling), the outputs (``outputs.monthly_sha256``, ``outputs.scalars_sha256``) and the
+    invariant results (``invariants_sha256``)."""
     inputs = manifest.get("inputs", {})
     entries: list[tuple[str, dict[str, Any]]] = [("model points", inputs.get("model_points", {}))]
     entries += [(f"table {n}", e) for n, e in inputs.get("tables", {}).items()]
@@ -734,6 +744,13 @@ def run_files(manifest: dict[str, Any]) -> list[tuple[str, str, str]]:
     outputs = manifest.get("outputs", {})
     for key in ("monthly", "scalars"):
         out.append((f"{key} outputs", str(outputs.get(key)), str(outputs.get(f"{key}_sha256"))))
+    out.append(
+        (
+            "invariant results",
+            str(manifest.get("invariants")),
+            str(manifest.get("invariants_sha256")),
+        )
+    )
     return out
 
 

@@ -48,7 +48,7 @@ from halley.authoring.contracts import (
 )
 from halley.authoring.product import ModelPoint, Product, VarDef
 from halley.codegen import CompiledModel
-from halley.errors import BuildError, LoadError, Loc, UnitError
+from halley.errors import BuildError, LoadError, Loc, RunError, UnitError
 from halley.ir import units
 from halley.ir.units import Unit, unit_from_name
 from halley.runtime.loader import (
@@ -56,6 +56,7 @@ from halley.runtime.loader import (
     LoadedSeries,
     ReadFile,
     Source,
+    column_type,
     file_difference,
     read_copy,
     read_series_copy,
@@ -73,6 +74,7 @@ from halley.runtime.run import (
     run,
     run_files,
     verify_run,
+    write_manifest,
 )
 
 SCENARIO_TREATMENTS = ("mean", "each")
@@ -396,7 +398,9 @@ class Aggregation(Product):
     def series_declarations(cls) -> dict[str, ir.SeriesDecl]:
         """The stage's group series by name, each checked against the bases: a series of an
         undeclared basis, a name declared twice, a malformed tuple, a group schema keyed on
-        another field than ``group_id`` or a variable taking one of the stage's names is a
+        another field than ``group_id``, a group field the loader fills declared with another
+        kind or unit than it fills (:func:`_check_group_fields`), malformed disclosures
+        (:func:`_check_disclosures`) or a variable taking one of the stage's names is a
         BuildError at the model source."""
         schema = cls.model_point
         if schema is not None and schema.id_field != GROUP_ID:
@@ -406,6 +410,9 @@ class Aggregation(Product):
                 "(design section 9)",
                 _class_loc(cls),
             )
+        if schema is not None:
+            _check_group_fields(cls, schema.decls())
+        _check_disclosures(cls)
         for klass in cls.__mro__:
             for name, what in _STAGE_NAMES.items():
                 value = vars(klass).get(name)
@@ -440,6 +447,10 @@ def _is_list(value: object) -> TypeGuard[list[object]]:
     return isinstance(value, list)
 
 
+def _is_dict(value: object) -> TypeGuard[dict[object, object]]:
+    return isinstance(value, dict)
+
+
 def _is_mapping(value: object) -> TypeGuard[Mapping[str, Any]]:
     """A JSON object of a manifest."""
     return isinstance(value, dict)
@@ -466,6 +477,89 @@ def _bases(cls: type[Aggregation]) -> tuple[Basis, ...]:
 
 def _sums(cls: type[Aggregation]) -> tuple[GroupSum, ...]:
     return _tuple_of(cls, "series", GroupSum)
+
+
+_LOADER_FILLS: Final = {
+    **dict.fromkeys(FROM_DATES, ("int", units.INT, "a month count from the dates")),
+    **{
+        name: ("number", units.MONEY, f"the previous run's {variable}, an amount")
+        for name, (variable, _month) in FROM_PREVIOUS_RUN.items()
+    },
+    "csm_prev": ("number", units.MONEY, "compared with the previous run's csm(0), an amount"),
+    "lc_prev": ("number", units.MONEY, "compared with the previous run's lc(0), an amount"),
+}
+"""The group fields the loader fills or reads as a given kind and unit, by name: the kind and
+unit a stage that declares one must give it, and what the loader puts there."""
+
+
+def _check_group_fields(cls: type[Aggregation], fields: Mapping[str, ir.FieldDecl]) -> None:
+    """A group field the loader fills (:data:`FROM_PREVIOUS`) or compares with the previous
+    run (``csm_prev``, ``lc_prev``) is declared as the loader fills it: the month counts as
+    ``int`` fields of unit ``Int``, the amounts as ``number`` fields of unit ``Money``, none as
+    a derived field of the schema, which the loader's would collide with (D11: a month count
+    read as Money is a unit mistake, found at build). A schema that declares a field derived
+    from the previous run declares ``prev_run_id``, which names that run."""
+    where = f"{cls.__qualname__}.model_point"
+    for name, (kind, unit, what) in _LOADER_FILLS.items():
+        decl = fields.get(name)
+        if decl is None:
+            continue
+        if decl.derived:
+            raise BuildError(
+                f"{where} derives {name}, which the loader fills ({what}); declare it as a field",
+                _class_loc(cls),
+            )
+        if decl.kind != kind or decl.unit != unit:
+            got = decl.kind if decl.unit is None else f"{decl.kind} {decl.unit}"
+            raise UnitError(
+                f"{where} declares {name} as {got}, but the loader fills it with {what}: declare "
+                f"it {kind} {unit} (D11)",
+                _class_loc(cls),
+            )
+    derived = [name for name in FROM_PREVIOUS if name in fields]
+    if derived and "prev_run_id" not in fields:
+        raise BuildError(
+            f"{where} declares {', '.join(derived)}, which the loader derives from the previous "
+            "run the groups name and the dates, but no prev_run_id to name that run; build the "
+            "schema with group_schema(previous=True)",
+            _class_loc(cls),
+        )
+
+
+DATA_DISCLOSURES: Final = ("confidence_level", "para_120_curve_sha256")
+"""The disclosures the loader reads from the data (the cur basis's ``alpha``, the ``df_cur``
+file's hash), which a stage's declared :attr:`Aggregation.disclosures` may not name."""
+
+
+def _check_disclosures(cls: type[Aggregation]) -> None:
+    """``disclosures`` is a dict from a name to a string or a tuple of strings, and names none
+    of :data:`DATA_DISCLOSURES`: a declared value would replace what the data says, and a value
+    of another type would fail only when the manifest is written, after the run."""
+    value: object = getattr(cls, "disclosures", {})
+    where = f"{cls.__qualname__}.disclosures"
+    if not _is_dict(value):
+        raise BuildError(
+            f"{where} is a dict of strings or tuples of strings, not {type(value).__name__}",
+            _class_loc(cls),
+        )
+    for key, entry in value.items():
+        if not _is_name(key):
+            raise BuildError(
+                f"{where}: a disclosure is named like a variable, not {key!r}", _class_loc(cls)
+            )
+        if key in DATA_DISCLOSURES:
+            raise BuildError(
+                f"{where} declares {key}, which the loader reads from the data (the cur basis's "
+                "alpha, the df_cur file); a stage declares its approach strings and notes",
+                _class_loc(cls),
+            )
+        if not isinstance(entry, str) and not (
+            _is_tuple(entry) and all(isinstance(x, str) for x in entry)
+        ):
+            raise BuildError(
+                f"{where}: {key} is a string or a tuple of strings, not {entry!r}",
+                _class_loc(cls),
+            )
 
 
 # ---------------------------------------------------------------------- in-session builder
@@ -700,6 +794,11 @@ LOCKED_IN_CURVES: Final = ("p_l", "p_rec")
 section 10, ``locked_in_curve``): their metadata ``source_sha256`` and ``ilp_sha256`` must be
 the group's ``discount_rec_sha256`` and ``ilp_sha256``."""
 
+LOCKED_IN_RUN_CURVE: Final = "rf_df"
+"""The scenario input through which the locked-in runs (bases old and new) read ``p_l``, their
+discount curve (design section 10): its metadata ``source_sha256`` and ``ilp_sha256`` must be
+the group's too."""
+
 LOCKED_IN_CPI: Final = "cpi"
 """The scenario input through which the locked-in runs (bases old and new) read the spliced CPI
 path (``locked_in_cpi``): its metadata ``rec_sha256`` must be the group's ``cpi_rec_sha256``."""
@@ -790,10 +889,15 @@ class _Member:
     row: int
 
 
+MODEL_POINTS: Final = ("model points", "")
+"""The key of a run's model point copy among :attr:`_BasisRun.inputs`."""
+
+
 @dataclass(frozen=True, slots=True)
 class _BasisRun:
     """A projection run of a basis, read from its directory with every file verified: the run
-    (its outputs loaded), its manifest's sha256 and the rows of its model point copy."""
+    (its outputs loaded), its manifest's sha256, the rows of its model point copy and every
+    copied input as read."""
 
     basis: str
     result: RunResult
@@ -801,6 +905,11 @@ class _BasisRun:
     copy: str
     """The model point copy, as messages name it."""
     members: tuple[_Member, ...]
+    inputs: dict[tuple[str, str], ReadFile]
+    """Every copied input by (kind, name): :data:`MODEL_POINTS`, ``("table", <name>)`` and
+    ``("scenario input", <name>)``, each read from its copy and verified against the sha256 the
+    manifest records. What the loader asks of an input (its metadata, its hash, its values) it
+    asks of these, never of the manifest's description of them, which no hash covers."""
 
     @property
     def run_id(self) -> str:
@@ -810,12 +919,29 @@ class _BasisRun:
         """A member's row, for a message: the copy, the row and the policy."""
         return f"{self.copy}: row {m.row}, policy {m.pid}"
 
+    def scenario(self, name: str) -> ReadFile | None:
+        """The copy of scenario input ``name``, ``None`` when the run read no such input."""
+        return self.inputs.get(("scenario input", name))
+
+
+def _input_copies(
+    path: Path, manifest: Mapping[str, Any], who: str
+) -> dict[tuple[str, str], ReadFile]:
+    """Every input a run copied (its model points, tables and scenario files), each read from
+    its copy and verified against the sha256 its manifest records (:func:`read_copy`)."""
+    inputs: Mapping[str, Any] = manifest["inputs"]
+    entries: list[tuple[tuple[str, str], Any]] = [(MODEL_POINTS, inputs["model_points"])]
+    entries += [(("table", n), e) for n, e in inputs["tables"].items()]
+    entries += [(("scenario input", n), e) for n, e in inputs["scenarios"].items()]
+    return {key: read_copy(path, e, f"{who}: {key[0]} {key[1]}".rstrip()) for key, e in entries}
+
 
 def _basis_run(basis: str, given: object) -> _BasisRun:
     """A run of a basis given as a :class:`RunResult` or a run directory, read through its
     directory: every file its manifest records a hash for is verified (a tampered file is a
-    LoadError naming it), the run must be a projection, and its model point copy gives the
-    membership (each row's group key and issue date)."""
+    LoadError naming it), the run must be a projection, its copied inputs are read from the
+    copies (:func:`_input_copies`), and its model point copy gives the membership (each row's
+    group key and issue date)."""
     if isinstance(given, RunResult):
         path, expected = given.run_dir, given.run_id
     elif isinstance(given, (str, Path)):
@@ -835,9 +961,8 @@ def _basis_run(basis: str, given: object) -> _BasisRun:
         raise LoadError(f"basis {basis}: {path} holds an {kind} run; a basis reads projection runs")
     _manifest, sha = read_manifest(path)
     result = load_run(path)
-    f = read_copy(
-        path, manifest["inputs"]["model_points"], f"basis {basis} run {run_id}: model points"
-    )
+    copies = _input_copies(path, manifest, f"basis {basis} run {run_id}")
+    f = copies[MODEL_POINTS]
     cols = table_columns(f)
     groups = _group_ids(cols, f.where, "a basis run's model points")
     id_field = str(manifest["outputs"].get("id_field", "policy_id"))
@@ -854,7 +979,7 @@ def _basis_run(basis: str, given: object) -> _BasisRun:
         _Member(pid, g, d, row)
         for row, (pid, g, d) in enumerate(zip(ids, groups, dates, strict=True))
     )
-    return _BasisRun(basis, result, sha, f.where, members)
+    return _BasisRun(basis, result, sha, f.where, members, copies)
 
 
 def _runs_of(basis: str, given: object) -> list[object]:
@@ -900,15 +1025,32 @@ class _Groups:
         return f"{self.file.where}: group {self.ids[row]} (row {row})"
 
     def date(self, name: str, row: int) -> dt.date:
-        if name not in self.columns:
-            raise LoadError(f"{self.file.where}: column {name} is missing")
-        value: object = self.columns[name][row]
+        value: object = self._column(name)[row]
         if not isinstance(value, dt.date):
             raise LoadError(f"{self.at(row)}: {name} is a date, not {value!r}")
         return value
 
+    def _column(self, name: str) -> NDArray[Any]:
+        if name not in self.columns:
+            raise LoadError(f"{self.file.where}: column {name} is missing")
+        return self.columns[name]
+
     def number(self, name: str, row: int) -> float:
-        return float(self.columns[name][row])
+        """A number column's value. The rules read these before the schema's field checks
+        run, so a column of another type is a LoadError here, naming the file and column."""
+        values = self._column(name)
+        if values.dtype.kind not in "iuf":
+            got = column_type(self.file, name)
+            raise LoadError(f"{self.file.where}: column {name} is a number column, not {got}")
+        return float(values[row])
+
+    def string(self, name: str, row: int) -> str:
+        """A string column's value (a run id, a hash), checked before the schema's are."""
+        value: object = self._column(name)[row]
+        if not isinstance(value, str):
+            got = column_type(self.file, name)
+            raise LoadError(f"{self.file.where}: column {name} is a string column, not {got}")
+        return value
 
 
 def _read_groups(source: Source, valuation_date: dt.date) -> _Groups:
@@ -1089,7 +1231,7 @@ def _resolve_previous(
             f"{groups.file.where}: column prev_run_id is missing; the stage reads the previous "
             "run of each group"
         )
-    wanted = sorted({str(v) for v in groups.columns["prev_run_id"].tolist()})
+    wanted = sorted({groups.string("prev_run_id", row) for row in range(len(groups.ids))})
     if len(wanted) != 1:
         raise LoadError(
             f"{groups.file.where}: the groups name several previous runs ({', '.join(wanted)})"
@@ -1188,14 +1330,16 @@ def _previous_value(
 ) -> float:
     """The previous run's ``name`` for group ``gid`` at ``month`` (``None`` for a quantity
     without a time dimension): its stored output of that name or, failing one, its copy of the
-    group series of that name. The unit must be the derived field's (D11 across runs)."""
+    group series of that name. The unit must be the derived field's (D11 across runs), and the
+    month inside the domain the run records for it, ``start..H`` (D11: a month before the start
+    holds the zeros the generated code fills it with, not a value)."""
     r = prev.result
     variables: Mapping[str, Any] = r.manifest["outputs"]["variables"]
     if name in variables:
         info = r.variable_info(name)
-        got_unit, has_time, last = info.unit, info.time, r.H
+        got_unit, has_time, start, last = info.unit, info.time, info.start, r.H
         values = r.var(name)
-        g = r.index(gid)
+        ids: list[Any] = r.ids.tolist()
     else:
         series: Mapping[str, Any] = r.manifest["inputs"].get("series", {})
         if name not in series:
@@ -1204,9 +1348,9 @@ def _previous_value(
                 f"that made it stores {name}"
             )
         s = read_series_copy(r.run_dir, name, series[name], GROUP_ID, f"{prev.who}: series {name}")
-        got_unit, has_time, last = s.unit.name, s.has_time, s.horizon
+        got_unit, has_time, start, last = s.unit.name, s.has_time, s.start, s.horizon
         values = s.values
-        g = s.group_ids.tolist().index(gid)
+        ids = s.group_ids.tolist()
     if unit is not None and got_unit != unit.name:
         raise LoadError(
             f"{what}: {prev.who} records {name} as {got_unit}, not {unit.name} (D11 across runs)"
@@ -1217,11 +1361,18 @@ def _previous_value(
             "dimension"
         )
     k = 0 if month is None else month
+    if has_time and k < start:
+        raise LoadError(
+            f"{what}: {prev.who} records {name} from t = {start}, but the loader reads "
+            f"{name}({k}) (D11)"
+        )
     if k > last:
         raise LoadError(
             f"{what}: {prev.who} covers months 0..{last}, but the loader reads {name}({k})"
         )
-    return float(values[k, g, 0])
+    if gid not in ids:
+        raise LoadError(f"{what}: {prev.who} holds no {name} of group {gid}")
+    return float(values[k, ids.index(gid), 0])
 
 
 def _from_previous(
@@ -1276,19 +1427,17 @@ def _from_previous(
 # ---------------------------------------------------------------- structure and locked-in basis
 
 
-def _input_hashes(r: RunResult) -> dict[tuple[str, str], str]:
-    """The sha256 of every scenario file and table a run read, by (kind, name)."""
-    inputs: Mapping[str, Any] = r.manifest["inputs"]
-    out = {("scenario input", n): str(e["sha256"]) for n, e in inputs["scenarios"].items()}
-    out.update({("table", n): str(e["sha256"]) for n, e in inputs["tables"].items()})
-    return out
+def _input_hashes(r: _BasisRun) -> dict[tuple[str, str], str]:
+    """The sha256 of every scenario file and table a run read, by (kind, name), from its
+    verified copies."""
+    return {key: f.sha256 for key, f in r.inputs.items() if key != MODEL_POINTS}
 
 
 def _share(runs: Sequence[_BasisRun], keep: Callable[[str, str], bool], why: str) -> None:
     """Every input ``keep`` selects is read from one file by every run in ``runs``."""
     seen: dict[tuple[str, str], tuple[str, _BasisRun]] = {}
     for r in runs:
-        for key, sha in _input_hashes(r.result).items():
+        for key, sha in _input_hashes(r).items():
             if not keep(*key):
                 continue
             if key in seen and seen[key][0] != sha:
@@ -1320,59 +1469,91 @@ def _check_structure(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
         )
 
 
+_CURVE_METADATA: Final = (("source_sha256", "discount_rec_sha256"), ("ilp_sha256", "ilp_sha256"))
+"""The metadata of a locked-in curve (``locked_in_curve``, design section 10) and the group's
+hash each must equal."""
+
+_CPI_METADATA: Final = (("rec_sha256", "cpi_rec_sha256"),)
+"""The metadata of the locked-in CPI path (``locked_in_cpi``) and the group's hash it equals."""
+
+_LOCKED_IN_RUNS: Final = f"of the runs of bases {OLD_BASIS} and {NEW_BASIS}"
+_CURVE_SOURCES: Final = (
+    f"the stage's scenario inputs {' and '.join(LOCKED_IN_CURVES)} and scenario input "
+    f"{LOCKED_IN_RUN_CURVE} {_LOCKED_IN_RUNS}"
+)
+_LOCKED_IN_SOURCES: Final = {
+    "discount_rec_sha256": _CURVE_SOURCES,
+    "ilp_sha256": _CURVE_SOURCES,
+    "cpi_rec_sha256": f"scenario input {LOCKED_IN_CPI} {_LOCKED_IN_RUNS}",
+}
+"""By hash of the groups file, the inputs whose metadata can verify it, for a message."""
+
+
 def _check_locked_in(
     groups: _Groups,
     row: int,
     stage_files: Mapping[str, ReadFile],
     runs: Mapping[str, Sequence[_BasisRun]],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """A group's locked-in basis (design section 9; in-force 3.3, B72(b)): the three hashes of
-    the groups file against the metadata of the stage's locked-in curves (``p_l``, ``p_rec``:
-    ``source_sha256``, ``ilp_sha256``) and of the locked-in runs' CPI path (``rec_sha256``).
-    Returns the three, which the manifest records."""
+    the groups file against the metadata of every input built from the locked-in basis: the
+    stage's locked-in curves (``p_l``, ``p_rec``: ``source_sha256``, ``ilp_sha256``), the curve
+    each run of the old and new bases discounts with (``rf_df``, which is ``p_l``: the same two)
+    and their CPI path (``cpi``, the ``locked_in_cpi`` splice: ``rec_sha256``), each read from
+    its verified copy. Such an input that lacks one of its metadata, or holds another value, is
+    a LoadError naming it; so is a hash that no input the stage reads can verify, since a hash
+    recorded unverified would say the group was measured on a basis nobody checked. Returns the
+    three hashes and, under ``verified_by``, the files that verified each (label, sha256 and
+    metadata key), which the manifest records."""
     at = groups.at(row)
-    hashes: dict[str, str] = {}
-    for name in LOCKED_IN_FIELDS:
-        if name not in groups.columns:
-            raise LoadError(f"{groups.file.where}: column {name} is missing")
-        hashes[name] = str(groups.columns[name][row])
-    pairs = (("source_sha256", "discount_rec_sha256"), ("ilp_sha256", "ilp_sha256"))
-    for curve in LOCKED_IN_CURVES:
-        f = stage_files.get(curve)
-        if f is None:
-            continue
+    hashes = {name: groups.string(name, row) for name in LOCKED_IN_FIELDS}
+    verified: dict[str, list[dict[str, str]]] = {name: [] for name in LOCKED_IN_FIELDS}
+
+    def check(f: ReadFile, pairs: tuple[tuple[str, str], ...], why: str) -> None:
         for meta, name in pairs:
             got = f.metadata.get(meta)
             if got is None:
-                raise LoadError(
-                    f"{f.where}: carries no metadata halley.{meta}; a locked-in curve names the "
-                    "files it was built from (design section 10)"
-                )
+                raise LoadError(f"{f.where}: carries no metadata halley.{meta}; {why}")
             if got != hashes[name]:
                 raise LoadError(
                     f"{f.where}: halley.{meta} is {got}, but {at} locks in {name} {hashes[name]}"
                 )
+            verified[name].append({"file": f.label, "sha256": f.sha256, "metadata": meta})
+
+    for curve in LOCKED_IN_CURVES:
+        f = stage_files.get(curve)
+        if f is not None:
+            check(
+                f,
+                _CURVE_METADATA,
+                "a locked-in curve names the files it was built from (design section 10)",
+            )
     for basis in (OLD_BASIS, NEW_BASIS):
         for r in runs.get(basis, ()):
-            entry: Any = r.result.manifest["inputs"]["scenarios"].get(LOCKED_IN_CPI)
-            if entry is None:
-                continue
-            where = (
-                f"basis {basis} run {r.run_id}: scenario input {LOCKED_IN_CPI} ({entry['copy']})"
+            f = r.scenario(LOCKED_IN_RUN_CURVE)
+            if f is not None:
+                check(
+                    f,
+                    _CURVE_METADATA,
+                    f"the runs of basis {basis} discount at the locked-in rates, with p_l as "
+                    f"their {LOCKED_IN_RUN_CURVE}, which names the files it was built from "
+                    "(design section 10)",
+                )
+            f = r.scenario(LOCKED_IN_CPI)
+            if f is not None:
+                check(
+                    f,
+                    _CPI_METADATA,
+                    "the locked-in CPI path names the recognition path it splices (in-force 5.2)",
+                )
+    for name in LOCKED_IN_FIELDS:
+        if not verified[name]:
+            raise LoadError(
+                f"{at} locks in {name} {hashes[name]}, but the stage reads no input that can "
+                f"verify it ({_LOCKED_IN_SOURCES[name]}); a locked-in hash is verified, not "
+                "only recorded (B72(b))"
             )
-            metadata: Any = entry.get("metadata")
-            got = metadata.get("rec_sha256") if _is_mapping(metadata) else None
-            if got is None:
-                raise LoadError(
-                    f"{where}: carries no metadata halley.rec_sha256; the locked-in CPI path names "
-                    "the recognition path it splices (in-force 5.2)"
-                )
-            if got != hashes["cpi_rec_sha256"]:
-                raise LoadError(
-                    f"{where}: halley.rec_sha256 is {got}, but {at} locks in cpi_rec_sha256 "
-                    f"{hashes['cpi_rec_sha256']}"
-                )
-    return hashes
+    return {**hashes, "verified_by": verified}
 
 
 # ------------------------------------------------------------------------------ provenance
@@ -1476,18 +1657,14 @@ class _Finder:
 def _provenance_files(
     runs: Mapping[str, Sequence[_BasisRun]], own: Sequence[ReadFile]
 ) -> Iterator[ReadFile]:
-    """Every input that names its source: a basis run's copied inputs whose manifest metadata
-    carries a provenance key (read from the copy, verified), then the stage's own files."""
-    for basis, rs in runs.items():
+    """Every input that names its source: each copied input of each basis run whose copy, as
+    read and verified, carries a provenance key (never the manifest's description of it, which
+    no hash covers), then the stage's own files."""
+    for rs in runs.values():
         for r in rs:
-            inputs: Mapping[str, Any] = r.result.manifest["inputs"]
-            entries: list[tuple[str, Any]] = [("model points", inputs["model_points"])]
-            entries += [(f"table {n}", e) for n, e in inputs["tables"].items()]
-            entries += [(f"scenario input {n}", e) for n, e in inputs["scenarios"].items()]
-            for what, e in entries:
-                meta: Mapping[str, Any] = e.get("metadata") or {}
-                if any(key in meta for key in PROVENANCE_KEYS):
-                    yield read_copy(r.result.run_dir, e, f"basis {basis} run {r.run_id}: {what}")
+            for f in r.inputs.values():
+                if any(key in f.metadata for key in PROVENANCE_KEYS):
+                    yield f
     for f in own:
         if any(key in f.metadata for key in PROVENANCE_KEYS):
             yield f
@@ -1552,18 +1729,26 @@ def _disclosures(
 ) -> dict[str, Any]:
     """The manifest's ``disclosures`` block (design section 9, "Outputs"): the confidence level
     (para 119), ``alpha`` of the cur basis's ``ra_param`` copies; the sha256 of the para 120
-    curve, the stage's ``df_cur`` file; then what the stage declares (:attr:`Aggregation.
-    disclosures`). ``None`` where the stage reads no such input."""
+    curve, the stage's ``df_cur`` file; and what the stage declares (:attr:`Aggregation.
+    disclosures`, checked at build not to name either). ``None`` where the stage reads no such
+    input; a cur run's ``ra_param`` that holds no single ``alpha`` is a LoadError naming the
+    copy, since the disclosure would otherwise vanish."""
     table, column = CONFIDENCE_LEVEL
     levels: dict[float, str] = {}
     for r in runs.get(CUR_BASIS, ()):
-        entry: Any = r.result.manifest["inputs"]["tables"].get(table)
-        if entry is None:
+        f = r.inputs.get(("table", table))
+        if f is None:
             continue
-        f = read_copy(r.result.run_dir, entry, f"basis {CUR_BASIS} run {r.run_id}: table {table}")
         cols = table_columns(f)
-        if column in cols and len(cols[column]) == 1:
-            levels.setdefault(float(cols[column][0]), r.run_id)
+        why = f"the cur basis's {table} holds the confidence level the run discloses (para 119)"
+        if column not in cols:
+            raise LoadError(f"{f.where}: column {column} is missing; {why}")
+        values = cols[column]
+        if values.dtype.kind not in "iuf":
+            raise LoadError(f"{f.where}: column {column} is a number column; {why}")
+        if len(values) != 1:
+            raise LoadError(f"{f.where}: {len(values)} rows, not one; {why}")
+        levels.setdefault(float(values[0]), r.run_id)
     if len(levels) > 1:
         listing = "; ".join(f"run {rid}: {level!r}" for level, rid in levels.items())
         raise LoadError(
@@ -1572,9 +1757,9 @@ def _disclosures(
     curve = stage_files.get(PARA_120_CURVE)
     declared = {k: list(v) if isinstance(v, tuple) else v for k, v in stage.disclosures.items()}
     return {
+        **declared,
         "confidence_level": next(iter(levels), None),
         "para_120_curve_sha256": None if curve is None else curve.sha256,
-        **declared,
     }
 
 
@@ -1590,6 +1775,11 @@ class StageInputs:
     """A ``pyarrow.Table``: the groups file's rows with ``group_id`` and the derived fields."""
     series: dict[str, LoadedSeries]
     record: StageRecord
+    scenarios: dict[str, ReadFile]
+    """The stage's own scenario files as read and checked (the locked-in, provenance and
+    disclosure checks), which the run reads and copies: the bytes checked are the bytes used."""
+    tables: dict[str, ReadFile]
+    """The stage's assumption tables, likewise."""
 
 
 def _stage_of(compiled: CompiledModel) -> type[Aggregation]:
@@ -1657,14 +1847,14 @@ def load_aggregation_inputs(
     _check_structure(runs)
     stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
     table_files = {n: read_source(s, f"table {n}") for n, s in (tables or {}).items()}
-    locked_in: dict[str, dict[str, str]] = {}
+    locked_in: dict[str, dict[str, Any]] = {}
     if any(name in graph.fields for name in LOCKED_IN_FIELDS):
         for row, gid in enumerate(group_rows.ids):
             locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs)
     derived: dict[str, list[Any]] = {GROUP_ID: list(group_rows.ids)}
+    # a schema that declares one of these declares prev_run_id (a BuildError otherwise), so the
+    # previous run is resolved whenever one is wanted
     wanted = [name for name in FROM_PREVIOUS if name in graph.fields]
-    if wanted and prev is None:
-        raise LoadError(f"the stage declares {', '.join(wanted)}, which come from a previous run")
     if prev is not None:
         rows = [
             _from_previous(graph, group_rows, row, prev, valuation_date)
@@ -1730,6 +1920,8 @@ def load_aggregation_inputs(
         with_columns(group_rows.file, columns),
         series,
         StageRecord(group_rows.file, with_columns(None, columns), blocks),
+        stage_files,
+        table_files,
     )
 
 
@@ -1779,8 +1971,8 @@ def run_aggregation(
     return run(
         compiled,
         model_points=loaded.model_points,
-        tables=dict(tables) if tables is not None else None,
-        scenarios=dict(scenarios) if scenarios is not None else None,
+        tables=dict(loaded.tables) if tables is not None else None,
+        scenarios=dict(loaded.scenarios) if scenarios is not None else None,
         settings=settings,
         run_dir=run_dir,
         series=loaded.series,
@@ -1792,13 +1984,16 @@ def replay_aggregation(
     compiled: CompiledModel, from_run: str | Path, *, run_dir: str | Path
 ) -> RunResult:
     """Re-run an aggregation run from its own directory alone (D21): every file the manifest
-    records a hash for is verified, then the stage runs on the copies (the groups file and the
-    derived group fields, every series, the scenario and table files) with the recorded
+    records a hash for is verified, then the stage runs on the copies as read (the groups file
+    and the derived group fields, every series, the scenario and table files) with the recorded
     settings, into ``run_dir``. The bases and the previous run are not read, so they may have
     moved or gone; the manifest blocks that record them are carried over, with
-    ``replayed_from``. The replay has the run's id when nothing it covers changed (the same IR,
-    backend and NumPy). ``compiled`` is the stage that made the run: a run directory holds the
-    generated code, not the model, and a stage with another IR is a LoadError."""
+    ``replayed_from``. ``compiled`` is the stage that made the run: a run directory holds the
+    generated code, not the model, and a stage with another IR is a LoadError.
+
+    The replay is then compared with the run (:func:`_compare_replay`):
+    ``replayed_from.matches`` records whether it has the run's id and outputs bit for bit, and
+    a difference the environment does not explain is a RunError."""
     source = Path(from_run)
     manifest = verify_run(source, "replayed run")
     inputs: Mapping[str, Any] = manifest["inputs"]
@@ -1816,15 +2011,16 @@ def replay_aggregation(
         for name, entry in inputs["series"].items()
     }
     scenarios: dict[str, Source] = {
-        name: source / str(e["copy"]) for name, e in inputs["scenarios"].items()
+        name: read_copy(source, e, f"scenario input {name}")
+        for name, e in inputs["scenarios"].items()
     }
     tables: dict[str, Source] = {
-        name: source / str(e["copy"]) for name, e in inputs["tables"].items()
+        name: read_copy(source, e, f"table {name}") for name, e in inputs["tables"].items()
     }
     blocks = {key: manifest[key] for key in STAGE_BLOCKS if key in manifest}
     blocks["replayed_from"] = {"run_id": manifest["run_id"], "dir": str(source.resolve())}
     record = StageRecord(groups, table_of(derived), blocks)
-    return run(
+    result = run(
         compiled,
         model_points=with_columns(groups, table_columns(derived)),
         tables=tables,
@@ -1833,4 +2029,55 @@ def replay_aggregation(
         run_dir=run_dir,
         series=series,
         stage_record=record,
+    )
+    _compare_replay(source, manifest, result)
+    return result
+
+
+RUN_ID_ENVIRONMENT: Final = ("name", "numpy")
+"""The entries of a manifest's ``backend`` block that a run id covers (the backend's name and
+the NumPy version); the output files' bytes depend on every entry (pyarrow writes its version
+into them, and the platform's libm computes the powers)."""
+
+
+def _compare_replay(source: Path, original: Mapping[str, Any], replay: RunResult) -> None:
+    """Record in the replay's manifest whether it reproduced the run it replays: under
+    ``replayed_from``, ``matches`` (the same run id and the same sha256 of both output files)
+    and, when not, ``differences`` and the ``environment`` that changed (the entries of the
+    manifest's ``backend`` block that differ). A run id that differs while the backend and
+    NumPy are unchanged, or outputs that differ while nothing in the backend block changed, is a
+    RunError (D21): the run is not reproducible from its own directory."""
+    mine = replay.manifest
+    differences: list[str] = []
+    id_differs = replay.run_id != original["run_id"]
+    if id_differs:
+        differences.append(f"run id {replay.run_id} against {original['run_id']}")
+    for key in ("monthly", "scalars"):
+        a = str(mine["outputs"][f"{key}_sha256"])
+        b = str(original["outputs"].get(f"{key}_sha256"))
+        if a != b:
+            differences.append(f"{key} outputs sha256 {a[:12]}... against {b[:12]}...")
+    then: Mapping[str, Any] = original.get("backend", {})
+    now: Mapping[str, Any] = mine["backend"]
+    changed = {
+        k: {"run": then.get(k), "replay": now.get(k)}
+        for k in sorted(set(then) | set(now))
+        if then.get(k) != now.get(k)
+    }
+    record: dict[str, Any] = mine["replayed_from"]
+    record["matches"] = not differences
+    if differences:
+        record["differences"] = differences
+        record["environment"] = changed
+    write_manifest(replay.run_dir, mine)
+    if id_differs and not any(k in changed for k in RUN_ID_ENVIRONMENT):
+        same = "the same backend and NumPy, which the run id covers"
+    elif differences and not changed:
+        same = "the same backend, NumPy, pyarrow, Python and platform"
+    else:
+        return
+    raise RunError(
+        f"the replay of {source} (run {original['run_id']}) in {replay.run_dir} does not "
+        f"reproduce it with {same}: {'; '.join(differences)}; every run is reproducible from "
+        "its own directory (D21)"
     )
