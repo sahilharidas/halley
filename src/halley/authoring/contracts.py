@@ -593,3 +593,107 @@ class Invariant:
 
 def int_field(name: str, **kw: Any) -> Field:
     return Field(name, "int", INT.name, **kw)
+
+
+# ----------------------------------------------------------------------------- stage groups
+
+GROUP_ID = "group_id"
+"""The id field of an aggregation stage's groups, and so of its outputs. The loader derives it
+from the group key as ``f"{portfolio}-{cohort}-{profit_bucket}"``; it is not a column of the
+groups file (design section 9)."""
+
+GROUP_KEY = ("portfolio", "cohort", "profit_bucket")
+"""The fields a group is keyed on (in-force 3.3; paras 14, 16 and 22), on every member's model
+point and on every row of the groups file."""
+
+PROFIT_BUCKETS = ("ONEROUS", "NO_SIGNIFICANT_RISK", "OTHER")
+"""The values of ``profit_bucket`` (para 16)."""
+
+PREVIOUS_FIELDS = ("prev_valuation_date", "csm_prev", "lc_prev", "cu_act", "prev_run_id")
+"""The groups file's fields of a group measured before (in-force 3.3): the previous valuation
+date, the closing CSM and loss component there, the coverage units actually provided since and
+the ``run_id`` of the previous aggregation run."""
+
+LOCKED_IN_FIELDS = ("discount_rec_sha256", "ilp_sha256", "cpi_rec_sha256")
+"""The locked-in basis of a group by hash (in-force 3.3; B72(b)): the discount file at
+recognition, the illiquidity premium table and the recognition CPI file."""
+
+FROM_PREVIOUS_RUN: dict[str, tuple[str, str | None]] = {
+    "f_prev_0": ("fcf_g", "0"),
+    "f_prev_tau": ("fcf_g", "tau"),
+    "lc_prev_tau": ("lc", "tau"),
+    "p_g_prev": ("p_g", None),
+}
+"""The group fields the loader reads from the previous aggregation run, never typed into the
+groups file (design section 9): by field, the previous run's output (or, failing an output of
+that name, its group series) and the month read, ``"0"``, ``"tau"`` or ``None`` for a quantity
+without a time dimension. ``fcf_g`` at months 0 and ``tau`` (``F_prev``), ``lc`` at ``tau``
+(K7) and ``p_g``, P_g carried forward from recognition."""
+
+FROM_DATES = ("tau0", "tau", "i_acc", "i_rec")
+"""The group fields the loader derives from the dates: ``tau0 = mi(V) - mi(recognition_date)``,
+``tau = mi(V) - mi(prev_valuation_date)``, ``i_acc = tau0 - tau`` and ``i_rec = tau0``, with
+``mi(d) = 12 * year(d) + month(d) - 1``."""
+
+FROM_PREVIOUS = (*FROM_PREVIOUS_RUN, *FROM_DATES)
+"""Every group field the loader derives (:data:`FROM_PREVIOUS_RUN`, :data:`FROM_DATES`)."""
+
+
+def _month_end(d: dt.date) -> str | None:
+    if (d + dt.timedelta(days=1)).day == 1:
+        return None
+    return "must be the last day of a calendar month (in-force 3.1)"
+
+
+def group_schema(
+    *fields: Field,
+    previous: bool = False,
+    locked_in: bool = False,
+    rules: tuple[Rule, ...] = (),
+    valuation_date_rule: Callable[[dt.date], str | None] | None = _month_end,
+) -> Schema:
+    """The model point schema of an aggregation stage: one row per group, keyed on
+    :data:`GROUP_ID` (in-force 3.3).
+
+    Every stage's groups carry ``group_id`` (derived by the loader), the group key
+    (``portfolio``, ``cohort``, ``profit_bucket``) and ``recognition_date``, every member's issue
+    date. ``previous=True`` adds the fields of a group measured before (:data:`PREVIOUS_FIELDS`)
+    and those the loader derives from the previous run and the dates (:data:`FROM_PREVIOUS`);
+    ``locked_in=True`` the three hashes of the locked-in basis (:data:`LOCKED_IN_FIELDS`);
+    ``fields`` and ``rules`` are the stage's own. The groups file holds every field but
+    ``group_id`` and the derived ones; the loader checks the rules of in-force 3.3 on it
+    (month-end dates, ``prev_valuation_date`` at least a month before the valuation date, at
+    most one of ``csm_prev`` and ``lc_prev`` positive, every member issued on the recognition
+    date). The valuation date is a month-end by default, as the month counts ``tau`` and
+    ``tau0`` take it to be."""
+    out: list[Field] = [
+        Field(GROUP_ID, "string", unique=True, doc="portfolio-cohort-profit_bucket, derived"),
+        Field("portfolio", "string", doc="group key"),
+        int_field("cohort", ge=1900, le=2200, doc="group key: the year of issue (para 22)"),
+        Field("profit_bucket", "enum", enum=PROFIT_BUCKETS, doc="group key (para 16)"),
+        Field("recognition_date", "date", doc="a month-end; every member's issue_date"),
+    ]
+    if previous:
+        out += [
+            Field("prev_valuation_date", "date", doc="a month-end, at most V - 1 month"),
+            Field("csm_prev", "number", "Money", ge=0, doc="the closing CSM at V_prev"),
+            Field("lc_prev", "number", "Money", ge=0, doc="the closing loss component at V_prev"),
+            Field("cu_act", "number", "CoverageUnits", ge=0, doc="units provided in the period"),
+            Field("prev_run_id", "string", doc="the run_id of the previous aggregation run"),
+            Field("f_prev_0", "number", "Money", doc="derived: the previous run's fcf_g(0)"),
+            Field("f_prev_tau", "number", "Money", doc="derived: the previous run's fcf_g(tau)"),
+            Field("lc_prev_tau", "number", "Money", doc="derived: the previous run's lc(tau)"),
+            Field("p_g_prev", "number", "Money", doc="derived: the previous run's p_g"),
+            int_field("tau0", ge=0, doc="derived: months from the recognition date to V"),
+            int_field("tau", ge=1, doc="derived: months from the previous valuation date to V"),
+            int_field("i_acc", ge=0, doc="derived: tau0 - tau"),
+            int_field("i_rec", ge=0, doc="derived: tau0"),
+        ]
+    if locked_in:
+        out += [Field(name, "string", doc="the locked-in basis") for name in LOCKED_IN_FIELDS]
+    return Schema(
+        fields=(*out, *fields),
+        rules=rules,
+        id_field=GROUP_ID,
+        valuation_date_rule=valuation_date_rule,
+    )

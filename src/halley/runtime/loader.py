@@ -105,6 +105,134 @@ def read_source(source: Source, label: str) -> ReadFile:
     )
 
 
+# ------------------------------------------------------------------------ a run's own copies
+
+
+def verify_copy(run_dir: Path, rel: str, sha256: str, label: str) -> bytes:
+    """The bytes of ``run_dir / rel``, a file a run's manifest records with ``sha256`` (D21): a
+    LoadError naming the file when it is missing or when its bytes hash to anything else."""
+    path = run_dir / rel
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise LoadError(
+            f"{label}: {path} is missing, though its run's manifest records it"
+        ) from None
+    got = hashlib.sha256(data).hexdigest()
+    if got != sha256:
+        raise LoadError(
+            f"{label}: {path} does not match the sha256 its run's manifest records ({got[:12]}... "
+            f"against {sha256[:12]}...); the file was changed after the run"
+        )
+    return data
+
+
+def read_copy(run_dir: Path, entry: Mapping[str, Any], label: str) -> ReadFile:
+    """A run's copy of one of its inputs, as its manifest's entry records it (``copy`` and
+    ``sha256``), verified (:func:`verify_copy`) and read. The :class:`ReadFile`'s path is the
+    copy's, so a later run that reads it copies those bytes."""
+    rel, sha = entry.get("copy"), entry.get("sha256")
+    if not isinstance(rel, str) or not isinstance(sha, str):
+        raise LoadError(f"{label}: its run's manifest records no copy with a sha256")
+    data = verify_copy(run_dir, rel, sha, label)
+    try:
+        table = pq.read_table(io.BytesIO(data))
+    except (pa.ArrowException, OSError) as exc:
+        raise LoadError(f"{label}: {run_dir / rel} is not a Parquet file: {exc}") from exc
+    return ReadFile(table, sha, run_dir / rel, None, label, _schema_metadata(table))
+
+
+def table_columns(f: ReadFile) -> dict[str, NDArray[Any]]:
+    """Every column of a file as a NumPy array, for the aggregation loader (design section 9):
+    strings, dictionary-encoded or not, as ``str`` objects; integers as int64; floats as
+    float64; booleans as bool; dates and timestamps as ``datetime.date`` objects. A column with
+    nulls, or of another type, is a LoadError naming the file and the column."""
+    out: dict[str, NDArray[Any]] = {}
+    for name in f.table.column_names:
+        col = f.table.column(name)
+        if col.null_count:
+            raise LoadError(f"{f.where}: column {name} has {col.null_count} null value(s)")
+        t = col.type
+        if pa.types.is_dictionary(t):
+            col = col.cast(pa.string())
+            t = col.type
+        if pa.types.is_string(t) or pa.types.is_large_string(t):
+            out[name] = np.asarray([str(v) for v in col.to_pylist()], dtype=object)
+        elif pa.types.is_integer(t):
+            out[name] = np.asarray(col.to_numpy(), dtype=np.int64)
+        elif pa.types.is_floating(t):
+            out[name] = np.asarray(col.to_numpy(), dtype=np.float64)
+        elif pa.types.is_boolean(t):
+            out[name] = np.asarray(col.to_pylist(), dtype=np.bool_)
+        elif pa.types.is_date(t) or pa.types.is_timestamp(t):
+            out[name] = np.asarray(col.cast(pa.date32()).to_pylist(), dtype=object)
+        else:
+            raise LoadError(f"{f.where}: column {name} is {t}, which the loader does not read")
+    return out
+
+
+def with_columns(f: ReadFile | None, columns: Mapping[str, NDArray[Any]]) -> Any:
+    """A ``pyarrow.Table``: the file's table with ``columns`` appended (strings as string, ints
+    as int64, floats as float64), or, for a file that is ``None``, ``columns`` alone. The stage
+    loader's model points are the groups file with the fields it derived; its
+    ``derived_groups`` copy is those fields alone."""
+    arrays = {name: _arrow_array(values) for name, values in columns.items()}
+    if f is None:
+        return pa.table(arrays)
+    table = f.table
+    for name, arr in arrays.items():
+        table = table.append_column(name, arr)
+    return table
+
+
+def _arrow_array(values: NDArray[Any]) -> Any:
+    if values.dtype == object:
+        return pa.array([str(v) for v in values], pa.string())
+    if np.issubdtype(values.dtype, np.integer):
+        return pa.array(values.astype(np.int64), pa.int64())
+    return pa.array(values.astype(np.float64), pa.float64())
+
+
+def table_difference(a: Any, b: Any) -> str | None:
+    """``None`` when two ``pyarrow.Table`` objects are equal bit for bit (column names and
+    types, every value, floats compared as their 64-bit patterns so ``-0.0`` and ``0.0``
+    differ, and the ``halley.*`` and ``version`` schema metadata); otherwise the first
+    difference, for a message."""
+    if a.column_names != b.column_names:
+        return f"columns {a.column_names} against {b.column_names}"
+    if a.num_rows != b.num_rows:
+        return f"{a.num_rows} rows against {b.num_rows}"
+    for name in a.column_names:
+        x, y = a.column(name), b.column(name)
+        if x.type != y.type:
+            return f"column {name} is {x.type} against {y.type}"
+        if pa.types.is_floating(x.type):
+            xs = np.asarray(x.to_numpy(), dtype=np.float64).view(np.uint64)
+            ys = np.asarray(y.to_numpy(), dtype=np.float64).view(np.uint64)
+            bad = np.flatnonzero(xs != ys)
+            if bad.size:
+                i = int(bad[0])
+                return f"column {name}, row {i}: {x[i].as_py()!r} against {y[i].as_py()!r}"
+        elif not x.equals(y):
+            return f"column {name} differs"
+    if _schema_metadata(a) != _schema_metadata(b):
+        return f"metadata {_schema_metadata(a)} against {_schema_metadata(b)}"
+    return None
+
+
+def file_difference(f: ReadFile, table: Any) -> str | None:
+    """:func:`table_difference` between a file as read and a ``pyarrow.Table``: ``None`` when
+    the table holds the file's values bit for bit."""
+    if not isinstance(table, pa.Table):
+        return f"a {type(table).__name__}, not a pyarrow.Table"
+    return table_difference(f.table, table)
+
+
+def table_of(f: ReadFile) -> Any:
+    """The ``pyarrow.Table`` of a file as read."""
+    return f.table
+
+
 def _ids(values: NDArray[Any], mask: NDArray[np.bool_], limit: int = 5) -> str:
     bad = [str(v) for v in values[mask]]
     shown = ", ".join(bad[:limit])
@@ -206,10 +334,12 @@ def load_model_points(
     source: Source,
     valuation_date: dt.date,
     lanes: str = "policies",
+    label: str = "model points",
 ) -> ModelPoints:
     """Read and check the model points; a failure names the rows by their ids under ``lanes``
-    (``"groups"`` for an aggregation stage)."""
-    f = read_source(source, "model points")
+    (``"groups"`` for an aggregation stage) and the file by ``label`` (an aggregation run names
+    its groups file, from which the loader built the table)."""
+    f = read_source(source, label)
     label = f.where
     if schema.valuation_date_rule is not None:
         message = schema.valuation_date_rule(valuation_date)
@@ -575,6 +705,10 @@ class LoadedSeries:
     scenarios: str
     """``"mean"`` (one scenario, the mean over the basis's) or ``"each"``."""
     provenance: dict[str, Any] = field(default_factory=dict)
+    pathwise: NDArray[np.float64] | None = None
+    """For a mean, the per-scenario group totals it averaged, ``(Tn | 1, groups, J)``, kept
+    beside it in the run directory as ``<name>.pathwise.parquet`` (design section 9); ``None``
+    for a series that keeps its scenarios."""
 
     @property
     def n_scenarios(self) -> int:
@@ -813,8 +947,12 @@ def load_series(
                 f"{label}: basis cur covers months 0..{_basis_horizon(s)} but the stage runs to "
                 f"H = {horizon}; the stage's horizon is at most its cur basis's"
             )
+        pathwise = s.pathwise
+        if pathwise is not None:
+            _check_pathwise(label, decl, values, pathwise)
         if decl.has_time and name in relative:
             values = values[: horizon + 1]
+            pathwise = None if pathwise is None else pathwise[: horizon + 1]
         last = int(values.shape[0]) - 1
         late = [k for k in sorted(fixed.get(name, ())) if k > last] if decl.has_time else []
         if late:
@@ -828,9 +966,96 @@ def load_series(
                 "at month k comes from a basis whose horizon is at least k"
             )
         out[name] = LoadedSeries(
-            name, values, s.unit, s.has_time, s.start, s.group_ids, s.scenarios, s.provenance
+            name,
+            values,
+            s.unit,
+            s.has_time,
+            s.start,
+            s.group_ids,
+            s.scenarios,
+            s.provenance,
+            pathwise,
         )
     return out
+
+
+def _check_pathwise(
+    label: str, decl: ir.SeriesDecl, values: NDArray[np.float64], pathwise: NDArray[Any]
+) -> None:
+    """A mean's pathwise values are the basis's per-scenario group totals it averaged: finite
+    float64, shaped like the mean but for the scenarios. They are a record beside the mean,
+    which is what the stage reads and what the run id covers."""
+    if decl.scenario:
+        raise LoadError(f"{label}: keeps its scenarios, so it has no pathwise values")
+    if (
+        not isinstance(pathwise, np.ndarray)
+        or pathwise.dtype != np.float64
+        or pathwise.ndim != 3
+        or pathwise.shape[:2] != values.shape[:2]
+        or not np.isfinite(pathwise).all()
+    ):
+        raise LoadError(
+            f"{label}: its pathwise values must be finite float64 shaped like the mean, "
+            f"{values.shape[:2]}, with the basis's scenarios"
+        )
+
+
+def read_series_copy(
+    run_dir: Path, name: str, entry: Mapping[str, Any], id_field: str, label: str
+) -> LoadedSeries:
+    """A group series as a stage's run directory keeps it: ``inputs/series/<name>.parquet`` in
+    long form (the group id, ``scenario``, ``t``, ``value``, group-major, then month, then
+    scenario) and, for a mean, its ``.pathwise`` sibling, each verified against the sha256 the
+    manifest's ``entry`` records and read back to the dense ``(Tn | 1, groups, scenarios)``
+    array, with the unit, domain, scenario treatment and provenance the entry records. A
+    LoadError names the file that is missing, changed or laid out otherwise."""
+    f = read_copy(run_dir, entry, label)
+    values, group_ids = _dense_series(f, id_field)
+    pathwise: NDArray[np.float64] | None = None
+    sibling = entry.get("pathwise")
+    if sibling is not None:
+        pf = read_copy(run_dir, sibling, f"{label} (pathwise)")
+        pathwise, pids = _dense_series(pf, id_field)
+        if pids.tolist() != group_ids.tolist():
+            raise LoadError(f"{pf.where}: it covers other groups than the series it sits beside")
+    try:
+        unit = units.unit_from_name(str(entry["unit"]))
+        has_time, start = bool(entry["time"]), int(entry["start"])
+        scenarios = str(entry["scenarios"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LoadError(f"{label}: its manifest entry is incomplete: {exc}") from None
+    provenance = {key: entry[key] for key in SERIES_PROVENANCE if key in entry}
+    return LoadedSeries(
+        name, values, unit, has_time, start, group_ids, scenarios, provenance, pathwise
+    )
+
+
+def _dense_series(f: ReadFile, id_field: str) -> tuple[NDArray[np.float64], NDArray[Any]]:
+    """A series copy's long form back to ``(Tn, groups, scenarios)`` and its group ids."""
+    table = f.table
+    for col in (id_field, "scenario", "t", "value"):
+        if col not in table.column_names:
+            raise LoadError(f"{f.where}: column {col} is missing")
+    ids = np.asarray(table.column(id_field).to_pylist(), dtype=object)
+    scen = np.asarray(table.column("scenario").to_numpy(), dtype=np.int64)
+    month = np.asarray(table.column("t").to_numpy(), dtype=np.int64)
+    value = np.asarray(table.column("value").to_numpy(), dtype=np.float64)
+    n = len(value)
+    if n == 0:
+        raise LoadError(f"{f.where}: no rows")
+    n_s, n_t = int(scen.max()) + 1, int(month.max()) + 1
+    n_g = n // (n_t * n_s)
+    if (
+        n_g * n_t * n_s != n
+        or not np.array_equal(scen, np.tile(np.arange(n_s), n_g * n_t))
+        or not np.array_equal(month, np.tile(np.repeat(np.arange(n_t), n_s), n_g))
+    ):
+        raise LoadError(f"{f.where}: the rows are not group-major, then month, then scenario")
+    group_ids = ids[:: n_t * n_s]
+    if not np.array_equal(ids, np.repeat(group_ids, n_t * n_s)):
+        raise LoadError(f"{f.where}: the rows are not group-major, then month, then scenario")
+    values = np.ascontiguousarray(value.reshape(n_g, n_t, n_s).transpose(1, 0, 2))
+    return values, group_ids
 
 
 def _stage_scenarios(
@@ -954,17 +1179,19 @@ def load_inputs(
     input_rules: Sequence[InputRule] = (),
     series: Mapping[str, LoadedSeries] | None = None,
     lanes: str = "policies",
+    model_points_label: str = "model points",
 ) -> Inputs:
     """Load every input the model reads, in order: model points, tables, the horizon, an
     aggregation stage's group series, scenario files, then the product's input rules over all of
     them. The contracts, when given, add the tables' required metadata and rules, the scenario
     inputs' column names, bounds, coverage and rules. A stage's horizon defaults to its cur
     basis's (:func:`_stage_horizon`) when its schema names no horizon field. A failure names the
-    model points by their ids under ``lanes``, ``"groups"`` for a stage."""
+    model points by their ids under ``lanes``, ``"groups"`` for a stage, and their file by
+    ``model_points_label``."""
     table_contracts = table_contracts or {}
     scenario_contracts = scenario_contracts or {}
     series = series or {}
-    mp = load_model_points(graph, schema, model_points, valuation_date, lanes)
+    mp = load_model_points(graph, schema, model_points, valuation_date, lanes, model_points_label)
     tables = tables or {}
     loaded_tables: dict[str, LoadedTable] = {}
     for name, decl in graph.tables.items():

@@ -51,6 +51,7 @@ from halley import (
     where,
 )
 from halley.authoring import int_field
+from halley.authoring.contracts import PROFIT_BUCKETS, group_schema
 
 VAL = dt.date(2027, 1, 1)
 
@@ -773,3 +774,259 @@ def run_stage(
         settings=RunSettings(valuation_date=valuation_date, **settings),
         run_dir=tmp_path / name,
     )
+
+
+# ------------------------------------------------------------ aggregation runs (B2)
+
+V_REC = dt.date(2025, 12, 31)
+"""The toy group's recognition date (in-force 3.1's)."""
+
+V_NOW = dt.date(2026, 12, 31)
+"""A valuation date a year later: ``tau = tau0 = 12``."""
+
+MEMBER_SCHEMA = Schema(
+    fields=(
+        int_field("policy_id", ge=1, unique=True),
+        Field("portfolio", "string"),
+        int_field("cohort", ge=1900, le=2200),
+        Field("profit_bucket", "enum", enum=PROFIT_BUCKETS),
+        Field("issue_date", "date"),
+        Field("premium", "number", "MoneyPerPolicy", gt=0),
+        Field("pols_if_init", "number", "Count", gt=0),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+)
+
+EXPENSE = Table("expense", keys=(), columns=(Column("maint", "MoneyPerPolicy", ge=0),))
+ILP = Table("ilp", keys=(), columns=(Column("ilp", "Factor", ge=0, le=0.5),))
+RA_PARAM = Table("ra_param", keys=(), columns=(Column("alpha", "Prob"),))
+
+
+class Member(Product):
+    """A projection of a group's members (design section 9's class runs in miniature): its
+    model points carry the group key and the issue date; the discount curve, the CPI path and
+    the illiquidity table are its financial inputs, the expense and RA tables its
+    non-financial ones."""
+
+    model_point = MEMBER_SCHEMA
+    assumption_tables = (EXPENSE, ILP, RA_PARAM)
+    scenario_inputs = (
+        ScenarioInput("rf_df", "Factor", gt=0),
+        ScenarioInput("cpi", "Index", gt=0),
+    )
+    outputs = ("x", "cf", "cu", "fcf", "premium_total")
+
+    @var(init=lambda mp: mp.pols_if_init, role="in_force")
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.98
+
+    @var
+    def esc(self, t: Int) -> Factor:
+        return self.scen.cpi(t - 1) / self.scen.cpi.at(0)
+
+    @var
+    def cf(self, t: Int) -> Money:
+        return self.x(t - 1) * ((self.mp.premium * self.esc(t)) + self.tables.expense.maint)
+
+    @var
+    def cu(self, t: Int) -> CoverageUnits:
+        return as_cu(self.x(t - 1) * self.mp.premium)
+
+    @var(domain="state")
+    def df(self, t: Int) -> Factor:
+        return self.scen.rf_df(t) * (1 - self.tables.ilp.ilp)
+
+    @var(terminal=0)
+    def fcf(self, t: Int) -> Money:
+        return (self.fcf(t + 1) + self.cf(t + 1)) * (self.df(t + 1) / self.df(t))
+
+    @var
+    def premium_total(self) -> Money:
+        return (self.mp.pols_if_init * self.mp.premium) * 30.0
+
+
+@functools.cache
+def compiled_member() -> CompiledModel:
+    return build(Member)
+
+
+def member_points(
+    ids: list[int],
+    *,
+    issue: dt.date = V_REC,
+    cohort: int = 2025,
+    bucket: str = "OTHER",
+    rem_m: int = 24,
+    scale: float = 1.0,
+    cohorts: dict[int, int] | None = None,
+    issues: dict[int, dt.date] | None = None,
+) -> Any:
+    """``MEMBER_SCHEMA`` model points of portfolio ``IA``; ``cohorts`` and ``issues`` override
+    the cohort or the issue date of single policies."""
+    cohorts = cohorts or {}
+    issues = issues or {}
+    return pa.table(
+        {
+            "policy_id": pa.array(ids, pa.int64()),
+            "portfolio": pa.array(["IA"] * len(ids), pa.string()).dictionary_encode(),
+            "cohort": pa.array([cohorts.get(i, cohort) for i in ids], pa.int16()),
+            "profit_bucket": pa.array([bucket] * len(ids), pa.string()),
+            "issue_date": pa.array([issues.get(i, issue) for i in ids], pa.date32()),
+            "premium": pa.array([scale * (10.0 + 0.5 * (i % 7)) for i in ids], pa.float64()),
+            "pols_if_init": pa.array([1.0 + 0.25 * (i % 5) for i in ids], pa.float64()),
+            "rem_m": pa.array([rem_m] * len(ids), pa.int32()),
+        }
+    )
+
+
+def keyless(column: str, value: float, **metadata: str) -> Any:
+    """A one-row table with ``halley.<key>`` schema metadata."""
+    table = pa.table({column: pa.array([value], pa.float64())})
+    return table.replace_schema_metadata({f"halley.{k}": v for k, v in metadata.items()})
+
+
+def _with_metadata(table: Any, meta: dict[str, str] | None) -> Any:
+    return table.replace_schema_metadata({f"halley.{k}": v for k, v in (meta or {}).items()})
+
+
+def curve(
+    rate: float,
+    n_scen: int = 1,
+    column: str = "rf_df",
+    u_hi: int = 60,
+    meta: dict[str, str] | None = None,
+) -> Any:
+    """A discount curve ``exp(-rate * t / 12)`` (scenario ``s`` adds ``s / 100`` to the rate),
+    months ``0..u_hi``, with ``halley.<key>`` schema metadata from ``meta``."""
+    table = scenario_file(
+        column, 0, u_hi, n_scen, lambda s, u: float(np.exp(-(rate + s / 100) * u / 12))
+    )
+    return _with_metadata(table, meta)
+
+
+def cpi_path(
+    growth: float, n_scen: int = 1, u_hi: int = 60, meta: dict[str, str] | None = None
+) -> Any:
+    """A CPI path ``100 * (1 + growth) ** (u / 12)``, months ``0..u_hi``."""
+    table = scenario_file(
+        "cpi", 0, u_hi, n_scen, lambda s, u: 100.0 * (1 + growth + s / 100) ** (u / 12)
+    )
+    return _with_metadata(table, meta)
+
+
+def run_member(
+    run_dir: Path,
+    points: Any,
+    *,
+    rf_df: Any,
+    cpi: Any,
+    expense: Any,
+    ilp: Any,
+    ra_param: Any,
+    valuation_date: dt.date,
+    horizon: int,
+) -> RunResult:
+    """One ``Member`` class run: every run of a basis takes the same horizon."""
+    return run(
+        compiled_member(),
+        model_points=points,
+        tables={"expense": expense, "ilp": ilp, "ra_param": ra_param},
+        scenarios={"rf_df": rf_df, "cpi": cpi},
+        settings=RunSettings(valuation_date=valuation_date, horizon=horizon),
+        run_dir=run_dir,
+    )
+
+
+def group_row(**fields: Any) -> Any:
+    """A groups file of one row (in-force 3.3): group ``IA-2025-OTHER``, recognised at
+    ``V_REC``, with the stage's own field ``j``; ``fields`` adds or overrides columns (a value
+    of ``None`` drops the column; a list gives several rows)."""
+    row: dict[str, Any] = {
+        "portfolio": "IA",
+        "cohort": 2025,
+        "profit_bucket": "OTHER",
+        "recognition_date": V_REC,
+        "j": 0.002,
+    }
+    row.update(fields)
+    types = {"cohort": pa.int16(), "j": pa.float64()}
+    columns: dict[str, Any] = {}
+    for name, value in row.items():
+        if value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        if isinstance(values[0], dt.date):
+            columns[name] = pa.array(values, pa.date32())
+        else:
+            columns[name] = pa.array(values, types.get(name))
+    return pa.table(columns)
+
+
+RECOGNISE_OUTPUTS = ("csm", "lc", "release", "cu_next", "csm_0", "lc_0", "fcf_g", "p_g")
+ROLL_OUTPUTS = (*RECOGNISE_OUTPUTS, "delta", "aoc", "lock", "months")
+
+
+class Recognise(Release):
+    """A toy recognition stage (design section 9's ``NewGroup`` in miniature) on the group
+    schema of in-force 3.3: ``Release``'s roll-forward, storing the series it closes on so that
+    a later in-force stage reads them from this run."""
+
+    model_point = group_schema(Field("j", "number", "Rate[Monthly]", ge=0, le=0.1))
+    outputs = RECOGNISE_OUTPUTS
+
+    @var(domain="state")
+    def fcf_g(self, t: Int) -> Money:
+        return self.series.fcf_g(t)
+
+    @var
+    def p_g(self) -> Money:
+        return self.series.p_g()
+
+
+class Roll(Recognise):
+    """A toy in-force stage (``InForceGroup`` in miniature): bases ``old``, ``new`` and ``cur``,
+    the previous run's quantities as derived group fields, the locked-in curve ``p_l`` as its
+    own scenario input, and the locked-in hashes on the groups file."""
+
+    model_point = group_schema(
+        Field("j", "number", "Rate[Monthly]", ge=0, le=0.1), previous=True, locked_in=True
+    )
+    bases = (Basis("old"), Basis("new"), Basis("cur"))
+    series = (
+        *Release.series[:2],
+        GroupSum("fcf_old", "old", "fcf", "Money", start=0),
+        GroupSum("fcf_new", "new", "fcf", "Money", start=0),
+    )
+    scenario_inputs = (ScenarioInput("p_l", "Factor", gt=0, column="rf_df"),)
+    outputs = ROLL_OUTPUTS
+
+    @var
+    def delta(self) -> Money:
+        return self.series.fcf_new.at(0) - self.series.fcf_old.at(0)
+
+    @var
+    def csm_0(self) -> Money:
+        gap = (self.group.csm_prev - self.group.lc_prev) - self.delta()
+        return where(gap > 0, gap, 0.0)
+
+    @var
+    def lc_0(self) -> Money:
+        gap = self.delta() - (self.group.csm_prev - self.group.lc_prev)
+        return where(gap > 0, gap, 0.0)
+
+    @var
+    def p_g(self) -> Money:
+        return self.group.p_g_prev
+
+    @var
+    def aoc(self) -> Money:
+        return (self.group.f_prev_tau - self.group.f_prev_0) + self.group.lc_prev_tau
+
+    @var(domain="state")
+    def lock(self, t: Int) -> Factor:
+        return self.scen.p_l(t)
+
+    @var
+    def months(self) -> Int:
+        return (self.group.tau0 - self.group.tau) + (self.group.i_acc + self.group.i_rec)

@@ -11,7 +11,11 @@ the IR, the inputs' hashes (not their paths, so the same bytes anywhere give the
 settings and the backend. An aggregation stage runs through the same function: its model points
 are groups, its run directory also keeps a copy of every group series it read under
 ``inputs/series/`` with the series' provenance in the manifest, its run id covers each series by
-the hash of its values, and its outputs are marked ``outputs.kind = "aggregation"``.
+the hash of its values, and its outputs are marked ``outputs.kind = "aggregation"``. A stage run
+made from run directories (:func:`~halley.aggregation.stage.run_aggregation`) passes a
+:class:`StageRecord` too: its groups file and derived group fields are copied, its manifest
+gains the record's blocks, and its run id is the stage's identity. :func:`verify_run` checks
+every file a manifest records a hash for, which a later run does before it reads a run.
 """
 
 from __future__ import annotations
@@ -46,7 +50,14 @@ from halley.runtime.invariants import (
     check_declared,
     merge_results,
 )
-from halley.runtime.loader import Inputs, LoadedSeries, ReadFile, Source, load_inputs
+from halley.runtime.loader import (
+    Inputs,
+    LoadedSeries,
+    ReadFile,
+    Source,
+    load_inputs,
+    verify_copy,
+)
 
 OUTPUT_SCHEMA_VERSION = 1
 """Bumped when the layout of the output files changes. A later aggregation stage reads a
@@ -60,6 +71,11 @@ def _halley_version() -> str:
         return "0"
 
 
+NOT_IN_IDENTITY = ("label", "runs_root", "workers")
+"""Settings a manifest records but a run id does not cover: they say where a run is filed and
+how it was computed, not what it computed (design sections 9 and 12)."""
+
+
 @dataclass(frozen=True, slots=True)
 class RunSettings:
     valuation_date: dt.date
@@ -69,6 +85,20 @@ class RunSettings:
     outputs: tuple[str, ...] | None = None
     """Variables to store; default the model's ``outputs``, or every variable."""
     label: str = ""
+    runs_root: Path | None = None
+    """The directory whose run directories an aggregation stage searches for the previous run
+    its groups name (``prev_run_id``), and against which its manifest records the directory of
+    every run it read (design section 9). Recorded, not in the run id."""
+    workers: int = 1
+    """Processes to spread the batches over (design section 12). Recorded, not in the run id:
+    the results do not depend on it. Until the process pool of section 12 lands every batch
+    runs in this process, whatever the value."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
+            raise ValueError(f"workers is a positive int, not {self.workers!r}")
+        if self.runs_root is not None and not isinstance(self.runs_root, Path):
+            object.__setattr__(self, "runs_root", Path(self.runs_root))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -77,7 +107,29 @@ class RunSettings:
             "batch_size": self.batch_size,
             "outputs": list(self.outputs) if self.outputs is not None else None,
             "label": self.label,
+            "runs_root": None if self.runs_root is None else str(self.runs_root),
+            "workers": self.workers,
         }
+
+    def identity(self) -> dict[str, Any]:
+        """The settings a run id covers: all but :data:`NOT_IN_IDENTITY`."""
+        return {k: v for k, v in self.as_dict().items() if k not in NOT_IN_IDENTITY}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RunSettings:
+        """The settings a manifest records (:meth:`as_dict`), as settings again; a manifest
+        written before ``runs_root`` and ``workers`` were recorded has neither."""
+        outputs = d.get("outputs")
+        root = d.get("runs_root")
+        return cls(
+            valuation_date=dt.date.fromisoformat(str(d["valuation_date"])),
+            horizon=None if d.get("horizon") is None else int(d["horizon"]),
+            batch_size=int(d.get("batch_size", 10_000)),
+            outputs=None if outputs is None else tuple(str(o) for o in outputs),
+            label=str(d.get("label", "")),
+            runs_root=None if root is None else Path(str(root)),
+            workers=int(d.get("workers", 1)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +165,11 @@ class RunResult:
     @property
     def n_policies(self) -> int:
         return len(self.ids)
+
+    @property
+    def kind(self) -> str:
+        """``"projection"`` or ``"aggregation"``, as the manifest records it."""
+        return str(self.manifest.get("outputs", {}).get("kind", "projection"))
 
     @property
     def variables(self) -> list[str]:
@@ -221,12 +278,81 @@ def _without_paths(inputs: dict[str, Any]) -> dict[str, Any]:
     }
     if "series" in inputs:
         # an aggregation stage: each series by the hash of its values, not its copy's bytes
-        # (which depend on the parquet writer) nor its source runs' directories
+        # (which depend on the parquet writer) nor its source runs' directories; a mean's
+        # pathwise values are a record beside it, which the stage does not read
         out["series"] = {
-            name: {k: v for k, v in e.items() if k not in ("source_runs", "sha256")}
+            name: {k: v for k, v in e.items() if k not in ("source_runs", "sha256", "pathwise")}
             for name, e in inputs["series"].items()
         }
     return out
+
+
+@dataclass(frozen=True, slots=True)
+class StageRecord:
+    """What an aggregation run made from run directories records beside what every run does
+    (design section 9; :func:`halley.aggregation.stage.run_aggregation` makes it, and
+    :func:`~halley.aggregation.stage.replay_aggregation` takes it from the run it replays).
+
+    ``groups`` is the groups file as given, copied to ``inputs/groups.parquet``; ``derived``
+    the table of the group fields the loader derived (``group_id`` and the previous-run
+    quantities), copied to ``inputs/derived_groups.parquet``; ``blocks`` the manifest's
+    top-level blocks: ``previous`` (the previous run's ``run_id``, its directory and its
+    manifest's sha256, or ``None``), ``bases`` (the same for every run of every basis, with its
+    outputs' hashes), ``membership``, ``locked_in``, ``provenance`` and ``disclosures`` (and, in
+    a replay, ``replayed_from``). Such a run's id covers
+    the IR, the groups file, every series' values, every scenario and table file of the stage,
+    the previous run's id and manifest hash, the settings but those of
+    :data:`NOT_IN_IDENTITY`, the backend and the horizon: not the bases' directories, which may
+    move, nor the copies' bytes, which name their writer."""
+
+    groups: ReadFile
+    derived: Any
+    """A ``pyarrow.Table`` keyed on ``group_id``, in the groups file's row order."""
+    blocks: dict[str, Any]
+
+    @property
+    def previous(self) -> dict[str, Any] | None:
+        return self.blocks.get("previous")
+
+
+def _stage_identity(
+    manifest: dict[str, Any],
+    record: StageRecord,
+    settings: RunSettings,
+    compiled: CompiledModel,
+    horizon: int,
+) -> dict[str, Any]:
+    """The run identity of a stage run made from run directories (design section 9): the IR,
+    the groups file, every series by the hash of its values, every scenario and table file the
+    stage read, the previous run's id and manifest hash, the settings a run id covers, the
+    backend and the horizon. Nothing in it moves when the bases' directories do or when a
+    replay reads the copies instead of the files."""
+    inputs = manifest["inputs"]
+    previous = record.previous
+    return {
+        "kind": "aggregation",
+        "ir_sha256": manifest["ir_sha256"],
+        "groups": record.groups.sha256,
+        "series": {name: e["values_sha256"] for name, e in inputs["series"].items()},
+        "scenarios": {name: e["sha256"] for name, e in inputs["scenarios"].items()},
+        "tables": {name: e["sha256"] for name, e in inputs["tables"].items()},
+        "previous": None
+        if previous is None
+        else {"run_id": previous["run_id"], "manifest_sha256": previous["manifest_sha256"]},
+        "settings": settings.identity(),
+        "backend": {"name": compiled.backend, "numpy": np.__version__},
+        "horizon": horizon,
+    }
+
+
+def _write_table(table: pa.Table, dest: Path) -> str:
+    """Write a table the run made (not one it was given) and return its bytes' sha256."""
+    buf = io.BytesIO()
+    pq.write_table(table, buf)
+    raw = buf.getvalue()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(raw)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _series_table(s: LoadedSeries, id_field: str) -> pa.Table:
@@ -292,14 +418,19 @@ def run(
     settings: RunSettings,
     run_dir: str | Path,
     series: Mapping[str, LoadedSeries] | None = None,
+    stage_record: StageRecord | None = None,
 ) -> RunResult:
     """Load and validate the inputs, project every policy in batches, check the built-in and
     the product's invariants on every batch, and write the run directory.
 
     An aggregation stage runs the same way with its groups as the model points and its group
     series in ``series`` (:func:`~halley.aggregation.group_series`); its run directory keeps a
-    copy of every series and its outputs are keyed on the groups' id field, with
-    ``outputs.kind`` ``"aggregation"``."""
+    copy of every series (and of a mean's pathwise values) and its outputs are keyed on the
+    groups' id field, with ``outputs.kind`` ``"aggregation"``. A stage run made from run
+    directories (:func:`~halley.aggregation.stage.run_aggregation`) also passes its
+    ``stage_record``: the groups file and the fields the loader derived are copied too, the
+    record's blocks enter the manifest, and the run id is the stage's identity
+    (:class:`StageRecord`)."""
     graph = compiled.graph
     model = compiled.model
     run_path = Path(run_dir)
@@ -308,6 +439,8 @@ def run(
     stage = model.series_declarations() is not None
     if series and not stage:
         raise LoadError(f"{graph.model} is a projection; group series are read by a stage")
+    if stage_record is not None and not stage:
+        raise LoadError(f"{graph.model} is a projection; a stage record belongs to a stage")
     lanes = "groups" if stage else "policies"  # what the messages call the model points
     inputs = load_inputs(
         graph,
@@ -322,6 +455,7 @@ def run(
         input_rules=model.input_rules,
         series=series,
         lanes=lanes,
+        model_points_label="model points" if stage_record is None else stage_record.groups.where,
     )
     horizon = inputs.H
     n_pol = len(inputs.ids)
@@ -382,6 +516,32 @@ def run(
             "scenarios": y.scenarios,
             "months": [0, y.horizon],
         }
+        if y.pathwise is not None:
+            # the per-scenario group totals the mean averaged, labelled pathwise: a record
+            # beside the series, not read by the stage and not in the run id
+            pathwise = LoadedSeries(
+                name, y.pathwise, y.unit, y.has_time, y.start, y.group_ids, "pathwise"
+            )
+            pcopy = f"inputs/series/{name}.pathwise.parquet"
+            series_inputs[name]["pathwise"] = {
+                "copy": pcopy,
+                "sha256": _write_series(pathwise, id_field, run_path / pcopy),
+                "values_sha256": _series_values_sha256(pathwise),
+                "scenarios": pathwise.n_scenarios,
+            }
+    stage_inputs: dict[str, Any] = {}
+    if stage_record is not None:
+        _copy_input(stage_record.groups, run_path / "inputs" / "groups.parquet")
+        stage_inputs["groups"] = _input_entry(
+            stage_record.groups, "inputs/groups.parquet", rows=stage_record.groups.table.num_rows
+        )
+        stage_inputs["derived_groups"] = {
+            "copy": "inputs/derived_groups.parquet",
+            "sha256": _write_table(
+                stage_record.derived, run_path / "inputs" / "derived_groups.parquet"
+            ),
+            "columns": list(stage_record.derived.column_names),
+        }
 
     source_path = Path(graph.source_file)
     manifest: dict[str, Any] = {
@@ -427,6 +587,7 @@ def run(
                 for name, s in inputs.scenarios.items()
             },
             **({"series": series_inputs} if stage else {}),
+            **stage_inputs,
         },
         "outputs": {
             "kind": "aggregation" if stage else "projection",
@@ -445,13 +606,17 @@ def run(
         },
         "invariants": "invariants.json",
     }
-    identity = {
-        "ir_sha256": manifest["ir_sha256"],
-        "inputs": _without_paths(manifest["inputs"]),
-        "settings": {k: v for k, v in settings.as_dict().items() if k != "label"},
-        "backend": {"name": compiled.backend, "numpy": np.__version__},
-        "horizon": horizon,
-    }
+    if stage_record is not None:
+        manifest.update(stage_record.blocks)
+        identity = _stage_identity(manifest, stage_record, settings, compiled, horizon)
+    else:
+        identity = {
+            "ir_sha256": manifest["ir_sha256"],
+            "inputs": _without_paths(manifest["inputs"]),
+            "settings": settings.identity(),
+            "backend": {"name": compiled.backend, "numpy": np.__version__},
+            "horizon": horizon,
+        }
 
     run_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
     manifest["run_id"] = run_id
@@ -525,18 +690,79 @@ def _write_outputs(
     pq.write_table(pa.table(scalars).replace_schema_metadata(meta), out_dir / "scalars.parquet")
 
 
-def load_run(run_dir: str | Path) -> RunResult:
-    """Read a run directory back: manifest, outputs and invariants. The model is not needed."""
+def read_manifest(run_dir: str | Path) -> tuple[dict[str, Any], str]:
+    """A run directory's manifest and the sha256 of its bytes, which another run that reads
+    this one records (design section 9); a LoadError when there is none or when it was written
+    with another output schema."""
     run_path = Path(run_dir)
     manifest_path = run_path / "manifest.json"
-    if not manifest_path.exists():
-        raise LoadError(f"{run_path} holds no manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError:
+        raise LoadError(f"{run_path} holds no manifest.json") from None
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LoadError(f"{manifest_path} is not a run manifest: {exc}") from None
+    if not isinstance(manifest, dict):
+        raise LoadError(f"{manifest_path} is not a run manifest")
     if manifest.get("output_schema") != OUTPUT_SCHEMA_VERSION:
         raise LoadError(
             f"{run_path} was written with output schema {manifest.get('output_schema')}; this "
             f"version reads {OUTPUT_SCHEMA_VERSION}"
         )
+    return manifest, hashlib.sha256(raw).hexdigest()
+
+
+def run_files(manifest: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Every file of a run directory whose sha256 its manifest records, as ``(what, relative
+    path, sha256)``: the copied inputs (the model points, every table and scenario file and, for
+    a stage, its groups file, its derived groups and every series with a mean's pathwise
+    sibling), then the outputs (``outputs.monthly_sha256``, ``outputs.scalars_sha256``)."""
+    inputs = manifest.get("inputs", {})
+    entries: list[tuple[str, dict[str, Any]]] = [("model points", inputs.get("model_points", {}))]
+    entries += [(f"table {n}", e) for n, e in inputs.get("tables", {}).items()]
+    entries += [(f"scenario input {n}", e) for n, e in inputs.get("scenarios", {}).items()]
+    for key, what in (("groups", "groups"), ("derived_groups", "derived group fields")):
+        if key in inputs:
+            entries.append((what, inputs[key]))
+    for n, e in inputs.get("series", {}).items():
+        entries.append((f"series {n}", e))
+        if "pathwise" in e:
+            entries.append((f"series {n} (pathwise)", e["pathwise"]))
+    out = [(what, str(e.get("copy")), str(e.get("sha256"))) for what, e in entries]
+    outputs = manifest.get("outputs", {})
+    for key in ("monthly", "scalars"):
+        out.append((f"{key} outputs", str(outputs.get(key)), str(outputs.get(f"{key}_sha256"))))
+    return out
+
+
+def verify_run(run_dir: str | Path, what: str = "run") -> dict[str, Any]:
+    """Check every file of a run directory whose sha256 its manifest records
+    (:func:`run_files`) and return the manifest (D21). A LoadError names the first file that is
+    missing or whose bytes hash otherwise, or a manifest written before the outputs' hashes
+    were recorded. Messages name the run as ``"<what> <run_id>"`` (``"basis cur run 1f..."``)."""
+    run_path = Path(run_dir)
+    manifest, _sha = read_manifest(run_path)
+    who = f"{what} {manifest.get('run_id')}"
+    for name, rel, sha in run_files(manifest):
+        if rel == "None" or len(sha) != 64:
+            raise LoadError(
+                f"{who}: its manifest records no sha256 for its {name} ({run_path}); it predates "
+                "the hashes a later run verifies, so rerun it"
+            )
+        verify_copy(run_path, rel, sha, f"{who}: {name}")
+    return manifest
+
+
+def load_run(run_dir: str | Path, *, verify: bool = False) -> RunResult:
+    """Read a run directory back: manifest, outputs and invariants. The model is not needed.
+    With ``verify``, every file the manifest records a hash for is checked first
+    (:func:`verify_run`)."""
+    run_path = Path(run_dir)
+    if verify:
+        verify_run(run_path)
+    manifest, _sha = read_manifest(run_path)
     dims = manifest["dimensions"]
     n_pol, n_scen = int(dims["policies"]), int(dims["scenarios"])
     horizon = int(dims["horizon"])

@@ -10,10 +10,15 @@ ascending ``s`` (para 33(a)), or kept per scenario. A formula reads a series as
 ``self.series.<name>(t + k)``, ``self.series.<name>.at(k)`` or, without a time dimension,
 ``self.series.<name>()``; ``self.group.<field>`` is the group's own field.
 
-:func:`group_series` builds the dense series from projection runs of this session, so a stage
-can be run end to end through :func:`~halley.runtime.run.run`. The loader that reads the bases
-from run directories, with their copies, previous runs and membership checks, comes later
-(design section 9, "Loader and runs").
+:func:`group_series` builds the dense series from projection runs, so a stage can be run end to
+end through :func:`~halley.runtime.run.run`. :func:`run_aggregation` is the stage's own entry
+point (design section 9, "Loader and runs"): it reads every basis from run directories (or runs
+of the session, through their directories), each verified against the hashes its manifest
+records; takes the membership from each run's model point copy, grouped on (``portfolio``,
+``cohort``, ``profit_bucket``); resolves the previous aggregation run a group names by its
+``prev_run_id``; checks G1, G4, the ``groups`` rules, the structural and locked-in hashes and
+the provenance of every file that names one; fills the group fields derived from the previous
+run; and writes a run directory that :func:`replay_aggregation` re-runs from its own copies.
 """
 
 from __future__ import annotations
@@ -22,21 +27,53 @@ import dataclasses
 import datetime as dt
 import hashlib
 import inspect
+import json
 import numbers
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar, Final, NamedTuple, TypeGuard
 
 import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
+from halley.authoring.contracts import (
+    FROM_DATES,
+    FROM_PREVIOUS,
+    FROM_PREVIOUS_RUN,
+    GROUP_ID,
+    GROUP_KEY,
+    LOCKED_IN_FIELDS,
+)
 from halley.authoring.product import ModelPoint, Product, VarDef
+from halley.codegen import CompiledModel
 from halley.errors import BuildError, LoadError, Loc, UnitError
 from halley.ir import units
 from halley.ir.units import Unit, unit_from_name
-from halley.runtime.loader import LoadedSeries
-from halley.runtime.run import RunResult
+from halley.runtime.loader import (
+    CUR_BASIS,
+    LoadedSeries,
+    ReadFile,
+    Source,
+    file_difference,
+    read_copy,
+    read_series_copy,
+    read_source,
+    table_columns,
+    table_of,
+    with_columns,
+)
+from halley.runtime.run import (
+    RunResult,
+    RunSettings,
+    StageRecord,
+    load_run,
+    read_manifest,
+    run,
+    run_files,
+    verify_run,
+)
 
 SCENARIO_TREATMENTS = ("mean", "each")
 """What a series does with its basis's scenarios: their mean (one scenario) or each of them."""
@@ -47,13 +84,11 @@ coverage units. A probability, rate, factor, index level, flag or Int of each me
 add up to the group's, and a MoneyPerPolicy is per policy by definition. Narrower than
 :data:`~halley.ir.units.SUMMABLE`, the units ``sum_t()`` adds over the months of one policy."""
 
-GROUP_ID: Final = "group_id"
-"""The id field of a stage's group schema, and so of its output files (design section 9)."""
-
 _STAGE_NAMES = {
     "group": "the group's fields (self.group)",
     "series": "the group series accessor (self.series)",
     "bases": "a stage class attribute",
+    "disclosures": "a stage class attribute",
 }
 """Names a stage's variable may not take, beside the projection's own reserved names."""
 
@@ -332,7 +367,9 @@ class Aggregation(Product):
     * ``bases``: the :class:`Basis` declarations whose runs it reads;
     * ``series``: the :class:`GroupSum` declarations, read in formulas as
       ``self.series.<name>(t + k)``, ``self.series.<name>.at(k)`` or ``self.series.<name>()``;
-    * ``scenario_inputs``: its own curves, such as a locked-in discount curve.
+    * ``scenario_inputs``: its own curves, such as a locked-in discount curve;
+    * ``disclosures``: the approach strings and notes its run manifest discloses beside the
+      confidence level and the para 120 curve (:func:`run_aggregation`).
 
     The class attribute ``series`` holds the declarations; inside a formula ``self.series`` is
     the accessor that turns them into reads. A series' unit, time dimension, domain and
@@ -345,6 +382,10 @@ class Aggregation(Product):
     series: ClassVar[Any] = ()
     """A tuple of :class:`GroupSum`. Typed ``Any`` because a formula reads ``self.series`` as
     the accessor of the same name, which a tuple's type would refuse."""
+    disclosures: ClassVar[dict[str, str | tuple[str, ...]]] = {}
+    """What the manifest's ``disclosures`` block adds to the data-derived entries: by name, a
+    string (the approach to discount rates, ``discount_rates``, or to the risk adjustment,
+    ``risk_adjustment``) or a tuple of strings (``notes``)."""
 
     @property
     def group(self) -> ModelPoint:
@@ -395,6 +436,15 @@ def _is_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
     return isinstance(value, tuple)
 
 
+def _is_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
+def _is_mapping(value: object) -> TypeGuard[Mapping[str, Any]]:
+    """A JSON object of a manifest."""
+    return isinstance(value, dict)
+
+
 def _tuple_of[T](cls: type[Aggregation], name: str, kind: type[T]) -> tuple[T, ...]:
     """``cls.<name>`` as a tuple of ``kind``; the realistic slip is a one-element tuple without
     its comma, which arrives as the element itself."""
@@ -425,8 +475,10 @@ def group_series(
     stage: type[Aggregation],
     bases: Mapping[str, Sequence[RunResult]],
     members: Mapping[Any, Sequence[Any]],
+    *,
+    runs_root: Path | None = None,
 ) -> dict[str, LoadedSeries]:
-    """Every series ``stage`` declares, summed from projection runs of this session.
+    """Every series ``stage`` declares, summed from projection runs.
 
     ``bases`` gives each declared basis's runs; ``members`` each group's member policy ids, by
     group id (the stage's model point ids). Every group has members, every policy of every run
@@ -437,8 +489,10 @@ def group_series(
     run of its basis with the series' unit; its recorded domain start is the series' (the latest
     over the variables), which the loader requires to be no later than the stage's declared
     start when the stage runs. The provenance records the basis's valuation date, which the
-    stage's must equal, its horizon, which bounds the stage's when the basis is ``cur``, and
-    the membership the sums used. A LoadError otherwise."""
+    stage's must equal, its horizon, which bounds the stage's when the basis is ``cur``, the
+    membership the sums used and each source run's id, directory (relative to ``runs_root``
+    when it lies under it), manifest sha256 and outputs' sha256s. A mean keeps the
+    per-scenario group totals it averaged as its ``pathwise`` values. A LoadError otherwise."""
     stage.series_declarations()  # the declarations are sound before anything is summed
     declared = {b.name: b for b in _bases(stage)}
     for name in declared:
@@ -485,7 +539,9 @@ def group_series(
         [_plain(g), [_plain(p) for p in _sorted_ids(list(members[g]))]] for g in group_ids
     ]
     return {
-        s.name: _summed(s, bases[s.basis], group_ids, members, shared[s.basis], membership)
+        s.name: _summed(
+            s, bases[s.basis], group_ids, members, shared[s.basis], membership, runs_root
+        )
         for s in sums
     }
 
@@ -513,6 +569,7 @@ def _summed(
     members: Mapping[Any, Any],
     basis: BasisInfo,
     membership: list[list[Any]],
+    runs_root: Path | None,
 ) -> LoadedSeries:
     start = 0
     for var in s.names:
@@ -538,7 +595,9 @@ def _summed(
     for other in totals[1:]:
         x = x + other  # the group totals, added left to right per scenario
     n_scen = int(x.shape[2])
+    pathwise: NDArray[np.float64] | None = None
     if s.scenarios == "mean":
+        pathwise = np.ascontiguousarray(x)  # the per-scenario totals, kept beside the mean
         x = sequential_sum((1.0 / n_scen) * x, axis=2)  # ascending s; x * 1.0 when J = 1
     provenance: dict[str, Any] = {
         "basis": s.basis,
@@ -546,7 +605,7 @@ def _summed(
         "basis_scenarios": n_scen,
         "valuation_date": basis.valuation_date.isoformat(),
         "basis_horizon": basis.horizon,  # recorded for a series without a time dimension too
-        "source_runs": [_source_run(s, r) for r in runs],
+        "source_runs": [_source_run(s, r, runs_root) for r in runs],
         "members": membership,  # [group id, its member ids ascending], groups ascending
     }
     return LoadedSeries(
@@ -558,11 +617,13 @@ def _summed(
         group_ids,
         s.scenarios,
         provenance,
+        pathwise,
     )
 
 
-def _source_run(s: GroupSum, r: RunResult) -> dict[str, str]:
-    """Where a series' values came from: the run, its directory and its manifest's hash."""
+def _source_run(s: GroupSum, r: RunResult, runs_root: Path | None) -> dict[str, Any]:
+    """Where a series' values came from: the run, its directory, its manifest's hash and the
+    hashes of its outputs (design section 9)."""
     manifest = r.run_dir / "manifest.json"
     try:
         raw = manifest.read_bytes()
@@ -572,9 +633,29 @@ def _source_run(s: GroupSum, r: RunResult) -> dict[str, str]:
         ) from None
     return {
         "run_id": r.run_id,
-        "dir": str(r.run_dir),
+        "dir": _dir_label(r.run_dir, runs_root),
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "outputs_sha256": _outputs_sha256(r.manifest),
     }
+
+
+def _outputs_sha256(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """The sha256 of a run's two output files, as its manifest records them."""
+    outputs: Mapping[str, Any] = manifest.get("outputs", {})
+    return {"monthly": outputs.get("monthly_sha256"), "scalars": outputs.get("scalars_sha256")}
+
+
+def _dir_label(path: Path, runs_root: Path | None) -> str:
+    """A run directory as a manifest records it: relative to ``runs_root`` (``/``-separated)
+    when it lies under it, so that a tree of runs can move as a whole, else its absolute
+    path."""
+    full = Path(path).resolve()
+    if runs_root is not None:
+        try:
+            return full.relative_to(Path(runs_root).resolve()).as_posix()
+        except ValueError:
+            pass
+    return str(full)
 
 
 def _group_totals(
@@ -597,3 +678,1159 @@ def _group_totals(
         ]
         columns.append(sequential_sum(np.stack(lanes, axis=1), axis=1))
     return np.concatenate(columns, axis=1)
+
+
+# --------------------------------------------------------------------------- loader and runs
+
+OLD_BASIS: Final = "old"
+"""The basis on the previous non-financial tables and the expected in-force (in-force 5.5): its
+policies are exactly the previous run's members (G4)."""
+
+NEW_BASIS: Final = "new"
+"""The basis on the current non-financial tables at the locked-in rates (in-force 5.5): its
+policies are the cur basis's (G4)."""
+
+FINANCIAL_INPUTS: Final = ("rf_df", "cpi", "ilp")
+"""The inputs of a projection run that carry its financial basis: the discount curve and the CPI
+path (scenario inputs) and the illiquidity premium (a table). The old and new bases share every
+one of them; the cur and new bases share every other table (in-force 5.5)."""
+
+LOCKED_IN_CURVES: Final = ("p_l", "p_rec")
+"""A stage's scenario inputs built from the locked-in discount file and ILP table (design
+section 10, ``locked_in_curve``): their metadata ``source_sha256`` and ``ilp_sha256`` must be
+the group's ``discount_rec_sha256`` and ``ilp_sha256``."""
+
+LOCKED_IN_CPI: Final = "cpi"
+"""The scenario input through which the locked-in runs (bases old and new) read the spliced CPI
+path (``locked_in_cpi``): its metadata ``rec_sha256`` must be the group's ``cpi_rec_sha256``."""
+
+CONFIDENCE_LEVEL: Final = ("ra_param", "alpha")
+"""The table and column of the cur basis's runs that hold the disclosed confidence level (para
+119)."""
+
+PARA_120_CURVE: Final = "df_cur"
+"""The stage's scenario input that holds the disclosed composed current curve (para 120)."""
+
+PREVIOUS_TOLERANCE: Final = 1e-12
+"""``csm_prev`` and ``lc_prev`` agree with the previous run's ``csm(0)`` and ``lc(0)`` within this
+many times ``P_g`` (design section 9)."""
+
+STAGE_BLOCKS: Final = (
+    "previous",
+    "bases",
+    "membership",
+    "locked_in",
+    "provenance",
+    "disclosures",
+)
+"""The manifest blocks a run made by :func:`run_aggregation` adds beside every run's, which
+:func:`replay_aggregation` carries over."""
+
+PROVENANCE_KEYS: Final = ("rebased_from", "derived_from")
+"""The metadata keys (``halley.<key>``) of a file that a section 10 helper made from another:
+the source's sha256 (``rebased_from``) or run id (``derived_from``)."""
+
+
+def require_one_group(group_ids: Sequence[str], where: str) -> None:
+    """G1 (in-force 12.4): one group per aggregation run in this version. This is the rule's one
+    place: :func:`load_aggregation_inputs` calls it once, and the rest of the loader (the
+    membership, the derived fields, the locked-in hashes, the manifest blocks) works per group,
+    so lifting the rule is deleting that call."""
+    if len(group_ids) != 1:
+        raise LoadError(
+            f"{where}: holds {len(group_ids)} groups ({', '.join(group_ids)}); an aggregation run "
+            "measures one group in this version (G1)"
+        )
+
+
+def _month_index(d: dt.date) -> int:
+    """``mi(d) = 12 * year(d) + month(d) - 1``, the run constant ``m_val`` of a date."""
+    return 12 * d.year + d.month - 1
+
+
+def _is_month_end(d: dt.date) -> bool:
+    return (d + dt.timedelta(days=1)).day == 1
+
+
+def _listing(values: Sequence[object], limit: int = 5) -> str:
+    shown = ", ".join(str(v) for v in values[:limit])
+    return shown + (f" and {len(values) - limit} more" if len(values) > limit else "")
+
+
+def _group_ids(cols: Mapping[str, NDArray[Any]], where: str, what: str) -> list[str]:
+    """Each row's group id, ``f"{portfolio}-{cohort}-{profit_bucket}"`` (design section 9); a
+    key column that is missing or of another type is a LoadError naming the file."""
+    for name in GROUP_KEY:
+        if name not in cols:
+            raise LoadError(
+                f"{where}: column {name} is missing; {what} carry the group key "
+                f"({', '.join(GROUP_KEY)})"
+            )
+    portfolio, cohort, bucket = (cols[name] for name in GROUP_KEY)
+    if portfolio.dtype != object or bucket.dtype != object:
+        raise LoadError(f"{where}: portfolio and profit_bucket are string columns")
+    if not np.issubdtype(cohort.dtype, np.integer):
+        raise LoadError(f"{where}: cohort is an integer column, not {cohort.dtype}")
+    return [
+        f"{p}-{int(c)}-{b}"
+        for p, c, b in zip(portfolio.tolist(), cohort.tolist(), bucket.tolist(), strict=True)
+    ]
+
+
+# ------------------------------------------------------------------------ the bases' runs
+
+
+@dataclass(frozen=True, slots=True)
+class _Member:
+    """One row of a basis run's model point copy."""
+
+    pid: Any
+    group: str
+    issue_date: dt.date
+    row: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BasisRun:
+    """A projection run of a basis, read from its directory with every file verified: the run
+    (its outputs loaded), its manifest's sha256 and the rows of its model point copy."""
+
+    basis: str
+    result: RunResult
+    manifest_sha256: str
+    copy: str
+    """The model point copy, as messages name it."""
+    members: tuple[_Member, ...]
+
+    @property
+    def run_id(self) -> str:
+        return self.result.run_id
+
+    def at(self, m: _Member) -> str:
+        """A member's row, for a message: the copy, the row and the policy."""
+        return f"{self.copy}: row {m.row}, policy {m.pid}"
+
+
+def _basis_run(basis: str, given: object) -> _BasisRun:
+    """A run of a basis given as a :class:`RunResult` or a run directory, read through its
+    directory: every file its manifest records a hash for is verified (a tampered file is a
+    LoadError naming it), the run must be a projection, and its model point copy gives the
+    membership (each row's group key and issue date)."""
+    if isinstance(given, RunResult):
+        path, expected = given.run_dir, given.run_id
+    elif isinstance(given, (str, Path)):
+        path, expected = Path(given), None
+    else:
+        raise LoadError(
+            f"basis {basis}: a run is a RunResult or a run directory, not {type(given).__name__}"
+        )
+    manifest = verify_run(path, f"basis {basis} run")
+    run_id = str(manifest.get("run_id"))
+    if expected is not None and run_id != expected:
+        raise LoadError(
+            f"basis {basis}: run {expected} was given, but its directory {path} holds run {run_id}"
+        )
+    kind = manifest.get("outputs", {}).get("kind", "projection")
+    if kind != "projection":
+        raise LoadError(f"basis {basis}: {path} holds an {kind} run; a basis reads projection runs")
+    _manifest, sha = read_manifest(path)
+    result = load_run(path)
+    f = read_copy(
+        path, manifest["inputs"]["model_points"], f"basis {basis} run {run_id}: model points"
+    )
+    cols = table_columns(f)
+    groups = _group_ids(cols, f.where, "a basis run's model points")
+    id_field = str(manifest["outputs"].get("id_field", "policy_id"))
+    for name in (id_field, "issue_date"):
+        if name not in cols:
+            raise LoadError(f"{f.where}: column {name} is missing")
+    ids: list[Any] = cols[id_field].tolist()
+    dates: list[Any] = cols["issue_date"].tolist()
+    if not all(isinstance(d, dt.date) for d in dates):
+        raise LoadError(f"{f.where}: issue_date is a date column")
+    if sorted(map(repr, ids)) != sorted(map(repr, result.ids.tolist())):
+        raise LoadError(f"{f.where}: it holds other policies than the run's outputs")
+    members = tuple(
+        _Member(pid, g, d, row)
+        for row, (pid, g, d) in enumerate(zip(ids, groups, dates, strict=True))
+    )
+    return _BasisRun(basis, result, sha, f.where, members)
+
+
+def _runs_of(basis: str, given: object) -> list[object]:
+    if _is_tuple(given) or _is_list(given):
+        return list(given)
+    raise LoadError(
+        f"basis {basis} takes a list of runs (RunResults or run directories), not "
+        f"{type(given).__name__}"
+    )
+
+
+def _check_keys_agree(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
+    """A policy in several bases has one group key in all of them (G4 without a previous
+    run)."""
+    seen: dict[Any, tuple[_BasisRun, _Member]] = {}
+    for rs in runs.values():
+        for r in rs:
+            for m in r.members:
+                if m.pid not in seen:
+                    seen[m.pid] = (r, m)
+                    continue
+                r0, m0 = seen[m.pid]
+                if m0.group != m.group:
+                    raise LoadError(
+                        f"{r.at(m)} is in group {m.group}, but {r0.at(m0)} is in group "
+                        f"{m0.group}; a policy's group key is the same in every run (G4)"
+                    )
+
+
+# ---------------------------------------------------------------------------- the groups
+
+
+@dataclass(frozen=True, slots=True)
+class _Groups:
+    """The groups file as read: every column, and each row's derived group id."""
+
+    file: ReadFile
+    columns: dict[str, NDArray[Any]]
+    ids: list[str]
+
+    def at(self, row: int) -> str:
+        """A row, for a message: the file, the group and the row."""
+        return f"{self.file.where}: group {self.ids[row]} (row {row})"
+
+    def date(self, name: str, row: int) -> dt.date:
+        if name not in self.columns:
+            raise LoadError(f"{self.file.where}: column {name} is missing")
+        value: object = self.columns[name][row]
+        if not isinstance(value, dt.date):
+            raise LoadError(f"{self.at(row)}: {name} is a date, not {value!r}")
+        return value
+
+    def number(self, name: str, row: int) -> float:
+        return float(self.columns[name][row])
+
+
+def _read_groups(source: Source, valuation_date: dt.date) -> _Groups:
+    """The groups file (in-force 3.3): the group key, the recognition date and the stage's
+    fields, one row per group. ``group_id`` is derived, never a column, and so are the fields
+    the loader fills from the previous run and the dates; a duplicate key is a LoadError naming
+    both rows; then the rules that need no run (:func:`_check_group_rules`)."""
+    f = read_source(source, "groups")
+    cols = table_columns(f)
+    if GROUP_ID in cols:
+        raise LoadError(
+            f"{f.where}: carries a column {GROUP_ID}, which the loader derives as "
+            "portfolio-cohort-profit_bucket (design section 9)"
+        )
+    retyped = [name for name in FROM_PREVIOUS if name in cols]
+    if retyped:
+        raise LoadError(
+            f"{f.where}: carries {', '.join(retyped)}, which the loader derives from the "
+            "previous run and the dates; they are never typed into the groups file (design "
+            "section 9)"
+        )
+    ids = _group_ids(cols, f.where, "the groups")
+    if not ids:
+        raise LoadError(f"{f.where}: no rows")
+    seen: dict[str, int] = {}
+    for row, g in enumerate(ids):
+        if g in seen:
+            raise LoadError(
+                f"{f.where}: rows {seen[g]} and {row} are both group {g}; a group has one row, "
+                "and every member maps to exactly one"
+            )
+        seen[g] = row
+    groups = _Groups(f, cols, ids)
+    _check_group_rules(groups, valuation_date)
+    return groups
+
+
+def _check_group_rules(groups: _Groups, valuation_date: dt.date) -> None:
+    """The ``groups`` rules of in-force 3.3 that need no run: the dates are month-ends; the
+    recognition date is no later than the valuation date; ``prev_valuation_date`` is at least a
+    month before it and no earlier than the recognition date (``0 <= tau <= tau0``, with ``tau``
+    at least 1); at most one of ``csm_prev`` and ``lc_prev`` is positive."""
+    cols = groups.columns
+    v = valuation_date
+    for row in range(len(groups.ids)):
+        at = groups.at(row)
+        rec = groups.date("recognition_date", row)
+        if not _is_month_end(rec):
+            raise LoadError(f"{at}: recognition_date {rec} is not the last day of a month")
+        if rec > v:
+            raise LoadError(f"{at}: recognition_date {rec} is after the valuation date {v}")
+        if "prev_valuation_date" in cols:
+            prev = groups.date("prev_valuation_date", row)
+            if not _is_month_end(prev):
+                raise LoadError(f"{at}: prev_valuation_date {prev} is not the last day of a month")
+            if _month_index(prev) > _month_index(v) - 1:
+                raise LoadError(
+                    f"{at}: prev_valuation_date {prev} is not at least a month before the "
+                    f"valuation date {v}"
+                )
+            if prev < rec:
+                raise LoadError(
+                    f"{at}: prev_valuation_date {prev} is before recognition_date {rec}, so tau "
+                    f"= {_month_index(v) - _month_index(prev)} would exceed tau0 = "
+                    f"{_month_index(v) - _month_index(rec)}"
+                )
+        if "csm_prev" in cols and "lc_prev" in cols:
+            csm, lc = groups.number("csm_prev", row), groups.number("lc_prev", row)
+            if csm > 0 and lc > 0:
+                raise LoadError(
+                    f"{at}: csm_prev = {csm!r} and lc_prev = {lc!r} are both positive; at most "
+                    "one of them is"
+                )
+
+
+def _members_by_group(
+    runs: Mapping[str, Sequence[_BasisRun]], groups: _Groups
+) -> dict[str, list[Any]]:
+    """Every member of every basis run maps to exactly one group row and was issued on its
+    group's recognition date; every group has a member. The members of each group, over every
+    basis."""
+    rows = {g: row for row, g in enumerate(groups.ids)}
+    members: dict[str, dict[Any, None]] = {g: {} for g in groups.ids}
+    for rs in runs.values():
+        for r in rs:
+            for m in r.members:
+                row = rows.get(m.group)
+                if row is None:
+                    raise LoadError(
+                        f"{r.at(m)} is in group {m.group}, which has no row in "
+                        f"{groups.file.where}; every member maps to exactly one group row"
+                    )
+                rec = groups.date("recognition_date", row)
+                if m.issue_date != rec:
+                    raise LoadError(
+                        f"{r.at(m)}: issue_date {m.issue_date} is not the recognition_date {rec} "
+                        f"of group {m.group}; every member is issued on it (in-force 3.3)"
+                    )
+                members[m.group][m.pid] = None
+    for row, g in enumerate(groups.ids):
+        if not members[g]:
+            raise LoadError(f"{groups.at(row)} has no member in any run of the stage's bases")
+    return {g: list(pids) for g, pids in members.items()}
+
+
+# ------------------------------------------------------------------------ the previous run
+
+
+@dataclass(frozen=True, slots=True)
+class _Previous:
+    """The previous aggregation run a group names, read from its directory with every file
+    verified: its outputs, its manifest's sha256 and its members at its valuation date (its cur
+    basis's), by policy."""
+
+    path: Path
+    result: RunResult
+    manifest_sha256: str
+    members: dict[Any, str]
+
+    @property
+    def run_id(self) -> str:
+        return self.result.run_id
+
+    @property
+    def who(self) -> str:
+        return f"the previous run {self.run_id}"
+
+
+def find_run(run_id: str, runs_root: Path) -> Path:
+    """The directory under ``runs_root`` whose manifest carries ``run_id`` (design section 9,
+    "Run addressing"): every ``runs_root/*/manifest.json`` is read; no match, or several (a run
+    and its copy, a replay filed beside the run it replays), is a LoadError."""
+    root = Path(runs_root)
+    if not root.is_dir():
+        raise LoadError(f"runs_root {root} is not a directory")
+    found: list[Path] = []
+    for manifest in sorted(root.glob("*/manifest.json")):
+        try:
+            data: Any = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LoadError(f"{manifest} is not a run manifest: {exc}") from None
+        if _is_mapping(data) and data.get("run_id") == run_id:
+            found.append(manifest.parent)
+    if not found:
+        raise LoadError(
+            f"no run under runs_root {root} has run_id {run_id} ({root}/*/manifest.json)"
+        )
+    if len(found) > 1:
+        raise LoadError(
+            f"{len(found)} runs under runs_root {root} have run_id {run_id}: "
+            f"{', '.join(str(p) for p in found)}; a run id addresses one run, so file each run "
+            "once under runs_root"
+        )
+    return found[0]
+
+
+def _needs_previous(graph: ir.Graph) -> bool:
+    """Whether the stage's groups name a previous run (``prev_run_id``) or read a field derived
+    from one."""
+    return "prev_run_id" in graph.fields or any(n in graph.fields for n in FROM_PREVIOUS_RUN)
+
+
+def _resolve_previous(
+    graph: ir.Graph, groups: _Groups, previous: Path | None, settings: RunSettings
+) -> _Previous | None:
+    """The previous aggregation run the groups name by ``prev_run_id``: found under
+    ``settings.runs_root`` (:func:`find_run`), or ``previous=``, a test override whose manifest
+    must carry that run id; every file of it verified; an aggregation run at one scenario that
+    recorded its membership."""
+    if not _needs_previous(graph):
+        if previous is not None:
+            raise LoadError(
+                "previous= was given, but the stage's groups name no previous run (prev_run_id)"
+            )
+        return None
+    if "prev_run_id" not in groups.columns:
+        raise LoadError(
+            f"{groups.file.where}: column prev_run_id is missing; the stage reads the previous "
+            "run of each group"
+        )
+    wanted = sorted({str(v) for v in groups.columns["prev_run_id"].tolist()})
+    if len(wanted) != 1:
+        raise LoadError(
+            f"{groups.file.where}: the groups name several previous runs ({', '.join(wanted)})"
+        )
+    want = wanted[0]
+    if previous is not None:
+        path = Path(previous)
+        manifest, _sha = read_manifest(path)
+        if manifest.get("run_id") != want:
+            raise LoadError(
+                f"previous= {path} holds run {manifest.get('run_id')}, but {groups.at(0)} names "
+                f"prev_run_id {want}"
+            )
+    elif settings.runs_root is None:
+        raise LoadError(
+            f"{groups.at(0)} names prev_run_id {want}; set RunSettings.runs_root to the directory "
+            "the runs are filed in (or pass previous=)"
+        )
+    else:
+        path = find_run(want, settings.runs_root)
+    manifest = verify_run(path, "previous run")
+    kind = manifest.get("outputs", {}).get("kind", "projection")
+    if kind != "aggregation":
+        raise LoadError(
+            f"prev_run_id {want} names {path}, a {kind} run; it names the previous aggregation run"
+        )
+    _manifest, sha = read_manifest(path)
+    result = load_run(path)
+    from halley.aggregation import require_deterministic  # the one J = 1 check
+
+    require_deterministic(
+        result,
+        f"the previous run {want}",
+        "the loader reads the previous run's group outputs at one scenario",
+        LoadError,
+    )
+    membership: Any = manifest.get("membership")
+    groups_block: Any = membership.get("groups") if _is_mapping(membership) else None
+    if not _is_mapping(groups_block):
+        raise LoadError(
+            f"the previous run {want} records no membership; it was not made by run_aggregation"
+        )
+    members: dict[Any, str] = {}
+    for gid, by_basis in groups_block.items():
+        cur: Any = by_basis.get(CUR_BASIS) if _is_mapping(by_basis) else None
+        if not _is_list(cur):
+            raise LoadError(
+                f"the previous run {want} records no members of basis {CUR_BASIS} for group {gid}"
+            )
+        for pid in cur:
+            members[pid] = str(gid)
+    return _Previous(path, result, sha, members)
+
+
+def _check_g4(runs: Mapping[str, Sequence[_BasisRun]], prev: _Previous) -> None:
+    """G4 (design section 9; in-force 3.2, 12.4) per basis against the previous run's members:
+    every policy at V was a member, in the same group (its key unchanged); the old basis holds
+    every member (``ids(old) == ids(previous)``); the new and cur bases hold the same policies
+    (``ids(new) == ids(cur) ⊆ ids(previous)``)."""
+    for rs in runs.values():
+        for r in rs:
+            for m in r.members:
+                was = prev.members.get(m.pid)
+                if was is None:
+                    raise LoadError(
+                        f"{r.at(m)} is not a member of {prev.who}; contracts do not join a group "
+                        "after recognition (G4, para 28)"
+                    )
+                if was != m.group:
+                    raise LoadError(
+                        f"{r.at(m)} is in group {m.group} but was in group {was} at {prev.who}; "
+                        "a policy's group key does not change (G4)"
+                    )
+    ids = {b: {m.pid for r in rs for m in r.members} for b, rs in runs.items()}
+    if OLD_BASIS in ids:
+        missing = [p for p in _sorted_ids(list(prev.members)).tolist() if p not in ids[OLD_BASIS]]
+        if missing:
+            raise LoadError(
+                f"basis {OLD_BASIS} holds no run with policies {_listing(missing)} of "
+                f"{prev.who}'s members; the old basis projects every member of the previous run "
+                "(G4)"
+            )
+    if NEW_BASIS in ids and CUR_BASIS in ids and ids[NEW_BASIS] != ids[CUR_BASIS]:
+        only_new = _sorted_ids(list(ids[NEW_BASIS] - ids[CUR_BASIS])).tolist()
+        only_cur = _sorted_ids(list(ids[CUR_BASIS] - ids[NEW_BASIS])).tolist()
+        raise LoadError(
+            f"bases {NEW_BASIS} and {CUR_BASIS} hold other policies (only in {NEW_BASIS}: "
+            f"{_listing(only_new) or 'none'}; only in {CUR_BASIS}: "
+            f"{_listing(only_cur) or 'none'}); both project the members in force at the valuation "
+            "date (G4)"
+        )
+
+
+def _previous_value(
+    prev: _Previous, name: str, gid: str, month: int | None, unit: Unit | None, what: str
+) -> float:
+    """The previous run's ``name`` for group ``gid`` at ``month`` (``None`` for a quantity
+    without a time dimension): its stored output of that name or, failing one, its copy of the
+    group series of that name. The unit must be the derived field's (D11 across runs)."""
+    r = prev.result
+    variables: Mapping[str, Any] = r.manifest["outputs"]["variables"]
+    if name in variables:
+        info = r.variable_info(name)
+        got_unit, has_time, last = info.unit, info.time, r.H
+        values = r.var(name)
+        g = r.index(gid)
+    else:
+        series: Mapping[str, Any] = r.manifest["inputs"].get("series", {})
+        if name not in series:
+            raise LoadError(
+                f"{what}: {prev.who} stored no {name}, as an output or a group series; the stage "
+                f"that made it stores {name}"
+            )
+        s = read_series_copy(r.run_dir, name, series[name], GROUP_ID, f"{prev.who}: series {name}")
+        got_unit, has_time, last = s.unit.name, s.has_time, s.horizon
+        values = s.values
+        g = s.group_ids.tolist().index(gid)
+    if unit is not None and got_unit != unit.name:
+        raise LoadError(
+            f"{what}: {prev.who} records {name} as {got_unit}, not {unit.name} (D11 across runs)"
+        )
+    if has_time != (month is not None):
+        raise LoadError(
+            f"{what}: {prev.who} records {name} {'with' if has_time else 'without'} a time "
+            "dimension"
+        )
+    k = 0 if month is None else month
+    if k > last:
+        raise LoadError(
+            f"{what}: {prev.who} covers months 0..{last}, but the loader reads {name}({k})"
+        )
+    return float(values[k, g, 0])
+
+
+def _from_previous(
+    graph: ir.Graph, groups: _Groups, row: int, prev: _Previous, valuation_date: dt.date
+) -> dict[str, float | int]:
+    """The derived fields of one group (design section 9): from the previous run its
+    ``fcf_g(0)``, ``fcf_g(tau)``, ``lc(tau)`` and ``p_g`` (:data:`FROM_PREVIOUS_RUN`), and from
+    the dates ``tau0``, ``tau``, ``i_acc``, ``i_rec`` (:data:`FROM_DATES`), each that the stage
+    declares. Checked first: the previous run values at ``prev_valuation_date`` and holds the
+    group; after, ``csm_prev`` and ``lc_prev`` equal its ``csm(0)`` and ``lc(0)`` within
+    ``1e-12 * P_g``."""
+    gid, at = groups.ids[row], groups.at(row)
+    prev_date = groups.date("prev_valuation_date", row)
+    valued = str(prev.result.manifest["settings"]["valuation_date"])
+    if valued != prev_date.isoformat():
+        raise LoadError(
+            f"{at}: prev_valuation_date is {prev_date}, but {prev.who} values at {valued}"
+        )
+    if gid not in prev.result.ids.tolist():
+        raise LoadError(
+            f"{at}: {prev.who} measured no group {gid}; a group's key does not change (G4)"
+        )
+    rec = groups.date("recognition_date", row)
+    tau0 = _month_index(valuation_date) - _month_index(rec)
+    tau = _month_index(valuation_date) - _month_index(prev_date)
+    out: dict[str, float | int] = {}
+    for name, (variable, month) in FROM_PREVIOUS_RUN.items():
+        if name in graph.fields:
+            k = None if month is None else (0 if month == "0" else tau)
+            unit = graph.fields[name].unit
+            out[name] = _previous_value(prev, variable, gid, k, unit, f"{at}: {name}")
+    dates = {"tau0": tau0, "tau": tau, "i_acc": tau0 - tau, "i_rec": tau0}
+    for name in FROM_DATES:
+        if name in graph.fields:
+            out[name] = dates[name]
+    closing = [(f, v) for f, v in (("csm_prev", "csm"), ("lc_prev", "lc")) if f in groups.columns]
+    if closing:
+        p_g = out.get("p_g_prev")
+        if p_g is None:
+            p_g = _previous_value(prev, "p_g", gid, None, units.MONEY, f"{at}: P_g")
+        for fieldname, variable in closing:
+            given = groups.number(fieldname, row)
+            closed = _previous_value(prev, variable, gid, 0, units.MONEY, f"{at}: {fieldname}")
+            if abs(given - closed) > PREVIOUS_TOLERANCE * abs(p_g):
+                raise LoadError(
+                    f"{at}: {fieldname} = {given!r}, but {prev.who} closed at {variable}(0) = "
+                    f"{closed!r}; they agree within 1e-12 * P_g = {PREVIOUS_TOLERANCE * abs(p_g)!r}"
+                )
+    return out
+
+
+# ---------------------------------------------------------------- structure and locked-in basis
+
+
+def _input_hashes(r: RunResult) -> dict[tuple[str, str], str]:
+    """The sha256 of every scenario file and table a run read, by (kind, name)."""
+    inputs: Mapping[str, Any] = r.manifest["inputs"]
+    out = {("scenario input", n): str(e["sha256"]) for n, e in inputs["scenarios"].items()}
+    out.update({("table", n): str(e["sha256"]) for n, e in inputs["tables"].items()})
+    return out
+
+
+def _share(runs: Sequence[_BasisRun], keep: Callable[[str, str], bool], why: str) -> None:
+    """Every input ``keep`` selects is read from one file by every run in ``runs``."""
+    seen: dict[tuple[str, str], tuple[str, _BasisRun]] = {}
+    for r in runs:
+        for key, sha in _input_hashes(r.result).items():
+            if not keep(*key):
+                continue
+            if key in seen and seen[key][0] != sha:
+                known, other = seen[key]
+                raise LoadError(
+                    f"basis {other.basis} run {other.run_id} and basis {r.basis} run {r.run_id} "
+                    f"read {key[0]} {key[1]} from different files (sha256 {known[:12]}... and "
+                    f"{sha[:12]}...); {why}"
+                )
+            seen.setdefault(key, (sha, r))
+
+
+def _check_structure(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
+    """The structural checks of design section 9: the old and new bases share every financial
+    input (:data:`FINANCIAL_INPUTS`), and the cur and new bases every other table."""
+    if OLD_BASIS in runs and NEW_BASIS in runs:
+        _share(
+            [*runs[OLD_BASIS], *runs[NEW_BASIS]],
+            lambda _kind, name: name in FINANCIAL_INPUTS,
+            "the old and new bases share every financial input (rf_df, cpi, ilp), so that their "
+            "difference is the change in the non-financial tables and the in-force (in-force 5.5)",
+        )
+    if CUR_BASIS in runs and NEW_BASIS in runs:
+        _share(
+            [*runs[CUR_BASIS], *runs[NEW_BASIS]],
+            lambda kind, name: kind == "table" and name not in FINANCIAL_INPUTS,
+            "the cur and new bases share every non-financial table, so that their difference is "
+            "a financial effect (in-force 5.5)",
+        )
+
+
+def _check_locked_in(
+    groups: _Groups,
+    row: int,
+    stage_files: Mapping[str, ReadFile],
+    runs: Mapping[str, Sequence[_BasisRun]],
+) -> dict[str, str]:
+    """A group's locked-in basis (design section 9; in-force 3.3, B72(b)): the three hashes of
+    the groups file against the metadata of the stage's locked-in curves (``p_l``, ``p_rec``:
+    ``source_sha256``, ``ilp_sha256``) and of the locked-in runs' CPI path (``rec_sha256``).
+    Returns the three, which the manifest records."""
+    at = groups.at(row)
+    hashes: dict[str, str] = {}
+    for name in LOCKED_IN_FIELDS:
+        if name not in groups.columns:
+            raise LoadError(f"{groups.file.where}: column {name} is missing")
+        hashes[name] = str(groups.columns[name][row])
+    pairs = (("source_sha256", "discount_rec_sha256"), ("ilp_sha256", "ilp_sha256"))
+    for curve in LOCKED_IN_CURVES:
+        f = stage_files.get(curve)
+        if f is None:
+            continue
+        for meta, name in pairs:
+            got = f.metadata.get(meta)
+            if got is None:
+                raise LoadError(
+                    f"{f.where}: carries no metadata halley.{meta}; a locked-in curve names the "
+                    "files it was built from (design section 10)"
+                )
+            if got != hashes[name]:
+                raise LoadError(
+                    f"{f.where}: halley.{meta} is {got}, but {at} locks in {name} {hashes[name]}"
+                )
+    for basis in (OLD_BASIS, NEW_BASIS):
+        for r in runs.get(basis, ()):
+            entry: Any = r.result.manifest["inputs"]["scenarios"].get(LOCKED_IN_CPI)
+            if entry is None:
+                continue
+            where = (
+                f"basis {basis} run {r.run_id}: scenario input {LOCKED_IN_CPI} ({entry['copy']})"
+            )
+            metadata: Any = entry.get("metadata")
+            got = metadata.get("rec_sha256") if _is_mapping(metadata) else None
+            if got is None:
+                raise LoadError(
+                    f"{where}: carries no metadata halley.rec_sha256; the locked-in CPI path names "
+                    "the recognition path it splices (in-force 5.2)"
+                )
+            if got != hashes["cpi_rec_sha256"]:
+                raise LoadError(
+                    f"{where}: halley.rec_sha256 is {got}, but {at} locks in cpi_rec_sha256 "
+                    f"{hashes['cpi_rec_sha256']}"
+                )
+    return hashes
+
+
+# ------------------------------------------------------------------------------ provenance
+
+
+@dataclass(frozen=True, slots=True)
+class ProvenanceCheck:
+    """What a provenance helper receives (design sections 9 and 10).
+
+    ``file`` is an input that names its source in ``halley.<key> = value``
+    (:data:`PROVENANCE_KEYS`): a hash for ``rebased_from``, a run id for ``derived_from``. The
+    helper recomputes the file from that source and returns the ``pyarrow.Table`` it must equal
+    bit for bit. It finds a file by sha256 with ``find_file`` (among the stage's own inputs and
+    in the directories of the previous run, the runs it read and the stage's bases, verified on
+    read) and a run by id with ``find_run``; ``bases`` are the stage's runs by basis,
+    ``previous`` the previous aggregation run (``None`` at recognition)."""
+
+    key: str
+    value: str
+    file: ReadFile
+    valuation_date: dt.date
+    bases: Mapping[str, Sequence[RunResult]]
+    previous: RunResult | None
+    find_file: Callable[[str], ReadFile]
+    find_run: Callable[[str], RunResult]
+
+
+type ProvenanceHelper = Callable[[ProvenanceCheck], Any]
+"""Recomputes a file from the source it names, as a ``pyarrow.Table``."""
+
+PROVENANCE_HELPERS: dict[str, ProvenanceHelper] = {}
+"""The registry: by metadata key, the helper that recomputes a file carrying it. The section 10
+helpers (stage B3a) register themselves here with :func:`register_provenance`."""
+
+
+def register_provenance(key: str, helper: ProvenanceHelper) -> None:
+    """Register the helper that recomputes a file carrying ``halley.<key>``, replacing any."""
+    if key not in PROVENANCE_KEYS:
+        raise ValueError(f"a provenance key is one of {', '.join(PROVENANCE_KEYS)}, not {key!r}")
+    PROVENANCE_HELPERS[key] = helper
+
+
+class _Finder:
+    """Where a provenance helper looks for a source: the stage's own input files, then the run
+    directories of the previous run, the runs it read and the stage's bases."""
+
+    def __init__(
+        self,
+        files: Sequence[ReadFile],
+        prev: _Previous | None,
+        runs: Mapping[str, Sequence[_BasisRun]],
+        runs_root: Path | None,
+    ) -> None:
+        self._files = list(files)
+        self._dirs: list[tuple[str, Path]] = []
+        self._runs_root = runs_root
+        if prev is not None:
+            self._dirs.append((prev.who, prev.path))
+            recorded: Any = prev.result.manifest.get("bases") or {}
+            for basis, entries in recorded.items():
+                for e in entries:
+                    d = Path(str(e["dir"]))
+                    if not d.is_absolute() and runs_root is not None:
+                        d = Path(runs_root) / d
+                    self._dirs.append((f"{prev.who}'s basis {basis} run {e['run_id']}", d))
+        for rs in runs.values():
+            for r in rs:
+                self._dirs.append((f"basis {r.basis} run {r.run_id}", r.result.run_dir))
+
+    def _manifests(self) -> Iterator[tuple[str, Path, dict[str, Any]]]:
+        for what, d in self._dirs:
+            if (d / "manifest.json").is_file():
+                manifest, _sha = read_manifest(d)
+                yield what, d, manifest
+
+    def file(self, sha256: str) -> ReadFile:
+        for f in self._files:
+            if f.sha256 == sha256:
+                return f
+        for what, d, manifest in self._manifests():
+            for name, rel, sha in run_files(manifest):
+                if sha == sha256:
+                    return read_copy(d, {"copy": rel, "sha256": sha}, f"{what}: {name}")
+        raise LoadError(
+            f"no file with sha256 {sha256} in the stage's inputs, the previous run, the runs it "
+            "read or the stage's bases"
+        )
+
+    def run(self, run_id: str) -> RunResult:
+        for _what, d, manifest in self._manifests():
+            if manifest.get("run_id") == run_id:
+                verify_run(d)
+                return load_run(d)
+        if self._runs_root is not None:
+            d = find_run(run_id, self._runs_root)
+            verify_run(d)
+            return load_run(d)
+        raise LoadError(f"no run {run_id} among the previous run, the runs it read or the bases")
+
+
+def _provenance_files(
+    runs: Mapping[str, Sequence[_BasisRun]], own: Sequence[ReadFile]
+) -> Iterator[ReadFile]:
+    """Every input that names its source: a basis run's copied inputs whose manifest metadata
+    carries a provenance key (read from the copy, verified), then the stage's own files."""
+    for basis, rs in runs.items():
+        for r in rs:
+            inputs: Mapping[str, Any] = r.result.manifest["inputs"]
+            entries: list[tuple[str, Any]] = [("model points", inputs["model_points"])]
+            entries += [(f"table {n}", e) for n, e in inputs["tables"].items()]
+            entries += [(f"scenario input {n}", e) for n, e in inputs["scenarios"].items()]
+            for what, e in entries:
+                meta: Mapping[str, Any] = e.get("metadata") or {}
+                if any(key in meta for key in PROVENANCE_KEYS):
+                    yield read_copy(r.result.run_dir, e, f"basis {basis} run {r.run_id}: {what}")
+    for f in own:
+        if any(key in f.metadata for key in PROVENANCE_KEYS):
+            yield f
+
+
+def _verify_provenance(
+    files: Iterator[ReadFile],
+    finder: _Finder,
+    valuation_date: dt.date,
+    runs: Mapping[str, Sequence[_BasisRun]],
+    prev: _Previous | None,
+) -> list[dict[str, str]]:
+    """Each file that names its source is recomputed by the helper registered for its key and
+    must equal what it gives bit for bit (design section 9, "Provenance verification"); a file
+    whose key has no helper is a LoadError too, since it cannot be verified. Returns what the
+    manifest records of each."""
+    bases = {b: [r.result for r in rs] for b, rs in runs.items()}
+    previous = None if prev is None else prev.result
+    record: list[dict[str, str]] = []
+    for f in files:
+        for key in PROVENANCE_KEYS:
+            value = f.metadata.get(key)
+            if value is None:
+                continue
+            helper = PROVENANCE_HELPERS.get(key)
+            if helper is None:
+                raise LoadError(
+                    f"{f.where}: carries halley.{key} = {value}, but no helper is registered to "
+                    "recompute it (register_provenance); a file that names its source is "
+                    "verified against it (design section 9)"
+                )
+            check = ProvenanceCheck(
+                key, value, f, valuation_date, bases, previous, finder.file, finder.run
+            )
+            try:
+                table = helper(check)
+            except LoadError:
+                raise
+            except Exception as exc:  # the helper's own failure
+                raise LoadError(
+                    f"{f.where}: recomputing it from halley.{key} = {value} raised "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            difference = file_difference(f, table)
+            if difference is not None:
+                raise LoadError(
+                    f"{f.where}: it is not what its source (halley.{key} = {value}) gives: "
+                    f"{difference}; a file that names its source equals the recomputed file bit "
+                    "for bit"
+                )
+            record.append({"file": f.label, "sha256": f.sha256, "key": key, "value": value})
+    return record
+
+
+# ----------------------------------------------------------------------------- disclosures
+
+
+def _disclosures(
+    stage: type[Aggregation],
+    runs: Mapping[str, Sequence[_BasisRun]],
+    stage_files: Mapping[str, ReadFile],
+) -> dict[str, Any]:
+    """The manifest's ``disclosures`` block (design section 9, "Outputs"): the confidence level
+    (para 119), ``alpha`` of the cur basis's ``ra_param`` copies; the sha256 of the para 120
+    curve, the stage's ``df_cur`` file; then what the stage declares (:attr:`Aggregation.
+    disclosures`). ``None`` where the stage reads no such input."""
+    table, column = CONFIDENCE_LEVEL
+    levels: dict[float, str] = {}
+    for r in runs.get(CUR_BASIS, ()):
+        entry: Any = r.result.manifest["inputs"]["tables"].get(table)
+        if entry is None:
+            continue
+        f = read_copy(r.result.run_dir, entry, f"basis {CUR_BASIS} run {r.run_id}: table {table}")
+        cols = table_columns(f)
+        if column in cols and len(cols[column]) == 1:
+            levels.setdefault(float(cols[column][0]), r.run_id)
+    if len(levels) > 1:
+        listing = "; ".join(f"run {rid}: {level!r}" for level, rid in levels.items())
+        raise LoadError(
+            f"the runs of basis {CUR_BASIS} read different confidence levels: {listing}"
+        )
+    curve = stage_files.get(PARA_120_CURVE)
+    declared = {k: list(v) if isinstance(v, tuple) else v for k, v in stage.disclosures.items()}
+    return {
+        "confidence_level": next(iter(levels), None),
+        "para_120_curve_sha256": None if curve is None else curve.sha256,
+        **declared,
+    }
+
+
+# ------------------------------------------------------------------------ the entry points
+
+
+@dataclass(frozen=True, slots=True)
+class StageInputs:
+    """What :func:`load_aggregation_inputs` hands :func:`~halley.runtime.run.run`: the stage's
+    model points, its group series and the record of what it read."""
+
+    model_points: Any
+    """A ``pyarrow.Table``: the groups file's rows with ``group_id`` and the derived fields."""
+    series: dict[str, LoadedSeries]
+    record: StageRecord
+
+
+def _stage_of(compiled: CompiledModel) -> type[Aggregation]:
+    model = compiled.model
+    if not issubclass(model, Aggregation):
+        raise LoadError(
+            f"{compiled.name} is a projection; run_aggregation runs an aggregation stage"
+        )
+    return model
+
+
+def load_aggregation_inputs(
+    compiled: CompiledModel,
+    *,
+    groups: Source,
+    bases: Mapping[str, Sequence[RunResult | Path | str]],
+    scenarios: Mapping[str, Source] | None = None,
+    tables: Mapping[str, Source] | None = None,
+    previous: Path | None = None,
+    settings: RunSettings,
+) -> StageInputs:
+    """The loader of design section 9, "Loader and runs", in order: each basis's runs from their
+    directories, every file verified (:func:`_basis_run`) and checked as a :class:`Basis`, at
+    the stage's valuation date; the groups file and its rules (:func:`_read_groups`); G1
+    (:func:`require_one_group`); the previous run by ``prev_run_id`` (:func:`_resolve_previous`)
+    and G4 against its members, or, without one, one group key per policy across the bases;
+    every member mapped to exactly one group row, issued on its recognition date; the
+    structural hashes; the locked-in hashes; the provenance of every file that names a source;
+    the derived group fields; the group series, summed in ascending policy id across each
+    basis's runs (:func:`group_series`); and the manifest blocks. A LoadError names the file and
+    the row or key of the first failure."""
+    stage = _stage_of(compiled)
+    graph = compiled.graph
+    valuation_date = settings.valuation_date
+    declared = _bases(stage)
+    for b in declared:
+        if b.name not in bases:
+            raise LoadError(f"{stage.__qualname__} reads basis {b.name}, which was not given")
+    names = {b.name for b in declared}
+    for name in bases:
+        if name not in names:
+            raise LoadError(
+                f"basis {name!r} was given but {stage.__qualname__} declares no such basis"
+            )
+    runs: dict[str, list[_BasisRun]] = {
+        b.name: [_basis_run(b.name, given) for given in _runs_of(b.name, bases[b.name])]
+        for b in declared
+    }
+    for b in declared:
+        info = b.check([r.result for r in runs[b.name]])
+        if info.valuation_date != valuation_date:
+            raise LoadError(
+                f"basis {b.name} values at {info.valuation_date}, but the stage at "
+                f"{valuation_date} (RunSettings.valuation_date); a stage and its bases share one "
+                "valuation date"
+            )
+    group_rows = _read_groups(groups, valuation_date)
+    require_one_group(group_rows.ids, group_rows.file.where)  # G1, the rule's one place
+    prev = _resolve_previous(graph, group_rows, previous, settings)
+    if prev is None:
+        _check_keys_agree(runs)
+    else:
+        _check_g4(runs, prev)
+    members = _members_by_group(runs, group_rows)
+    _check_structure(runs)
+    stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
+    table_files = {n: read_source(s, f"table {n}") for n, s in (tables or {}).items()}
+    locked_in: dict[str, dict[str, str]] = {}
+    if any(name in graph.fields for name in LOCKED_IN_FIELDS):
+        for row, gid in enumerate(group_rows.ids):
+            locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs)
+    derived: dict[str, list[Any]] = {GROUP_ID: list(group_rows.ids)}
+    wanted = [name for name in FROM_PREVIOUS if name in graph.fields]
+    if wanted and prev is None:
+        raise LoadError(f"the stage declares {', '.join(wanted)}, which come from a previous run")
+    if prev is not None:
+        rows = [
+            _from_previous(graph, group_rows, row, prev, valuation_date)
+            for row in range(len(group_rows.ids))
+        ]
+        for name in wanted:
+            derived[name] = [values[name] for values in rows]
+    own = [group_rows.file, *stage_files.values(), *table_files.values()]
+    finder = _Finder(own, prev, runs, settings.runs_root)
+    provenance = _verify_provenance(
+        _provenance_files(runs, own), finder, valuation_date, runs, prev
+    )
+    series = group_series(
+        stage,
+        {name: [r.result for r in rs] for name, rs in runs.items()},
+        members,
+        runs_root=settings.runs_root,
+    )
+    root = settings.runs_root
+    blocks: dict[str, Any] = {
+        "previous": None
+        if prev is None
+        else {
+            "run_id": prev.run_id,
+            "dir": _dir_label(prev.path, root),
+            "manifest_sha256": prev.manifest_sha256,
+        },
+        "bases": {
+            name: [
+                {
+                    "run_id": r.run_id,
+                    "dir": _dir_label(r.result.run_dir, root),
+                    "manifest_sha256": r.manifest_sha256,
+                    "outputs_sha256": _outputs_sha256(r.result.manifest),
+                }
+                for r in rs
+            ]
+            for name, rs in runs.items()
+        },
+        "membership": {
+            "key": list(GROUP_KEY),
+            "groups": {
+                gid: {
+                    name: [
+                        _plain(p)
+                        for p in _sorted_ids(
+                            [m.pid for r in rs for m in r.members if m.group == gid]
+                        ).tolist()
+                    ]
+                    for name, rs in runs.items()
+                }
+                for gid in group_rows.ids
+            },
+        },
+        "locked_in": locked_in or None,
+        "provenance": provenance,
+        "disclosures": _disclosures(stage, runs, stage_files),
+    }
+    columns: dict[str, NDArray[Any]] = {
+        name: np.asarray(values, dtype=_dtype(values)) for name, values in derived.items()
+    }
+    return StageInputs(
+        with_columns(group_rows.file, columns),
+        series,
+        StageRecord(group_rows.file, with_columns(None, columns), blocks),
+    )
+
+
+def _dtype(values: Sequence[object]) -> Any:
+    """The NumPy dtype of a derived column: the group ids as objects (strings), the month counts
+    as int64, the amounts as float64."""
+    if all(isinstance(v, str) for v in values):
+        return object
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in values):
+        return np.int64
+    return np.float64
+
+
+def run_aggregation(
+    compiled: CompiledModel,
+    *,
+    groups: Source,
+    bases: Mapping[str, Sequence[RunResult | Path | str]],
+    scenarios: Mapping[str, Source] | None = None,
+    tables: Mapping[str, Source] | None = None,
+    previous: Path | None = None,
+    settings: RunSettings,
+    run_dir: str | Path,
+) -> RunResult:
+    """Run an aggregation stage on its groups file and bases (design section 9): the inputs are
+    loaded and checked by :func:`load_aggregation_inputs`, then the stage runs as any model does
+    (:func:`~halley.runtime.run.run`), its outputs keyed on ``group_id`` with ``outputs.kind =
+    "aggregation"``. Its run directory copies everything the stage read (the groups file,
+    ``inputs/derived_groups.parquet``, every series with a mean's ``.pathwise`` sibling, the
+    scenario and table files) and its manifest records the previous run, every run of every
+    basis, the membership, the locked-in hashes, the provenance checks and the disclosures, so
+    that :func:`replay_aggregation` re-runs it from the directory alone. Its run id covers the
+    IR, the groups file, every series' values, every scenario and table file, the previous
+    run's id and manifest hash, the settings but ``label``, ``runs_root`` and ``workers``, the
+    backend and the horizon: not where any run lives."""
+    if (Path(run_dir) / "manifest.json").exists():
+        raise LoadError(f"{run_dir} already holds a run; use a new directory for each run")
+    loaded = load_aggregation_inputs(
+        compiled,
+        groups=groups,
+        bases=bases,
+        scenarios=scenarios,
+        tables=tables,
+        previous=previous,
+        settings=settings,
+    )
+    return run(
+        compiled,
+        model_points=loaded.model_points,
+        tables=dict(tables) if tables is not None else None,
+        scenarios=dict(scenarios) if scenarios is not None else None,
+        settings=settings,
+        run_dir=run_dir,
+        series=loaded.series,
+        stage_record=loaded.record,
+    )
+
+
+def replay_aggregation(
+    compiled: CompiledModel, from_run: str | Path, *, run_dir: str | Path
+) -> RunResult:
+    """Re-run an aggregation run from its own directory alone (D21): every file the manifest
+    records a hash for is verified, then the stage runs on the copies (the groups file and the
+    derived group fields, every series, the scenario and table files) with the recorded
+    settings, into ``run_dir``. The bases and the previous run are not read, so they may have
+    moved or gone; the manifest blocks that record them are carried over, with
+    ``replayed_from``. The replay has the run's id when nothing it covers changed (the same IR,
+    backend and NumPy). ``compiled`` is the stage that made the run: a run directory holds the
+    generated code, not the model, and a stage with another IR is a LoadError."""
+    source = Path(from_run)
+    manifest = verify_run(source, "replayed run")
+    inputs: Mapping[str, Any] = manifest["inputs"]
+    if manifest.get("outputs", {}).get("kind") != "aggregation" or "groups" not in inputs:
+        raise LoadError(f"{source} holds no run made by run_aggregation; nothing to replay")
+    if manifest.get("ir_sha256") != compiled.ir_hash:
+        raise LoadError(
+            f"{source} was made by a stage with ir_sha256 {manifest.get('ir_sha256')}, but "
+            f"{compiled.name} has {compiled.ir_hash}; replay it with the stage that made it"
+        )
+    groups = read_copy(source, inputs["groups"], "groups")
+    derived = read_copy(source, inputs["derived_groups"], "derived group fields")
+    series = {
+        name: read_series_copy(source, name, entry, GROUP_ID, f"series {name}")
+        for name, entry in inputs["series"].items()
+    }
+    scenarios: dict[str, Source] = {
+        name: source / str(e["copy"]) for name, e in inputs["scenarios"].items()
+    }
+    tables: dict[str, Source] = {
+        name: source / str(e["copy"]) for name, e in inputs["tables"].items()
+    }
+    blocks = {key: manifest[key] for key in STAGE_BLOCKS if key in manifest}
+    blocks["replayed_from"] = {"run_id": manifest["run_id"], "dir": str(source.resolve())}
+    record = StageRecord(groups, table_of(derived), blocks)
+    return run(
+        compiled,
+        model_points=with_columns(groups, table_columns(derived)),
+        tables=tables,
+        scenarios=scenarios,
+        settings=RunSettings.from_dict(manifest["settings"]),
+        run_dir=run_dir,
+        series=series,
+        stage_record=record,
+    )
