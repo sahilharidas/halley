@@ -308,6 +308,7 @@ def run(
     stage = model.series_declarations() is not None
     if series and not stage:
         raise LoadError(f"{graph.model} is a projection; group series are read by a stage")
+    lanes = "groups" if stage else "policies"  # what the messages call the model points
     inputs = load_inputs(
         graph,
         compiled.schema,
@@ -320,6 +321,7 @@ def run(
         scenario_contracts={s.name: s for s in model.scenario_inputs},
         input_rules=model.input_rules,
         series=series,
+        lanes=lanes,
     )
     horizon = inputs.H
     n_pol = len(inputs.ids)
@@ -332,10 +334,10 @@ def run(
     for lo in range(0, n_pol, bs):
         hi = min(lo + bs, n_pol)
         inp = inputs.batch(graph, lo, hi)
-        out = run_batch(compiled.fn, graph, inp, horizon, "groups" if stage else "policies")
+        out = run_batch(compiled.fn, graph, inp, horizon, lanes)
         batch_scales = {u: s[lo:hi] for u, s in scales.items()}
-        results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales)
-        view = BatchView(graph, out, inputs, lo, hi, batch_scales)
+        results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales, lanes)
+        view = BatchView(graph, out, inputs, lo, hi, batch_scales, lanes)
         results.extend(check_declared(model.invariants, view))
         batches.append(results)
         for name in needed:

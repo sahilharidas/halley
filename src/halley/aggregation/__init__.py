@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from halley.aggregation.stage import Aggregation, Basis, GroupSum, group_series, sequential_sum
+from halley.aggregation.stage import (
+    Aggregation,
+    Basis,
+    BasisInfo,
+    GroupSum,
+    group_series,
+    sequential_sum,
+)
 from halley.errors import HalleyError, RunError
 
 if TYPE_CHECKING:
@@ -63,6 +70,7 @@ def portfolio_totals(result: RunResult, variables: list[str]) -> dict[str, NDArr
 __all__ = [
     "Aggregation",
     "Basis",
+    "BasisInfo",
     "GroupSum",
     "HasScenarios",
     "group_series",

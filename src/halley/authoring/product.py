@@ -463,5 +463,40 @@ class Product:
     def series_declarations(cls) -> dict[str, ir.SeriesDecl] | None:
         """The group series the model reads, by name, validated; ``None`` for a projection,
         which has no ``self.series`` (reads across policies belong to the aggregation stage).
-        The tracer calls it once, before it traces the formulas."""
+        The tracer calls it once, before it traces the formulas.
+
+        A projection that sets ``bases`` or ``series`` as a stage does is a BuildError at the
+        class: nothing would read the declarations, so the class was meant to be a stage. A
+        ``@var`` or a build-time parameter of either name is the projection's own."""
+        for name in _STAGE_DECLARATIONS:
+            value: object = getattr(cls, name, None)
+            if _is_stage_declaration(value):
+                raise BuildError(
+                    f"{cls.__qualname__} sets {name}, which an aggregation stage declares; a "
+                    "projection reads no group series, so derive the class from "
+                    "halley.Aggregation",
+                    _class_loc(cls),
+                )
         return None
+
+
+_STAGE_DECLARATIONS = ("bases", "series")
+"""The class attributes of an aggregation stage that a projection does not have."""
+
+
+def _is_stage_declaration(value: object) -> bool:
+    """A non-empty tuple or list (of ``Basis`` or ``GroupSum``), or one declaration written
+    without the tuple around it (an object of :mod:`halley.aggregation`)."""
+    if isinstance(value, (tuple, list)):
+        return len(cast(tuple[object, ...], value)) > 0
+    return type(value).__module__.startswith("halley.aggregation")
+
+
+def _class_loc(cls: type) -> Loc | None:
+    """Where a class is defined, for an error about the class rather than a method."""
+    try:
+        file = inspect.getsourcefile(cls)
+        _lines, line = inspect.getsourcelines(cls)
+    except (OSError, TypeError):
+        return None
+    return None if file is None else Loc(file, line, cls.__qualname__)

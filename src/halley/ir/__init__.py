@@ -316,15 +316,20 @@ class SeriesDecl:
     scenarios)`` array. ``has_time`` says whether it has a month axis; ``start`` is the first
     month of its domain (0 for a sum of states, 1 for a sum of month quantities); ``scenario``
     is true when it keeps the basis's scenarios (``"each"``) and false for their mean, whose
-    scenario axis has size 1. The scenario axis exists either way (D4). ``loc`` is the line of
-    the ``GroupSum`` that declares it, for the checker's messages; it is neither compared nor
-    part of the repr, so it stays out of the graph hash."""
+    scenario axis has size 1. The scenario axis exists either way (D4). ``basis`` and
+    ``variables`` say what is summed, the outputs in the order their group totals are added:
+    they are the stage's input contract, which the loader holds every series it is given to, so
+    they are in the repr and the graph hash (a stage edited to sum other outputs is another
+    stage). ``loc`` is the line of the ``GroupSum`` that declares it, for the checker's
+    messages; it is neither compared nor part of the repr, so it stays out of the graph hash."""
 
     name: str
     unit: Unit
     has_time: bool
     start: int
     scenario: bool
+    basis: str
+    variables: tuple[str, ...]
     doc: str = ""
     loc: Loc | None = field(default=None, compare=False, repr=False)
 

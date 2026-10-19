@@ -28,10 +28,13 @@ from halley import (
     Basis,
     BuildError,
     BuildWarning,
+    Count,
     CoverageUnits,
     Factor,
     GroupSum,
+    InputRule,
     Int,
+    Invariant,
     LoadError,
     Money,
     Product,
@@ -50,7 +53,7 @@ from halley import (
     trace,
     var,
 )
-from halley.aggregation import group_series
+from halley.aggregation import BasisInfo, group_series
 from halley.authoring import int_field
 from halley.errors import Loc
 from halley.ir import units as u
@@ -157,10 +160,12 @@ def _series(res: RunResult) -> dict[str, LoadedSeries]:
 def test_a_stage_declares_its_series_in_the_ir() -> None:
     graph = trace(Release)
     assert graph.series == {
-        "cu_g": ir.SeriesDecl("cu_g", u.COVERAGE_UNITS, True, 1, False),
-        "fcf_g": ir.SeriesDecl("fcf_g", u.MONEY, True, 0, False),
-        "p_g": ir.SeriesDecl("p_g", u.MONEY, False, 0, False),
+        "cu_g": ir.SeriesDecl("cu_g", u.COVERAGE_UNITS, True, 1, False, "cur", ("cu",)),
+        "fcf_g": ir.SeriesDecl("fcf_g", u.MONEY, True, 0, False, "cur", ("fcf",)),
+        "p_g": ir.SeriesDecl("p_g", u.MONEY, False, 0, False, "cur", ("premium_total",)),
     }
+    both = GroupSum("fcf_g", "cur", ("bel", "ra"), "Money", start=0).decl()
+    assert both.variables == ("bel", "ra")  # in the order their totals are added
     each = dataclasses.replace(FCF_G, scenarios="each")
     assert each.decl().scenario  # "each" keeps the basis's scenarios; a mean has one
     assert Growth.series_declarations() is None  # a projection reads no series
@@ -188,14 +193,30 @@ def test_render_writes_series_reads_as_the_model_does() -> None:
 
 def test_the_graph_hash_covers_the_series_declarations() -> None:
     """Series declarations are hashed like scenario declarations: the same stage gives the same
-    hash, and a series' domain or scenario treatment changes it even where no formula does. A
-    projection declares none, so its hash is unchanged (the pinned hashes in test_tracing)."""
+    hash, and a series' domain, scenario treatment, basis or variables change it even where no
+    formula does, so a stage edited in place to sum other outputs gets another ir_sha256 and
+    another run id (D21). A projection declares none, so its hash is unchanged (the pinned
+    hashes in test_tracing)."""
     base = ir.graph_hash(trace(Release))
     assert ir.graph_hash(trace(Release)) == base
-    for change in ({"scenario": True}, {"start": 1}, {"unit": u.FACTOR}):
+    for change in (
+        {"scenario": True},
+        {"start": 1},
+        {"unit": u.FACTOR},
+        {"basis": "old"},
+        {"variables": ("fcf", "cf")},
+        {"variables": ("cf", "fcf")},  # another order adds the totals in another order
+    ):
         g = trace(Release)
         g.series["fcf_g"] = dataclasses.replace(g.series["fcf_g"], **change)
         assert ir.graph_hash(g) != base, change
+
+    class Edited(Release):
+        pass
+
+    before = ir.graph_hash(trace(Edited))
+    Edited.series = (CU_G, GroupSum("fcf_g", "cur", ("fcf", "cf"), "Money", start=0), P_G)
+    assert ir.graph_hash(trace(Edited)) != before  # the same formulas, another sum
 
 
 def test_series_units_come_from_the_declaration() -> None:
@@ -449,6 +470,10 @@ def test_the_declarations_are_validated_at_trace() -> None:
         ({"variables": ()}, "series s names its variables"),
         ({"variables": ["cu"]}, "series s names its variables"),
         ({"variables": ("cu", 3)}, "series s names its variables"),
+        ({"variables": "two words"}, "series s: 'two words' is not the name of a variable"),
+        ({"variables": ("fcf", "1cf")}, "series s: '1cf' is not the name of a variable"),
+        ({"variables": ("fcf", "fcf")}, "series s names fcf twice; each output is summed once"),
+        ({"variables": ("bel", "ra", "bel")}, "series s names bel twice"),
         ({"name": 3}, "a series is named like a variable, not 3"),
         ({"name": "two words"}, "a series is named like a variable, not 'two words'"),
         ({"basis": 3}, "series s: its basis is a Basis name, not 3"),
@@ -464,6 +489,56 @@ def test_the_declarations_are_validated_at_trace() -> None:
             Basis(name)
         assert info.value.loc is not None
         assert Path(info.value.loc.file) == Path(__file__)
+
+    class ByPolicy(Release):  # the addendum: a stage's outputs are keyed on group_id
+        model_point = SIMPLE_SCHEMA
+
+    with pytest.raises(
+        BuildError,
+        match=r"ByPolicy.model_point keys its rows on 'policy_id'; a stage's model points are "
+        r"groups, keyed on 'group_id'",
+    ) as info:
+        trace(ByPolicy)
+    _at_class(info.value.loc, ByPolicy)
+
+    class NotAStage(Product):  # a projection would ignore these declarations
+        model_point = SIMPLE_SCHEMA
+        bases = (Basis("cur"),)
+        series = (CU_G,)
+
+        @var
+        def x(self, t: Int) -> Int:
+            return t
+
+    with pytest.raises(
+        BuildError,
+        match=r"NotAStage sets bases, which an aggregation stage declares; a projection reads "
+        r"no group series, so derive the class from halley.Aggregation",
+    ) as info:
+        trace(NotAStage)
+    _at_class(info.value.loc, NotAStage)
+
+    class OneSeries(Product):  # a single declaration, its tuple's comma forgotten
+        model_point = SIMPLE_SCHEMA
+        series = CU_G
+
+        @var
+        def x(self, t: Int) -> Int:
+            return t
+
+    with pytest.raises(BuildError, match="OneSeries sets series, which an aggregation stage"):
+        trace(OneSeries)
+
+    class OwnSeries(Product):  # a projection's own variable named series is its business
+        model_point = SIMPLE_SCHEMA
+        bases = ()
+
+        @var
+        def series(self, t: Int) -> Int:
+            return t
+
+    assert trace(OwnSeries).series == {}
+
     # one declaration, and one hash, whatever the spelling: start=1 is the default
     spelled = GroupSum("s", "cur", "cu", "Money", start=1).decl()
     assert repr(spelled) == repr(GroupSum("s", "cur", "cu", "Money").decl())
@@ -511,9 +586,29 @@ def test_a_group_sum_adds_only_what_adds_across_policies() -> None:
     assert loc.line == _line_of("decl: big_g"), loc
     assert loc.function.endswith("SumsFlags"), loc
     with pytest.raises(BuildError, match="scenarios is 'mean' or 'each', not 'all'") as info:
-        dataclasses.replace(CU_G, scenarios="all")
-    assert info.value.loc is not None  # the replace() line here, not inside dataclasses
-    assert Path(info.value.loc.file) == Path(__file__)
+        dataclasses.replace(CU_G, scenarios="all")  # decl: replace
+    loc = info.value.loc
+    assert loc is not None  # the replace() line here, not inside dataclasses, nor CU_G's line
+    assert Path(loc.file) == Path(__file__), loc
+    assert loc.line == _line_of("decl: replace"), loc
+    copied = dataclasses.replace(Release.series[0], scenarios="each")  # decl: copied
+    assert copied.loc is not None
+    assert Path(copied.loc.file) == Path(__file__), copied.loc  # not Release's, in models.py
+    assert copied.loc.line == _line_of("decl: copied"), copied.loc
+
+    class BadBasis(Release):  # a subclass that replaces its parent's GroupSum
+        series = (
+            dataclasses.replace(Release.series[0], basis="nope"),  # decl: nope
+            *Release.series[1:],
+        )
+
+    with pytest.raises(
+        BuildError, match=r"series cu_g sums basis 'nope', which .*BadBasis does not declare"
+    ) as info:
+        trace(BadBasis)
+    _at_class(info.value.loc, BadBasis)  # the subclass's line, not Release's in models.py
+    assert info.value.loc is not None
+    assert info.value.loc.line == _line_of("decl: nope")
     with pytest.raises(BuildError, match="build one of its subclasses"):
         build(Aggregation)
 
@@ -585,6 +680,8 @@ def test_the_stage_run_directory_keeps_its_series(
         entry["valuation_date"] == VAL.isoformat() == stage.manifest["settings"]["valuation_date"]
     )
     assert entry["members"] == [[g, sorted(m)] for g, m in sorted(MEMBERS.items())]
+    assert entry["basis_horizon"] == 12
+    assert stage.manifest["inputs"]["series"]["p_g"]["basis_horizon"] == 12  # a scalar too
     assert len(entry["values_sha256"]) == 64
     assert entry["values_sha256"] != entry["sha256"]  # what the run id covers, not the file
     table = pq.read_table(copy)
@@ -924,6 +1021,27 @@ def test_the_mean_over_a_two_scenario_basis(
         assert per_scenario.lane("lc", g, 1)[0] > 0
         assert per_scenario.lane("csm", g, 1)[0] == 0.0
 
+    # the interpreter reads each scenario of an "each" series, as the generated code does: fcf_g
+    # differs between the scenarios (cu_g and p_g do not), so a read of scenario 0 for scenario
+    # 1 gives other values for csm_0, lc_0 and lc
+    graph = per_scenario.graph
+    assert graph is not None
+    for name, v in graph.variables.items():
+        for g in per_scenario.ids:
+            for s in (0, 1):
+                lane = per_scenario.lane(name, g, s)
+                for t in range(per_scenario.H + 1 if v.has_time else 1):
+                    assert recompute(per_scenario, g, name, t, s) == lane[t], (name, g, t, s)
+    fcf_g, cu_g = each["fcf_g"].values, each["cu_g"].values
+    e = explain(per_scenario, "G1", "lc", 3, scenario=1)
+    assert dict(e.inputs)["series.fcf_g(t)"] == fcf_g[3, 1, 1] != fcf_g[3, 1, 0]
+    assert dict(e.inputs)["series.fcf_g(t-1)"] == fcf_g[2, 1, 1]
+    assert e.value == per_scenario.lane("lc", "G1", 1)[3]
+    e0 = explain(per_scenario, "G0", "csm_0", scenario=1)
+    assert dict(e0.inputs)["series.fcf_g.at(0)"] == fcf_g[0, 0, 1] != fcf_g[0, 0, 0]
+    e_cu = explain(per_scenario, "G1", "cu_next", 3, scenario=1)
+    assert dict(e_cu.inputs)["series.cu_g(t+1)"] == cu_g[4, 1, 1]
+
 
 def test_the_mean_over_three_scenarios_is_a_sequential_sum_of_thirds(tmp_path: Path) -> None:
     """With J = 3 the mean is ``((1/3) x0 + (1/3) x1) + (1/3) x2`` bit for bit (para 33(a):
@@ -1126,7 +1244,11 @@ def test_the_loader_checks_each_series_against_the_stage(
     # D21: a series says where it came from, and holds float64 values the stage computes on
     cu_g, p_g = series["cu_g"], series["p_g"]
     for provenance, missing in (
-        ({}, "basis, variables, basis_scenarios, valuation_date, source_runs, members"),
+        (
+            {},
+            "basis, variables, basis_scenarios, valuation_date, basis_horizon, source_runs, "
+            "members",
+        ),
         ({k: v for k, v in cu_g.provenance.items() if k != "members"}, "members"),
     ):
         bare = {**series, "cu_g": dataclasses.replace(cu_g, provenance=provenance)}
@@ -1136,6 +1258,13 @@ def test_the_loader_checks_each_series_against_the_stage(
             r"that say where they came from \(halley.aggregation.group_series, D21\)",
         ):
             run_stage(tmp_path, Release, bare, name="bare")
+    for reach in (0, 12.0, True, "12", None):
+        recorded = {**cu_g.provenance, "basis_horizon": reach}
+        odd = {**series, "cu_g": dataclasses.replace(cu_g, provenance=recorded)}
+        with pytest.raises(
+            LoadError, match=rf"series cu_g: its provenance records basis_horizon {reach!r}, not"
+        ):
+            run_stage(tmp_path, Release, odd, name="reach")
     for name, values, kind in (
         ("cu_g", cu_g.values.astype(np.float32), "float32"),
         ("p_g", np.array([[[3], [4]]], dtype=np.int64), "int64"),
@@ -1205,7 +1334,7 @@ def test_the_stage_values_at_its_bases_valuation_date(tmp_path: Path) -> None:
     LoadError naming the series and its basis (D11: a time-reference mistake)."""
     june = dt.date(2027, 6, 1)
     later = release_bases(tmp_path / "later", valuation_date=june)
-    assert Basis("cur").check(later["cur"]) == june
+    assert Basis("cur").check(later["cur"]) == BasisInfo(june, 12)
     series = group_series(Release, later, MEMBERS)
     assert {s.provenance["valuation_date"] for s in series.values()} == {"2027-06-01"}
     with pytest.raises(
@@ -1317,3 +1446,155 @@ def test_a_series_no_formula_reads_warns_and_sets_no_scenarios(
             settings=settings,
             run_dir=tmp_path / "b",
         )
+
+
+# ------------------------------------------------------------------- the stage's input contract
+
+
+def test_a_stage_runs_only_on_series_of_what_it_declares(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """D21: a GroupSum's basis and variables are the stage's input contract, and in its graph
+    hash. Release's series (fcf_g sums fcf of basis cur) given to a stage whose fcf_g sums
+    fcf + cf, or fcf of basis old, is a LoadError naming both sums; each stage runs on its own.
+    The horizon follows the declaration's basis: old's fcf_g, read relatively, is cut to cur's
+    horizon."""
+    series = group_series(Release, cur, MEMBERS)
+
+    class MoreVariables(Release):
+        series = (CU_G, GroupSum("fcf_g", "cur", ("fcf", "cf"), "Money", start=0), P_G)
+
+    with pytest.raises(
+        LoadError,
+        match=r"^series fcf_g: the stage sums fcf \+ cf of basis cur but was given fcf of basis "
+        r"cur$",
+    ):
+        run_stage(tmp_path, MoreVariables, series, name="more")
+    own = group_series(MoreVariables, cur, MEMBERS)
+    assert own["fcf_g"].provenance["variables"] == ["fcf", "cf"]
+    with pytest.raises(
+        LoadError,
+        match=r"^series fcf_g: the stage sums fcf of basis cur but was given fcf \+ cf of basis "
+        r"cur$",
+    ):
+        run_stage(tmp_path, Release, {**series, "fcf_g": own["fcf_g"]}, name="fewer")
+
+    class OtherBasis(Release):
+        bases = (Basis("cur"), Basis("old"))
+        series = (CU_G, GroupSum("fcf_g", "old", "fcf", "Money", start=0), P_G)
+
+    with pytest.raises(
+        LoadError,
+        match=r"^series fcf_g: the stage sums fcf of basis old but was given fcf of basis cur$",
+    ):
+        run_stage(tmp_path, OtherBasis, series, name="other")
+    on_old = group_series(OtherBasis, {**cur, **_old_basis(tmp_path, 24)}, MEMBERS)
+    assert on_old["fcf_g"].provenance["basis"] == "old"
+    res = run_stage(tmp_path, OtherBasis, on_old, name="other-own")
+    assert res.H == 12  # cur's horizon, though fcf_g's basis runs to 24
+    assert _series(res)["fcf_g"].values.shape == (13, 2, 1)
+    assert ir.graph_hash(trace(OtherBasis)) != ir.graph_hash(trace(Release))
+
+
+def test_a_cur_basis_of_scalars_sets_the_stage_horizon(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """Design section 9, "Horizon": the stage's H is its cur basis's even when cur supplies only
+    series without a time dimension, because every series records the horizon of its basis's
+    runs (basis_horizon). Beside an old basis with H = 24 read relatively, the stage runs to
+    cur's H = 12, and RunSettings.horizon = 24 is a LoadError naming the cur series."""
+
+    class ScalarCur(Aggregation):
+        model_point = STAGE_SCHEMA
+        bases = (Basis("cur"), Basis("old"))
+        series = (
+            GroupSum("p_g", "cur", "premium_total", "Money", time=False),
+            GroupSum("cu_old", "old", "cu", "CoverageUnits"),
+        )
+
+        @var
+        def premium(self) -> Money:
+            return self.series.p_g()
+
+        @var
+        def units(self, t: Int) -> CoverageUnits:
+            return self.series.cu_old(t)
+
+    old = _old_basis(tmp_path, 24)
+    series = group_series(ScalarCur, {**cur, **old}, MEMBERS)
+    assert series["p_g"].provenance["basis_horizon"] == 12
+    assert series["cu_old"].provenance["basis_horizon"] == 24
+    res = run_stage(tmp_path, ScalarCur, series, name="scalar-cur")
+    assert res.H == 12
+    assert _series(res)["cu_old"].values.shape == (13, 2, 1)  # cut to cur's horizon
+    with pytest.raises(
+        LoadError,
+        match=r"^series p_g: basis cur covers months 0\.\.12 but the stage runs to H = 24; the "
+        r"stage's horizon is at most its cur basis's$",
+    ):
+        run_stage(tmp_path, ScalarCur, series, name="scalar-cur-24", horizon=24)
+    assert run_stage(tmp_path, ScalarCur, series, name="scalar-cur-6", horizon=6).H == 6
+    # the series of one cur basis are summed from the same runs, so they record one horizon
+    p_g = series["p_g"]
+    shifted = {**p_g.provenance, "basis_horizon": 24}
+
+    class TwoCur(ScalarCur):
+        series = (
+            *ScalarCur.series,
+            GroupSum("p_again", "cur", "premium_total", "Money", time=False),
+        )
+
+        @var
+        def premium_again(self) -> Money:
+            return self.series.p_again()
+
+    two = group_series(TwoCur, {**cur, **old}, MEMBERS)
+    two["p_again"] = dataclasses.replace(two["p_again"], provenance=shifted)
+    with pytest.raises(
+        LoadError,
+        match=r"the stage's series of basis cur disagree on its horizon: series p_g records "
+        r"H = 12; series p_again records H = 24",
+    ):
+        run_stage(tmp_path, TwoCur, two, name="two-cur")
+
+
+def test_a_stage_names_groups_in_its_rule_and_invariant_failures(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """A stage's lanes are groups: a failing product invariant, built-in invariant, input rule
+    or group field bound names the group, never a policy."""
+    series = group_series(Release, cur, MEMBERS)
+
+    class SmallCsm(Release):
+        invariants = (Invariant("csm_small", lambda a: a.var("csm"), kind="le"),)  # decl: inv
+
+    with pytest.raises(
+        RunError, match=r"^invariant csm_small failed: group G0, t = 0: lhs = "
+    ) as info:  # G0 is profitable: its CSM starts above 0
+        run_stage(tmp_path, SmallCsm, series, name="invariant")
+    assert "polic" not in info.value.message
+    assert info.value.loc is not None
+    assert info.value.loc.line == _line_of("decl: inv")
+
+    class Rising(Release):
+        @var(init=1.0, role="in_force")
+        def n(self, t: Int) -> Count:
+            return self.n(t - 1) * 1.5
+
+    with pytest.raises(
+        RunError,
+        match=r"H1 in force never negative, never increasing: n increases for group G0 at t = 1",
+    ):
+        run_stage(tmp_path, Rising, series, name="builtin")
+
+    class SmallJ(Release):
+        input_rules = (InputRule("j_small", lambda v: v.model_points.j < 0.003),)
+
+    with pytest.raises(
+        LoadError, match=r"^input rule j_small fails for 1 of 2 values, first for group G1$"
+    ):
+        run_stage(tmp_path, SmallJ, series, name="rule")
+    with pytest.raises(
+        LoadError, match=r"model points: field j must be <= 0\.1; groups G1 break this"
+    ):
+        run_stage(tmp_path, Release, series, name="bound", groups=stage_groups(j=(0.2, 0.002)))

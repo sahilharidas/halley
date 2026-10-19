@@ -47,6 +47,12 @@ Source = str | Path | Any
 METADATA_PREFIX = "halley."
 
 
+def lane_noun(lanes: str) -> str:
+    """One of a run's lanes, for a message that names one: ``"policy"`` for ``"policies"``,
+    ``"group"`` for ``"groups"`` (an aggregation stage's model points are groups)."""
+    return "policy" if lanes == "policies" else lanes.removesuffix("s")
+
+
 @dataclass(slots=True)
 class ReadFile:
     """An input as read: the Arrow table, its bytes' hash, its ``halley.*`` schema metadata (and
@@ -169,7 +175,9 @@ def _as_numpy(col: pa.ChunkedArray, decl: ir.FieldDecl, label: str) -> NDArray[A
     return np.asarray(col.to_pylist(), dtype=object)
 
 
-def _check_range(values: NDArray[Any], decl: ir.FieldDecl, ids: NDArray[Any], label: str) -> None:
+def _check_range(
+    values: NDArray[Any], decl: ir.FieldDecl, ids: NDArray[Any], label: str, lanes: str
+) -> None:
     if decl.kind not in ("number", "int"):
         return
     checks = (
@@ -185,7 +193,7 @@ def _check_range(values: NDArray[Any], decl: ir.FieldDecl, ids: NDArray[Any], la
         if bad.any():
             symbol = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}[op]
             raise LoadError(
-                f"{label}: field {decl.name} must be {symbol} {bound}; policies "
+                f"{label}: field {decl.name} must be {symbol} {bound}; {lanes} "
                 f"{_ids(ids, bad)} break this"
             )
     if decl.kind == "number" and not np.isfinite(values).all():
@@ -193,8 +201,14 @@ def _check_range(values: NDArray[Any], decl: ir.FieldDecl, ids: NDArray[Any], la
 
 
 def load_model_points(
-    graph: ir.Graph, schema: Schema, source: Source, valuation_date: dt.date
+    graph: ir.Graph,
+    schema: Schema,
+    source: Source,
+    valuation_date: dt.date,
+    lanes: str = "policies",
 ) -> ModelPoints:
+    """Read and check the model points; a failure names the rows by their ids under ``lanes``
+    (``"groups"`` for an aggregation stage)."""
     f = read_source(source, "model points")
     label = f.where
     if schema.valuation_date_rule is not None:
@@ -218,7 +232,7 @@ def load_model_points(
             bad = np.array([v not in allowed for v in values], dtype=bool)
             if bad.any():
                 raise LoadError(
-                    f"{label}: field {fld.name} takes exactly {', '.join(decl.enum)}; policies "
+                    f"{label}: field {fld.name} takes exactly {', '.join(decl.enum)}; {lanes} "
                     f"{_ids(ids, bad)} have other values"
                 )
         if decl.unique:
@@ -229,7 +243,7 @@ def load_model_points(
                 raise LoadError(
                     f"{label}: field {fld.name} is not unique: {', '.join(sorted(dup))}"
                 )
-        _check_range(values, decl, ids, label)
+        _check_range(values, decl, ids, label, lanes)
     ctx = LoadContext(columns, valuation_date)
     for d in schema.derived:
         try:
@@ -240,7 +254,7 @@ def load_model_points(
             raise LoadError(f"{label}: derived field {d.name} must give one value per row")
         decl = graph.fields[d.name]
         values = values.astype(np.int64) if decl.kind == "int" else values.astype(np.float64)
-        _check_range(values, decl, ids, label)
+        _check_range(values, decl, ids, label, lanes)
         columns[d.name] = values
     for rule in schema.rules:
         ok = np.asarray(rule.check(ctx), dtype=bool)
@@ -248,7 +262,7 @@ def load_model_points(
             raise LoadError(f"{label}: rule {rule.name} must give one boolean per row")
         if not ok.all():
             raise LoadError(
-                f"{label}: rule {rule.name} fails for policies {_ids(ids, ~ok)}{_doc(rule.doc)}"
+                f"{label}: rule {rule.name} fails for {lanes} {_ids(ids, ~ok)}{_doc(rule.doc)}"
             )
     order = np.argsort(ids, kind="stable")
     columns = {k: v[order] for k, v in columns.items()}
@@ -582,11 +596,14 @@ SERIES_PROVENANCE = (
     "variables",
     "basis_scenarios",
     "valuation_date",
+    "basis_horizon",
     "source_runs",
     "members",
 )
 """What a group series' provenance records, every key required when a stage runs on it: the
-basis and the variables summed, the basis's number of scenarios and valuation date, the source
+basis and the variables summed (which must be what the stage's declaration sums), the basis's
+number of scenarios, valuation date and horizon (recorded for a series without a time dimension
+too, so a ``cur`` basis that supplies only scalars still sets the stage's horizon), the source
 runs (``run_id``, ``dir``, ``manifest_sha256``) and the membership the sums used (``[group id,
 member ids ascending]`` per group, groups ascending). :func:`~halley.aggregation.group_series`
 fills it."""
@@ -623,9 +640,29 @@ def _fixed_months(graph: ir.Graph) -> dict[str, set[int]]:
     return months
 
 
+def _summing(variables: Sequence[object]) -> str:
+    """The variables a series sums as it adds their totals: ``fcf``, ``bel + ra``."""
+    return " + ".join(str(v) for v in variables)
+
+
+def _provenance_variables(s: LoadedSeries) -> tuple[object, ...]:
+    got: object = s.provenance["variables"]
+    if isinstance(got, (list, tuple)):
+        return tuple(got)
+    return (got,)
+
+
+def _basis_horizon(s: LoadedSeries) -> int:
+    """The horizon of the runs a series was summed from (checked by :func:`_check_given`)."""
+    return int(s.provenance["basis_horizon"])
+
+
 def _check_given(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> None:
     """One series per declaration and no other, each with float64 values and the provenance a
-    run directory records (:data:`SERIES_PROVENANCE`)."""
+    run directory records (:data:`SERIES_PROVENANCE`), summed from what its declaration sums:
+    the same variables, in the same order, of the same basis. The declaration is the stage's
+    input contract, and its basis and variables are in the graph hash, so a stage edited to sum
+    other outputs is another stage and runs only on series summed for it (D21)."""
     for name in graph.series:
         if name not in series:
             raise LoadError(f"the stage declares series {name!r}, which was not given")
@@ -639,6 +676,20 @@ def _check_given(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> None:
                 f"series {name}: its provenance records no {', '.join(missing)}; a stage runs on "
                 "series that say where they came from (halley.aggregation.group_series, D21)"
             )
+        decl = graph.series[name]
+        got_basis = s.provenance["basis"]
+        got_variables = _provenance_variables(s)
+        if got_basis != decl.basis or got_variables != decl.variables:
+            raise LoadError(
+                f"series {name}: the stage sums {_summing(decl.variables)} of basis {decl.basis} "
+                f"but was given {_summing(got_variables)} of basis {got_basis}"
+            )
+        reach = s.provenance["basis_horizon"]
+        if not isinstance(reach, int) or isinstance(reach, bool) or reach < 1:
+            raise LoadError(
+                f"series {name}: its provenance records basis_horizon {reach!r}, not the horizon "
+                "of its basis's runs (an int of at least 1)"
+            )
         if not isinstance(s.values, np.ndarray) or s.values.dtype != np.float64:
             kind = s.values.dtype if isinstance(s.values, np.ndarray) else type(s.values).__name__
             raise LoadError(f"series {name}: its values are {kind}, not float64")
@@ -646,20 +697,31 @@ def _check_given(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> None:
 
 def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int | None:
     """A stage's default horizon (design section 9, "Horizon"): its ``cur`` basis's, which
-    every series of that basis with a time dimension covers. A stage without a ``cur`` series
-    with a time dimension takes the horizon its series read relatively agree on (its series
+    every series the stage declares of that basis records as ``basis_horizon``, whatever its
+    time dimension (a ``cur`` basis that supplies only a scalar series sets it too). A stage
+    without a ``cur`` series takes the horizon its series read relatively agree on (its series
     with a time dimension, when none is read relatively); series that disagree are a LoadError
-    naming each one's basis and asking for ``RunSettings.horizon``. ``None`` without a series
-    with a time dimension."""
+    naming each one's basis and asking for ``RunSettings.horizon``. ``None`` without a ``cur``
+    series or a series with a time dimension. The basis is the declaration's, which the series
+    given must sum (:func:`_check_given`)."""
     _check_given(graph, series)
-    timed = [series[n] for n, d in graph.series.items() if d.has_time]
+    cur = {n: _basis_horizon(series[n]) for n, d in graph.series.items() if d.basis == CUR_BASIS}
+    if len(set(cur.values())) > 1:
+        listing = "; ".join(f"series {n} records H = {h}" for n, h in cur.items())
+        raise LoadError(
+            f"the stage's series of basis cur disagree on its horizon: {listing}; the series of "
+            "a basis are summed from the same runs"
+        )
+    if cur:
+        return next(iter(cur.values()))
+    timed = [n for n, d in graph.series.items() if d.has_time]
     relative = _relatively_read(graph)
-    cur = [s for s in timed if s.basis == CUR_BASIS]
-    chosen = cur or [s for s in timed if s.name in relative] or timed
-    horizons = sorted({s.horizon for s in chosen})
+    chosen = [n for n in timed if n in relative] or timed
+    horizons = sorted({series[n].horizon for n in chosen})
     if len(horizons) > 1:
         listing = "; ".join(
-            f"series {s.name} of basis {s.basis} covers months 0..{s.horizon}" for s in chosen
+            f"series {n} of basis {graph.series[n].basis} covers months 0..{series[n].horizon}"
+            for n in chosen
         )
         raise LoadError(
             f"the stage's series disagree on its horizon: {listing}; a stage takes its cur "
@@ -676,12 +738,13 @@ def load_series(
     valuation_date: dt.date,
 ) -> dict[str, LoadedSeries]:
     """Check every group series the stage declares against what was supplied: one per
-    declaration and no other, with float64 values and its provenance, the stage's valuation
-    date (every basis's must equal it), the declared unit (D11 across runs), time dimension,
-    domain and scenario treatment, the stage's groups in its order, finite values. A series read
-    relatively is then cut to months ``0..H``, which its basis must cover, as must every series
-    of the ``cur`` basis (the stage's horizon is at most that basis's). A series read only at
-    fixed months keeps every month of its basis, and each constant ``at(k)`` must be one of the
+    declaration and no other, with float64 values and its provenance, summed from the declared
+    variables of the declared basis, the stage's valuation date (every basis's must equal it),
+    the declared unit (D11 across runs), time dimension, domain and scenario treatment, the
+    stage's groups in its order, finite values. A series read relatively is then cut to months
+    ``0..H``, which its basis must cover; the ``cur`` basis's horizon, as every series of it
+    records, bounds ``H`` whatever the series' time dimension. A series read only at fixed
+    months keeps every month of its basis, and each constant ``at(k)`` must be one of the
     months the series then covers (a per-group month is checked when the batch runs)."""
     _check_given(graph, series)
     relative = _relatively_read(graph)
@@ -690,10 +753,11 @@ def load_series(
     for name, decl in graph.series.items():
         s = series[name]
         label = f"series {name}"
+        basis = decl.basis  # the series' own, by _check_given
         when = str(s.provenance["valuation_date"])
         if when != valuation_date.isoformat():
             raise LoadError(
-                f"{label}: basis {s.basis} values at {when} but the stage values at "
+                f"{label}: basis {basis} values at {when} but the stage values at "
                 f"{valuation_date.isoformat()}; a stage and its bases share one valuation date"
             )
         if s.unit != decl.unit:
@@ -738,16 +802,16 @@ def load_series(
                 f"{label}: its provenance records the members of groups "
                 f"{', '.join(map(str, recorded))}, not of the groups it covers"
             )
-        reaches = name in relative or s.basis == CUR_BASIS
-        if decl.has_time and reaches and s.horizon < horizon:
-            why = (
-                "a series read relatively comes from a basis whose horizon is at least the stage's"
-                if name in relative
-                else "the stage's horizon is at most its cur basis's"
-            )
+        if decl.has_time and name in relative and s.horizon < horizon:
             raise LoadError(
-                f"{label}: basis {s.basis} covers months 0..{s.horizon} but the stage runs to "
-                f"H = {horizon}; {why}"
+                f"{label}: basis {basis} covers months 0..{s.horizon} but the stage runs to "
+                f"H = {horizon}; a series read relatively comes from a basis whose horizon is at "
+                "least the stage's"
+            )
+        if basis == CUR_BASIS and _basis_horizon(s) < horizon:
+            raise LoadError(
+                f"{label}: basis cur covers months 0..{_basis_horizon(s)} but the stage runs to "
+                f"H = {horizon}; the stage's horizon is at most its cur basis's"
             )
         if decl.has_time and name in relative:
             values = values[: horizon + 1]
@@ -757,7 +821,7 @@ def load_series(
             why = (
                 f"it is also read relatively, so it is cut to the stage's horizon, 0..{last}"
                 if last < s.horizon
-                else f"basis {s.basis} covers months 0..{last}"
+                else f"basis {basis} covers months 0..{last}"
             )
             raise LoadError(
                 f"{label}: the stage reads series.{name}.at({late[0]}), but {why}; a series read "
@@ -889,16 +953,18 @@ def load_inputs(
     scenario_contracts: Mapping[str, ScenarioInput] | None = None,
     input_rules: Sequence[InputRule] = (),
     series: Mapping[str, LoadedSeries] | None = None,
+    lanes: str = "policies",
 ) -> Inputs:
     """Load every input the model reads, in order: model points, tables, the horizon, an
     aggregation stage's group series, scenario files, then the product's input rules over all of
     them. The contracts, when given, add the tables' required metadata and rules, the scenario
     inputs' column names, bounds, coverage and rules. A stage's horizon defaults to its cur
-    basis's (:func:`_stage_horizon`) when its schema names no horizon field."""
+    basis's (:func:`_stage_horizon`) when its schema names no horizon field. A failure names the
+    model points by their ids under ``lanes``, ``"groups"`` for a stage."""
     table_contracts = table_contracts or {}
     scenario_contracts = scenario_contracts or {}
     series = series or {}
-    mp = load_model_points(graph, schema, model_points, valuation_date)
+    mp = load_model_points(graph, schema, model_points, valuation_date, lanes)
     tables = tables or {}
     loaded_tables: dict[str, LoadedTable] = {}
     for name, decl in graph.tables.items():
@@ -948,7 +1014,7 @@ def load_inputs(
         for rule in input_rules:
             ok = _run_check(rule.check, view, f"input rule {rule.name}")
             if not ok.all():
-                where = _first_failing_input(view, inputs.ids, ok)
+                where = _first_failing_input(view, inputs.ids, ok, lane_noun(lanes))
                 raise LoadError(f"input rule {rule.name} fails{where}{_doc(rule.doc)}")
     return inputs
 
@@ -962,14 +1028,17 @@ def _lines_up(ok: NDArray[np.bool_], shape: tuple[int, ...]) -> bool:
     )
 
 
-def _first_failing_input(view: InputView, ids: NDArray[Any], ok: NDArray[np.bool_]) -> str:
+def _first_failing_input(
+    view: InputView, ids: NDArray[Any], ok: NDArray[np.bool_], lane: str = "policy"
+) -> str:
     """Where an input rule first fails, by the shape of its result: ``at sex = M, age = 25 of
-    table mort`` when it lines up with exactly one table's dense shape, ``for policy P05`` when
-    it runs over the model points, ``for scenario 1, month -14 of scenario input cpi`` when it
-    lines up with exactly one scenario input, else the element's position (also when the shape
-    fits more than one input); with the count of failing values when the result has more than
-    one. A one-element result of a one-policy, one-scenario run fits the policy axis and every
-    scenario input's scenario axis alike; it names the policy."""
+    table mort`` when it lines up with exactly one table's dense shape, ``for policy P05`` (``for
+    group G0`` in a stage, by ``lane``) when it runs over the model points, ``for scenario 1,
+    month -14 of scenario input cpi`` when it lines up with exactly one scenario input, else the
+    element's position (also when the shape fits more than one input); with the count of
+    failing values when the result has more than one. A one-element result of a one-policy,
+    one-scenario run fits the policy axis and every scenario input's scenario axis alike; it
+    names the policy."""
     if ok.ndim == 0:
         return ""
     tables: list[str] = []
@@ -977,7 +1046,7 @@ def _first_failing_input(view: InputView, ids: NDArray[Any], ok: NDArray[np.bool
         if _lines_up(ok, table.shape):
             key = _first_failing_key(table, ok).removeprefix(" at ")
             tables.append(f"at {key} of table {name}" if key else f"in table {name}")
-    policy = f"for policy {ids[int(np.flatnonzero(~ok)[0])]}" if ok.shape == ids.shape else None
+    policy = f"for {lane} {ids[int(np.flatnonzero(~ok)[0])]}" if ok.shape == ids.shape else None
     scenarios: list[str] = []
     for name, scen in view.scenarios.items():
         row = _first_failing_row(scen, ok)

@@ -25,7 +25,7 @@ import inspect
 import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
-from typing import Any, ClassVar, Final, TypeGuard
+from typing import Any, ClassVar, Final, NamedTuple, TypeGuard
 
 import numpy as np
 from numpy.typing import NDArray
@@ -47,6 +47,9 @@ coverage units. A probability, rate, factor, index level, flag or Int of each me
 add up to the group's, and a MoneyPerPolicy is per policy by definition. Narrower than
 :data:`~halley.ir.units.SUMMABLE`, the units ``sum_t()`` adds over the months of one policy."""
 
+GROUP_ID: Final = "group_id"
+"""The id field of a stage's group schema, and so of its output files (design section 9)."""
+
 _STAGE_NAMES = {
     "group": "the group's fields (self.group)",
     "series": "the group series accessor (self.series)",
@@ -62,13 +65,15 @@ def sequential_sum(values: NDArray[Any], axis: int) -> NDArray[Any]:
 
 
 _NOT_MODEL_SOURCE = frozenset({__file__, dataclasses.__file__})
-"""This module and the one whose ``replace()`` re-runs a declaration's checks."""
+"""This module and the one whose ``replace()`` constructs a declaration from another."""
 
 
 def _declaration_loc() -> Loc | None:
     """The model source line that constructs a declaration: the nearest frame outside this
     module, outside ``dataclasses`` (a ``replace()`` of a declaration) and outside generated
-    code (a dataclass's ``__init__``)."""
+    code (a dataclass's ``__init__``). A declaration's ``loc`` is not an argument, so a
+    ``replace()`` does not copy it: the copy is declared where it is made, which is where a
+    later error about it belongs (a subclass that replaces its parent's ``GroupSum``)."""
     frame = inspect.currentframe()
     while frame is not None:
         name = frame.f_code.co_filename
@@ -90,28 +95,42 @@ def _class_loc(cls: type) -> Loc | None:
 # ------------------------------------------------------------------------------ declarations
 
 
+class BasisInfo(NamedTuple):
+    """What the runs of a basis share (:meth:`Basis.check`)."""
+
+    valuation_date: dt.date
+    """Which the stage's valuation date must equal (design section 9)."""
+    horizon: int
+    """The runs' ``H``: a ``cur`` basis's is the stage's default horizon and its bound."""
+
+
 @dataclass(frozen=True, slots=True)
 class Basis:
-    """A basis of a stage: one or more projection runs with the same valuation date, horizon and
-    number of scenarios J, and pairwise disjoint policy ids (one run per product class), whose
-    outputs the stage's :class:`GroupSum` series sum."""
+    """A basis of a stage: one or more projection runs with the same valuation date, horizon,
+    number of scenarios J and scenario files, and pairwise disjoint policy ids (one run per
+    product class), whose outputs the stage's :class:`GroupSum` series sum."""
 
     name: str
     doc: str = ""
-    _: KW_ONLY
-    loc: Loc | None = field(default=None, compare=False)
-    """Where the basis is declared; filled in when left out."""
+    loc: Loc | None = field(default=None, init=False, compare=False)
+    """Where the basis is declared: the line that constructs it (:func:`_declaration_loc`)."""
 
     def __post_init__(self) -> None:
-        if self.loc is None:
-            object.__setattr__(self, "loc", _declaration_loc())
+        object.__setattr__(self, "loc", _declaration_loc())
         if not _is_name(self.name):
             raise BuildError(f"a basis is named like a variable, not {self.name!r}", self.loc)
 
-    def check(self, runs: Sequence[RunResult]) -> dt.date:
-        """The runs given for this basis agree on the valuation date, the horizon and J, and
-        hold disjoint policies; returns their valuation date, which the stage's must equal
-        (design section 9). A LoadError otherwise."""
+    def check(self, runs: Sequence[RunResult]) -> BasisInfo:
+        """The runs given for this basis agree on the valuation date, the horizon and J, read
+        every scenario input they share from the same file, and hold disjoint policies; returns
+        their valuation date, which the stage's must equal, and their horizon (design section
+        9). A LoadError otherwise.
+
+        The scenario files are compared by the sha256 each run's manifest records: a group
+        total adds the members' values of scenario ``s`` across the runs, and the mean averages
+        those totals, which means something only when ``s`` is the same path in every run (two
+        class runs given the same J = 2 paths in the other order would otherwise be summed path
+        by path)."""
         if not runs:
             raise LoadError(f"basis {self.name} has no runs")
         first = runs[0]
@@ -134,6 +153,18 @@ class Basis:
                     f"run {first.run_id} has J = {first.n_scenarios}; the runs of a basis share "
                     "their scenarios"
                 )
+        files: dict[str, tuple[str, str]] = {}  # scenario input -> (first run, file sha256)
+        for r in runs:
+            for name, sha in _scenario_files(r).items():
+                if name in files and files[name][1] != sha:
+                    other, known = files[name]
+                    raise LoadError(
+                        f"basis {self.name}: run {r.run_id} read scenario input {name} from "
+                        f"another file than run {other} (sha256 {sha[:12]}... and "
+                        f"{known[:12]}...); the runs of a basis share their scenarios, so that "
+                        "scenario s is one path in every run"
+                    )
+                files.setdefault(name, (r.run_id, sha))
         seen: dict[object, str] = {}
         for r in runs:
             for pid in r.ids.tolist():
@@ -144,11 +175,17 @@ class Basis:
                         "product class)"
                     )
                 seen[pid] = r.run_id
-        return dt.date.fromisoformat(when)
+        return BasisInfo(dt.date.fromisoformat(when), first.H)
 
 
 def _valuation_date(r: RunResult) -> str:
     return str(r.manifest["settings"]["valuation_date"])
+
+
+def _scenario_files(r: RunResult) -> dict[str, str]:
+    """The sha256 of every scenario file a run read, by scenario input, from its manifest."""
+    entries: dict[str, Any] = r.manifest["inputs"]["scenarios"]
+    return {name: str(e["sha256"]) for name, e in entries.items()}
 
 
 def _is_name(value: object) -> bool:
@@ -193,12 +230,12 @@ class GroupSum:
     start: int | None = None
     """1 when left out, for a series with a time dimension."""
     doc: str = ""
-    loc: Loc | None = field(default=None, compare=False)
-    """Where the series is declared; filled in when left out."""
+    loc: Loc | None = field(default=None, init=False, compare=False)
+    """Where the series is declared: the line that constructs it, or that makes it with
+    ``dataclasses.replace()`` from another (:func:`_declaration_loc`)."""
 
     def __post_init__(self) -> None:
-        if self.loc is None:
-            object.__setattr__(self, "loc", _declaration_loc())
+        object.__setattr__(self, "loc", _declaration_loc())
         if not _is_name(self.name):
             raise BuildError(f"a series is named like a variable, not {self.name!r}", self.loc)
         what = f"series {self.name}"
@@ -211,6 +248,15 @@ class GroupSum:
         names: object = (self.variables,) if isinstance(self.variables, str) else self.variables
         if not _is_tuple(names) or not names or not all(isinstance(n, str) and n for n in names):
             raise BuildError(f"{what} names its variables, as 'bel' or ('bel', 'ra')", self.loc)
+        seen: set[object] = set()
+        for n in names:
+            # a name no run can have stored would fail only when the stage loads, as "did not
+            # store", and a name given twice would add that output's group total twice
+            if not _is_name(n):
+                raise BuildError(f"{what}: {n!r} is not the name of a variable", self.loc)
+            if n in seen:
+                raise BuildError(f"{what} names {n} twice; each output is summed once", self.loc)
+            seen.add(n)
         # the annotations do not bind a caller; a flag or a month of another type would reach
         # the declaration's repr, and so the graph hash, as a different series
         if not _is_bool(self.time):
@@ -266,6 +312,8 @@ class GroupSum:
             self.time,
             self.first_month,
             self.scenarios == "each",
+            self.basis,
+            self.names,
             self.doc,
             self.loc,
         )
@@ -279,8 +327,8 @@ class Aggregation(Product):
 
     Beside a ``Product``'s class attributes a stage sets:
 
-    * ``model_point``: the schema of its groups, one row per group (``self.group`` reads a
-      field, the same as ``self.mp``);
+    * ``model_point``: the schema of its groups, one row per group, keyed on ``group_id``, as
+      its outputs are (``self.group`` reads a field, the same as ``self.mp``);
     * ``bases``: the :class:`Basis` declarations whose runs it reads;
     * ``series``: the :class:`GroupSum` declarations, read in formulas as
       ``self.series.<name>(t + k)``, ``self.series.<name>.at(k)`` or ``self.series.<name>()``;
@@ -306,8 +354,17 @@ class Aggregation(Product):
     @classmethod
     def series_declarations(cls) -> dict[str, ir.SeriesDecl]:
         """The stage's group series by name, each checked against the bases: a series of an
-        undeclared basis, a name declared twice, a malformed tuple or a variable taking one of
-        the stage's names is a BuildError at the model source."""
+        undeclared basis, a name declared twice, a malformed tuple, a group schema keyed on
+        another field than ``group_id`` or a variable taking one of the stage's names is a
+        BuildError at the model source."""
+        schema = cls.model_point
+        if schema is not None and schema.id_field != GROUP_ID:
+            raise BuildError(
+                f"{cls.__qualname__}.model_point keys its rows on {schema.id_field!r}; a stage's "
+                f"model points are groups, keyed on {GROUP_ID!r}, which its outputs are keyed on "
+                "(design section 9)",
+                _class_loc(cls),
+            )
         for klass in cls.__mro__:
             for name, what in _STAGE_NAMES.items():
                 value = vars(klass).get(name)
@@ -380,7 +437,8 @@ def group_series(
     run of its basis with the series' unit; its recorded domain start is the series' (the latest
     over the variables), which the loader requires to be no later than the stage's declared
     start when the stage runs. The provenance records the basis's valuation date, which the
-    stage's must equal, and the membership the sums used. A LoadError otherwise."""
+    stage's must equal, its horizon, which bounds the stage's when the basis is ``cur``, and
+    the membership the sums used. A LoadError otherwise."""
     stage.series_declarations()  # the declarations are sound before anything is summed
     declared = {b.name: b for b in _bases(stage)}
     for name in declared:
@@ -391,7 +449,7 @@ def group_series(
             raise LoadError(
                 f"basis {name!r} was given but {stage.__qualname__} declares no such basis"
             )
-    dates = {name: b.check(bases[name]) for name, b in declared.items()}
+    shared = {name: b.check(bases[name]) for name, b in declared.items()}
     group_ids = _sorted_ids(list(members))
     owner: dict[Any, Any] = {}
     for g in group_ids:
@@ -427,7 +485,7 @@ def group_series(
         [_plain(g), [_plain(p) for p in _sorted_ids(list(members[g]))]] for g in group_ids
     ]
     return {
-        s.name: _summed(s, bases[s.basis], group_ids, members, dates[s.basis], membership)
+        s.name: _summed(s, bases[s.basis], group_ids, members, shared[s.basis], membership)
         for s in sums
     }
 
@@ -453,7 +511,7 @@ def _summed(
     runs: Sequence[RunResult],
     group_ids: NDArray[Any],
     members: Mapping[Any, Any],
-    valuation_date: dt.date,
+    basis: BasisInfo,
     membership: list[list[Any]],
 ) -> LoadedSeries:
     start = 0
@@ -486,7 +544,8 @@ def _summed(
         "basis": s.basis,
         "variables": list(s.names),
         "basis_scenarios": n_scen,
-        "valuation_date": valuation_date.isoformat(),
+        "valuation_date": basis.valuation_date.isoformat(),
+        "basis_horizon": basis.horizon,  # recorded for a series without a time dimension too
         "source_runs": [_source_run(s, r) for r in runs],
         "members": membership,  # [group id, its member ids ascending], groups ascending
     }

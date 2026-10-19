@@ -11,6 +11,7 @@ import pytest
 
 from halley import Basis, HalleyError, LoadError, RunError, RunResult, RunSettings, build, run
 from halley.aggregation import (
+    BasisInfo,
     portfolio_totals,
     require_deterministic,
     sequential_sum,
@@ -63,12 +64,15 @@ def test_the_deterministic_check_lives_in_one_place(term_run: RunResult, tmp_pat
 
 def test_basis_requires_disjoint_ids_same_date_horizon_and_j(tmp_path: Path) -> None:
     """A basis is one or more projection runs, one per product class, that agree on the
-    valuation date, the horizon and the number of scenarios and hold disjoint policies (design
-    section 9). It replaces AggregationInputs, which took several runs of the same policies."""
+    valuation date, the horizon and the number of scenarios, read the same scenario files and
+    hold disjoint policies (design section 9). It replaces AggregationInputs, which took
+    several runs of the same policies. The check returns the date and horizon they share."""
     cur = Basis("cur")
     a = run_covered(tmp_path, "a", covered_points("A"))
     b = run_covered(tmp_path, "b", covered_points("B"))
-    cur.check([a, b])  # one valuation date, H = 12, J = 1, A.. and B.. apart
+    shared = cur.check([a, b])  # one valuation date, H = 12, J = 1, A.. and B.. apart
+    assert shared == BasisInfo(VAL, 12)
+    assert (shared.valuation_date, shared.horizon) == (VAL, 12)
 
     with pytest.raises(LoadError, match="basis cur has no runs"):
         cur.check([])
@@ -89,3 +93,17 @@ def test_basis_requires_disjoint_ids_same_date_horizon_and_j(tmp_path: Path) -> 
     stochastic = run_covered(tmp_path, "stochastic", covered_points("B"), shocks=(1.0, 1.1))
     with pytest.raises(LoadError, match=r"has J = 2 scenarios but run .* has J = 1"):
         cur.check([a, stochastic])
+
+    # the same J, but scenario s is another path in each run: summed path by path, the totals
+    # and their mean would add unrelated scenarios
+    up = run_covered(tmp_path, "up", covered_points("A"), shocks=(1.0, 1.5))
+    down = run_covered(tmp_path, "down", covered_points("B"), shocks=(1.5, 1.0))
+    with pytest.raises(
+        LoadError,
+        match=rf"basis cur: run {down.run_id} read scenario input shock from another file than "
+        rf"run {up.run_id} \(sha256 .*\); the runs of a basis share their scenarios, so that "
+        r"scenario s is one path in every run",
+    ):
+        cur.check([up, down])
+    same = run_covered(tmp_path, "same", covered_points("B"), shocks=(1.0, 1.5))
+    assert cur.check([up, same]) == BasisInfo(VAL, 12)

@@ -13,7 +13,8 @@ the term assurance's reserve roll-forward and PV identity (H4, H5), the annuity'
 Every invariant is evaluated per batch on a :class:`BatchView`; the results of the batches are
 merged into one :class:`InvariantResult` per invariant, in ascending batch order, so the worst
 residual covers every policy and the first failing policy is deterministic. A failure is a
-:class:`~halley.errors.RunError` naming the invariant, the policy and the month.
+:class:`~halley.errors.RunError` naming the invariant, the policy and the month; in an
+aggregation stage, whose model points are groups, the group.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from halley.authoring.contracts import Invariant
 from halley.errors import RunError
 from halley.ir import units
 from halley.ir.units import unit_from_name
-from halley.runtime.loader import Inputs
+from halley.runtime.loader import Inputs, lane_noun
 from halley.runtime.tolerance import RELATIVE
 
 
@@ -67,14 +68,17 @@ def merge_results(batches: Sequence[Sequence[InvariantResult]]) -> list[Invarian
     return merged
 
 
-def _first_bad(mask: NDArray[np.bool_], ids: NDArray[Any], t_offset: int = 0) -> str:
-    """``policy P05 at t = 3`` for the first True in a (time, policy, scenario) mask."""
+def _first_bad(
+    mask: NDArray[np.bool_], ids: NDArray[Any], t_offset: int = 0, lane: str = "policy"
+) -> str:
+    """``policy P05 at t = 3`` (``group G0 at t = 3`` in a stage, by ``lane``) for the first
+    True in a (time, policy, scenario) mask."""
     idx = np.argwhere(mask)
     if idx.size == 0:
         return ""
     t, p, s = (int(x) for x in idx[0])
     p = min(p, len(ids) - 1)
-    where = f"policy {ids[p]} at t = {t + t_offset}"
+    where = f"{lane} {ids[p]} at t = {t + t_offset}"
     if mask.shape[2] > 1:
         where += f", scenario {s}"
     return where
@@ -86,7 +90,11 @@ def check_builtin(
     ids: NDArray[Any],
     horizon: int,
     scales: dict[units.Unit, NDArray[np.float64]],
+    lanes: str = "policies",
 ) -> list[InvariantResult]:
+    """H1 to H3 on one batch; a failure names the first failing lane by its id under ``lanes``
+    (``"groups"`` in an aggregation stage)."""
+    lane = lane_noun(lanes)
     results: list[InvariantResult] = []
     roles: dict[str, list[ir.Variable]] = {}
     for v in graph.variables.values():
@@ -109,9 +117,9 @@ def check_builtin(
         worst = float(max(-x.min(), (x[1:] - x[:-1]).max(), 0.0))
         detail = ""
         if neg.any():
-            detail = f"{in_force.name} is negative for {_first_bad(neg, ids)}"
+            detail = f"{in_force.name} is negative for {_first_bad(neg, ids, 0, lane)}"
         elif rising.any():
-            detail = f"{in_force.name} increases for {_first_bad(rising, ids, 1)}"
+            detail = f"{in_force.name} increases for {_first_bad(rising, ids, 1, lane)}"
         results.append(
             InvariantResult("H1 in force never negative, never increasing", passed, worst, detail)
         )
@@ -126,7 +134,7 @@ def check_builtin(
                     "H2 decrements never exceed the opening in-force count",
                     passed,
                     float(max(over.max(), 0.0)),
-                    f"decrements exceed {in_force.name}(t-1) for {_first_bad(bad, ids, 1)}"
+                    f"decrements exceed {in_force.name}(t-1) for {_first_bad(bad, ids, 1, lane)}"
                     if not passed
                     else "",
                 )
@@ -149,7 +157,7 @@ def check_builtin(
             bad = end != target
             detail = ""
             if bad.any():
-                detail = f"{v.name}(H) != {target} for {_first_bad(bad[None], ids, horizon)}"
+                detail = f"{v.name}(H) != {target} for {_first_bad(bad[None], ids, horizon, lane)}"
             results.append(
                 InvariantResult(
                     f"H3 {v.name} reaches its terminal value at t = {horizon}",
@@ -217,7 +225,8 @@ class BatchView:
     """One batch after projection, as a product invariant sees it (the
     :class:`~halley.authoring.contracts.BatchView` protocol). Arrays are ``(time, policy,
     scenario)``; a variable is broadcast to ``(H + 1, P, S)``, or ``(1, P, S)`` without a time
-    dimension, and memoised."""
+    dimension, and memoised. ``lanes`` names the batch's lanes in messages: ``"policies"``, or
+    ``"groups"`` in an aggregation stage."""
 
     def __init__(
         self,
@@ -227,6 +236,7 @@ class BatchView:
         lo: int,
         hi: int,
         scales: dict[units.Unit, NDArray[np.float64]],
+        lanes: str = "policies",
     ) -> None:
         self._graph = graph
         self._out = out
@@ -237,6 +247,7 @@ class BatchView:
         self.P = hi - lo
         self.S = inputs.n_scenarios
         self.ids = inputs.ids[lo:hi]
+        self.lanes = lanes
         self.t = np.arange(self.H + 1, dtype=np.int64).reshape(-1, 1, 1)
         self.mp = _Fields(inputs.model_points.columns, lo, hi)
         self.run = _Run(inputs.run)
@@ -273,7 +284,8 @@ class BatchView:
         idx = given.astype(np.int64).reshape(1, -1, 1)
         if idx.shape[1] != self.P:
             raise RunError(
-                f"a.at({name!r}, index): the index has {idx.shape[1]} policies, the batch {self.P}"
+                f"a.at({name!r}, index): the index has {idx.shape[1]} {self.lanes}, the batch "
+                f"{self.P}"
             )
         if (idx < 0).any() or (idx > self.H).any():
             raise RunError(f"a.at({name!r}, index): a month is outside 0..{self.H}")
@@ -365,8 +377,8 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
         raise RunError(f"invariant {inv.name}: its arrays do not line up: {exc}", inv.loc) from exc
     if shape[1] not in (1, a.P) or shape[2] not in (1, a.S):
         raise RunError(
-            f"invariant {inv.name}: its arrays are shaped {shape}; the batch has {a.P} policies "
-            f"and {a.S} scenarios",
+            f"invariant {inv.name}: its arrays are shaped {shape}; the batch has {a.P} "
+            f"{a.lanes} and {a.S} scenarios",
             inv.loc,
         )
     first, last = inv.window(a.H)
@@ -403,7 +415,7 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
     i, p, s = (int(x) for x in np.argwhere(bad)[0])
     parts: list[str] = []
     if shape[1] == a.P:
-        parts.append(f"policy {a.ids[p]}")
+        parts.append(f"{lane_noun(a.lanes)} {a.ids[p]}")
     if n_time > 1 or n_window == 1:
         parts.append(f"t = {first + i}")
     elif inv.months is not None:
@@ -428,8 +440,9 @@ def _evaluate(inv: Invariant, a: BatchView) -> InvariantResult:
 def check_declared(invariants: Sequence[Invariant], view: BatchView) -> list[InvariantResult]:
     """Evaluate the product's invariants on one batch, in declaration order, stopping at the
     first failure, which raises a :class:`~halley.errors.RunError` naming the invariant, the
-    first failing policy and month, located at the invariant's declaration (so a later
-    invariant that cannot even be evaluated never hides it)."""
+    first failing policy (group, in a stage: ``view.lanes``) and month, located at the
+    invariant's declaration (so a later invariant that cannot even be evaluated never hides
+    it)."""
     results: list[InvariantResult] = []
     for inv in invariants:
         r = _evaluate(inv, view)
