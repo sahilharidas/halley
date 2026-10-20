@@ -10,18 +10,27 @@ read from ``docs/spec/in-force-group`` or built from it by the cross-run helpers
 against ``docs/spec/in_force_group_numbers.py`` (``build_variant``): every per-run, per-policy
 column, the group totals, the recognition, the inputs the previous run supplies, the change in
 locked-in fulfilment cash flows, N, the period close and the months after it, the analysis of
-change, and the headline figures section 14 prints; K1 to K7, I11 to I13, M1 and M2 as run-time
-invariants; the six remeasurement cases of 14.5; the shifted world Z1 and Z2 on constructed
-inputs (12.3, 14.8); G6 and the load-time checks of 12.4; the locked-in files held to the group's
-tau0; batch and horizon independence (D5); reruns, replays and the run directory (D19, D21); and
-the committed reference workbooks, read through their cached values.
+change, and the headline figures section 14 prints, the close also bit for bit against a
+recomputation from the run's own copied inputs (D19); K1 to K7, I11 to I13, M1 and M2 as run-time
+invariants, and K1 and K7 failing on broken stages; the six remeasurement cases of 14.5 and the
+edge cases of 9.7; the shifted world Z1 and Z2 on constructed inputs (12.3, 14.8); G6 and the
+load-time checks of 12.4; the locked-in files held to the group's tau0 and to the curve each is
+read as, the locked-in runs' ILP of 0.0 and actual CPI history, the old basis held to the
+previous run and the new basis to the cur basis's model points; a chain of two periods, whose
+second has tau0 = 12 and tau = 6; batch and horizon independence (D5); reruns, replays and the
+run directory (D19, D21); and the committed reference workbooks, read through their cached
+values.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
+import importlib
+import inspect
 import json
+import re
 import shutil
 import warnings
 from pathlib import Path
@@ -36,15 +45,18 @@ import pytest
 from halley import (
     BuildError,
     CompiledModel,
+    CoverageUnits,
     Field,
     LoadError,
     Money,
+    RunError,
     RunResult,
     RunSettings,
     build,
     load_run,
     run,
     var,
+    where,
 )
 from halley.aggregation import (
     InForceGroup,
@@ -437,6 +449,10 @@ def test_the_recognition_and_the_previous_runs_supply(
     _agree(groups["csm_prev"], inputs["csm_prev"], p_g)
     _agree(groups["lc_prev"], inputs["lc_prev"], p_g)
     assert groups["cu_act"] == inputs["cu_act"] == data.IN_FORCE_CU_ACT[k]
+    # the close reads them once each, as the opening lines of 11.1 and the period's units
+    assert chain.lane("csm_open_per", 0) == groups["csm_prev"]
+    assert chain.lane("lc_open_per", 0) == groups["lc_prev"]
+    assert chain.lane("cu_act_per", 0) == groups["cu_act"]
     derived = pq.read_table(chain.stage.run_dir / "inputs" / "derived_groups.parquet")
     row = derived.to_pylist()[0]
     assert row["group_id"] == chain.gid
@@ -458,6 +474,66 @@ def test_the_recognition_and_the_previous_runs_supply(
 
 
 # ---------------------------------------------------------------- the close (8, 9, 10, 11)
+
+
+def _copy(res: RunResult, entry: dict[str, Any]) -> Any:
+    return pq.read_table(res.run_dir / entry["copy"])
+
+
+def _close_from_inputs(res: RunResult) -> dict[str, float]:
+    """The period close of in-force 9.2 to 9.6 recomputed in plain floats from what the stage run
+    copied and stored, in the design's order and grouping (``csm_prev x P_rec(i_acc)`` first, then
+    the division; the ratio ``F_prev(tau) / F_prev(0)`` and the share ``cu_act / U`` formed before
+    they multiply): the groups row, the derived fields, the copied ``p_rec``, the copies of the
+    series ``fcf_old``, ``fcf_new`` and ``fcf_g``, and the stored N(0), which is ``cu_next(0)``."""
+    inputs = res.manifest["inputs"]
+    group = _copy(res, inputs["groups"]).to_pylist()[0]
+    derived = _copy(res, inputs["derived_groups"]).to_pylist()[0]
+    curve = _copy(res, inputs["scenarios"]["p_rec"])
+    p_rec = dict(zip(curve.column("t").to_pylist(), curve.column("rf_df").to_pylist(), strict=True))
+
+    def at_0(name: str) -> float:
+        table = _copy(res, inputs["series"][name])
+        return float(table.column("value").to_pylist()[table.column("t").to_pylist().index(0)])
+
+    gid = res.ids.tolist()[0]
+    n_0 = float(res.lane("n_0", gid)[0])
+    assert n_0 == float(res.lane("cu_next", gid)[0])
+    csm_prev, lc_prev, cu_act = group["csm_prev"], group["lc_prev"], group["cu_act"]
+    f0, f_tau = derived["f_prev_0"], derived["f_prev_tau"]
+    s: dict[str, float] = {"csm_open_per": csm_prev, "lc_open_per": lc_prev, "cu_act_per": cu_act}
+    delta = s["delta_fcf_l"] = at_0("fcf_new") - at_0("fcf_old")
+    csm = s["csm_acc"] = (csm_prev * p_rec[derived["i_acc"]]) / p_rec[derived["i_rec"]]
+    s["acc_per"] = csm - csm_prev
+    lc = s["lc_alloc_per"] = lc_prev * (f_tau / f0) if f0 > 0 else 0.0
+    s["lca_per"] = lc_prev - lc
+    rev = s["rev"] = min(lc, -delta)
+    raw = s["raw"] = csm - delta
+    if lc > 0:
+        s["csm_adj"] = csm if delta >= 0 else csm + (-delta - rev)
+        s["lc_adj"] = lc + delta if delta >= 0 else lc - rev
+    else:
+        s["csm_adj"], s["lc_adj"] = (0.0, -raw) if raw < 0 else (raw, 0.0)
+    s["csm_fs"] = s["csm_adj"] - csm
+    s["lc_fs"] = s["lc_adj"] - lc
+    s["lc_loss"] = s["lc_fs"] if s["lc_fs"] > 0 else 0.0
+    s["lc_reversal"] = s["lc_fs"] if s["lc_fs"] < 0 else 0.0
+    u = s["u_per"] = cu_act + n_0
+    s["r_per"] = s["csm_adj"] * (cu_act / u) if u > 0 else s["csm_adj"]
+    s["csm_0"] = s["csm_adj"] - s["r_per"]
+    s["lc_0"] = s["lc_adj"]
+    s["lrc_0"] = at_0("fcf_g") + s["csm_0"]
+    return s
+
+
+def _assert_close_exact(res: RunResult) -> None:
+    """D19: every stored step of the close equals :func:`_close_from_inputs` bit for bit, so a
+    change of grouping in the generated code, which moves the last bit of the reference figures
+    (``csm_prev x (P_rec(0) / P_rec(12))`` is 764851.289403365, not 764851.2894033649), fails."""
+    gid = res.ids.tolist()[0]
+    for name, want in _close_from_inputs(res).items():
+        got = float(res.lane(name, gid)[0])
+        assert got == want, (name, got, want)
 
 
 CLOSE_STEPS = {
@@ -495,9 +571,18 @@ def test_the_close_and_the_months_reconcile(
     """Section 8 (delta_FCF_L), 9.5 (N(t) for t = 0..T, from the CUR units on P_L), the five
     steps of the close (9.2 to 9.6) and the months 1..T after it (10), against the script's
     ``delta``, ``n``, ``close`` and ``roll``, with P_g the scale of every amount; the closing
-    balances open the months, and LRC(0) is FCF_g^cur(0) + CSM(0)."""
+    balances open the months, and LRC(0) is FCF_g^cur(0) + CSM(0). D19: the close is also equal
+    bit for bit to its recomputation from the run's own copies in the design's grouping, which
+    the other groupings of the same formulas miss in the last bit on these figures."""
     v, chain = inforce_variants[k], chains[k]
     p_g = _p_g(v)
+    _assert_close_exact(chain.stage)
+    if k == "P":
+        p_rec = pq.read_table(_file("p_rec")).column("rf_df").to_pylist()
+        csm_prev, cu_act = chain.lane("csm_open_per", 0), chain.lane("cu_act_per", 0)
+        assert csm_prev * (p_rec[0] / p_rec[TAU]) != chain.lane("csm_acc", 0)
+        r_other = (chain.lane("csm_adj", 0) * cu_act) / chain.lane("u_per", 0)
+        assert r_other != chain.lane("r_per", 0)
     _agree(chain.lane("delta_fcf_l", 0), v["delta"], p_g)
     _agree(chain.lane("cu_next"), v["n"], p_g)
     _agree(chain.lane("n_0", 0), v["n"][0], p_g)
@@ -517,6 +602,11 @@ def test_the_close_and_the_months_reconcile(
     assert chain.lane("rev", 0) == min(chain.lane("lc_alloc_per", 0), -chain.lane("delta_fcf_l", 0))
     assert chain.lane("raw", 0) == chain.lane("csm_acc", 0) - chain.lane("delta_fcf_l", 0)
     assert chain.lane("p_g", 0) == v["recog"]["p_g"]
+    lc_fs = chain.lane("lc_fs", 0)  # 11.1: the loss and the reversal lines, lc_fs by its sign
+    assert (chain.lane("lc_loss", 0), chain.lane("lc_reversal", 0)) == (
+        max(lc_fs, 0.0),
+        min(lc_fs, 0.0),
+    )
 
 
 @pytest.mark.parametrize("k", VARIANTS)
@@ -885,6 +975,58 @@ def _invariants_json(r: RunResult) -> list[dict[str, Any]]:
     return json.loads((r.run_dir / "invariants.json").read_text(encoding="utf-8"))
 
 
+class Unreleased(InForceGroup):
+    """The closing CSM taken before the period's release, CSM(0) = CSM_adj: the months after V
+    roll forward consistently from it, so of the invariants only K1 sees it."""
+
+    @var
+    def csm_0(self) -> Money:
+        return self.csm_adj()
+
+
+class Inverted(InForceGroup):
+    """The loss component allocated by F_prev(0) / F_prev(tau), the previous run's ratio upside
+    down: the remeasurement rules and the months conserve whatever it gives, so of the
+    invariants only K7 sees it."""
+
+    @var
+    def lc_alloc_per(self) -> Money:
+        f_tau = self.fcf_prev_tau()
+        ratio = self.fcf_prev_0() / where(f_tau > 0, f_tau, 1.0)
+        return where(f_tau > 0, self.lc_open_per() * ratio, 0.0)
+
+
+BROKEN = {
+    "Unreleased": (Unreleased, "P", "K1 CSM(0) = csm_prev + acc_per + csm_fs - R_per"),
+    "Inverted": (Inverted, "O", "K7 LC_alloc = LC^prev(tau)"),
+}
+"""Each broken stage, the variant it runs on and the one invariant that fails."""
+
+
+@pytest.mark.parametrize("name", sorted(BROKEN))
+def test_k1_and_k7_fail_on_broken_stages(
+    name: str, chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """An invariant that compared a line with itself would pass every stage: K1 and K7 each fail
+    on a stage broken where they look, a RunError naming the invariant and the group with its
+    two sides, located at the invariant's declaration; every invariant declared before it (I11
+    to I13, M1, M2 and the K before it) held on the same run, since the run stops at the first
+    failure."""
+    broken, k, invariant = BROKEN[name]
+    chain = chains[k]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        compiled = build(broken)
+    with pytest.raises(
+        RunError, match=rf"^invariant {re.escape(invariant)} failed: group {chain.gid}: lhs = "
+    ) as info:
+        chain.in_force(tmp_path / name, compiled=compiled)
+    declared = next(inv for inv in CLOSE_INVARIANTS if inv.name == invariant)
+    assert info.value.loc is not None
+    assert info.value.loc == declared.loc
+    assert info.value.loc.file.endswith("csm.py")
+
+
 # ------------------------------------------------------ the remeasurement rules (9.4, 14.5)
 
 
@@ -964,6 +1106,140 @@ def test_every_branch_of_the_remeasurement_rules(
     assert min(one("csm_0"), one("lc_0")) == 0.0
     failed = [r.name for r in res.invariants if not r.passed]
     assert not failed, failed
+
+
+class Edge(InForceGroup):
+    """The in-force stage with the inputs of its close taken from group fields: the opening CSM
+    and loss component, F_prev(0), the period's units, N(0) and delta_FCF_L, so that the close's
+    where-forms run on the edge cases of in-force 9.7, everything else the reference chain's.
+    K7 holds the allocation to the previous run's own LC(tau), which an opening loss component or
+    an F_prev(0) other than the previous run's does not keep, so this stage leaves it out."""
+
+    model_point = group_schema(
+        Field("case_csm", "number", "Money", ge=0),
+        Field("case_lc", "number", "Money", ge=0),
+        Field("case_f0", "number", "Money"),
+        Field("case_cu", "number", "CoverageUnits", ge=0),
+        Field("case_n0", "number", "CoverageUnits", ge=0),
+        Field("case_delta", "number", "Money"),
+        previous=True,
+        locked_in=True,
+    )
+    invariants = tuple(inv for inv in InForceGroup.invariants if not inv.name.startswith("K7"))
+
+    @var
+    def csm_open_per(self) -> Money:
+        return self.group.case_csm
+
+    @var
+    def lc_open_per(self) -> Money:
+        return self.group.case_lc
+
+    @var
+    def fcf_prev_0(self) -> Money:
+        return self.group.case_f0
+
+    @var
+    def cu_act_per(self) -> CoverageUnits:
+        return self.group.case_cu
+
+    @var
+    def n_0(self) -> CoverageUnits:
+        return self.group.case_n0
+
+    @var
+    def delta_fcf_l(self) -> Money:
+        return self.group.case_delta
+
+
+EDGE_CASES: dict[str, tuple[str, dict[str, float | str]]] = {
+    "break-even, unfavourable change": ("P", {"csm": 0.0, "lc": 0.0}),
+    "break-even, favourable change": ("P", {"csm": 0.0, "lc": 0.0, "delta": "-dp"}),
+    "F_prev(0) = 0": ("O", {"f0": 0.0}),
+    "delta_FCF_L = 0 with LC_alloc > 0": ("O", {"delta": 0.0}),
+    "cu_act + N(0) = 0": ("P", {"cu": 0.0, "n0": 0.0}),
+    "cu_act = 0, N(0) > 0": ("P", {"cu": 0.0}),
+}
+"""In-force 9.7's cases: the variant whose close inputs a case starts from, and what it changes
+(``"-dp"``: minus variant P's delta_FCF_L, a favourable change of the same size)."""
+
+
+@pytest.fixture(scope="module")
+def compiled_edge() -> CompiledModel:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return build(Edge)
+
+
+@pytest.mark.parametrize("case", list(EDGE_CASES))
+def test_the_edge_cases_of_the_close(
+    case: str,
+    chains: dict[str, Chain],
+    compiled_edge: CompiledModel,
+    inforce_oracle: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """In-force 9.7 through the stage's own where-forms, each guard's other branch run: a group at
+    break-even at V_prev (both signs of the change), F_prev(0) = 0 (LC_alloc = 0, nothing to
+    allocate to), a change of 0 with a loss component (the first rule), no coverage left at all
+    (R_per = CSM_adj, and the months start from CSM(0) = 0) and no units in the period with
+    some to come (R_per = 0). Every step of the close equals the script's ``close_period`` on
+    the same inputs bit for bit, and every invariant but K7 holds."""
+    k, change = EDGE_CASES[case]
+    chain = chains[k]
+    dp = chains["P"].lane("delta_fcf_l", 0)
+    inputs = {
+        "csm": chain.lane("csm_open_per", 0),
+        "lc": chain.lane("lc_open_per", 0),
+        "f0": chain.lane("aoc_a", 0),
+        "cu": chain.lane("cu_act_per", 0),
+        "n0": chain.lane("n_0", 0),
+        "delta": chain.lane("delta_fcf_l", 0) if k == "O" else dp,
+    }
+    inputs.update({name: -dp if v == "-dp" else float(v) for name, v in change.items()})
+    groups = chain.groups
+    for name, value in inputs.items():
+        groups = groups.append_column(f"case_{name}", pa.array([value], pa.float64()))
+    res = chain.in_force(tmp_path / "edge", compiled=compiled_edge, groups=groups)
+    gid = chain.gid
+
+    def one(name: str) -> float:
+        return float(res.lane(name, gid)[0])
+
+    f_tau = chain.lane("aoc_b", 0)
+    want = inforce_oracle.close_period(
+        inputs["csm"],
+        inputs["lc"],
+        inputs["cu"],
+        inputs["f0"],
+        f_tau,
+        inputs["delta"],
+        inputs["n0"],
+    )
+    for name, key in CLOSE_STEPS.items():
+        assert one(name) == want[key], (name, one(name), want[key])
+    if case.startswith("break-even"):
+        assert one("csm_acc") == one("lc_alloc_per") == 0.0
+        if inputs["delta"] > 0:
+            assert (one("csm_adj"), one("lc_adj")) == (0.0, dp)
+        else:
+            assert (one("csm_adj"), one("lc_adj")) == (dp, 0.0)
+    elif case == "F_prev(0) = 0":
+        assert one("lc_alloc_per") == 0.0
+        assert one("lca_per") == inputs["lc"]
+    elif case == "delta_FCF_L = 0 with LC_alloc > 0":
+        assert one("lc_alloc_per") > 0.0
+        assert (one("csm_adj"), one("lc_adj")) == (one("csm_acc"), one("lc_alloc_per"))
+    elif case == "cu_act + N(0) = 0":
+        assert one("u_per") == 0.0
+        assert one("r_per") == one("csm_adj") > 0.0
+        assert (res.lane("csm", gid) == 0.0).all()
+    else:
+        assert one("r_per") == 0.0
+        assert one("csm_0") == one("csm_adj") > 0.0
+    names = [r.name for r in res.invariants]
+    assert not any(name.startswith("K7") for name in names)
+    assert all(r.passed for r in res.invariants)
 
 
 # ---------------------------------------------------------- the shifted world (12.3, 14.8)
@@ -1060,6 +1336,189 @@ def test_the_shifted_world_z1_and_z2(
     assert all(r.passed for r in stage.invariants)
 
 
+# -------------------------------------- a chain of two periods: tau0 not equal to tau (4)
+
+
+V_MID = dt.date(2026, 6, 30)
+"""A valuation date half-way through the reference period, which splits it into two."""
+TAU_MID = 6
+"""The months of each half: tau0 = tau = 6 for the first close, tau0 = 12 and tau = 6 for the
+second."""
+T_MID = 12 * 120 + 1 - 946
+"""The horizon at V_MID: the level life's age is 946 months there (in-force 4)."""
+SURVIVORS_MID = {"P": {"level": 99.0, "cpi": 50.0}, "O": {"level": 98.0, "cpi": 49.0}}
+"""The lives in force at V_MID, on the life-month stories of in-force 13."""
+CU_ACT_MID = {"P": 1000.00 * 597 + 800.00 * 300, "O": 1000.00 * 594 + 800.00 * 298}
+"""cu_act of the first half on the same stories (P: 100 lives for three months, 99 for three;
+O: 100, 99, 98 for two months each, and 50 for four, 49 for two); the second half's is the rest
+of the period's total."""
+
+
+def _cpi_mid(u: int) -> float:
+    """I_act at V_MID, u <= 0: the reference history, its months counted from June 2026."""
+    return data.cpi_actual(u - TAU_MID)
+
+
+def _cpi_act_mid() -> Any:
+    months = list(range(CPI_ACT_FIRST_MONTH, 1))
+    return pa.table(
+        {
+            "u": pa.array(months, pa.int32()),
+            "cpi": pa.array([_cpi_mid(u) for u in months], pa.float64()),
+        }
+    ).replace_schema_metadata(
+        {
+            b"halley.version": b"in-force-mid",
+            b"halley.basis": b"in-force-mid",
+            b"halley.estimated_rows": b"0",
+        }
+    )
+
+
+def _groups_at(k: str, prev_valuation_date: dt.date, cu_act: float, previous: RunResult) -> Any:
+    """Variant k's groups row with another previous valuation date and period's units, and the
+    fields read from ``previous``, never retyped."""
+    groups = pq.read_table(_file(f"groups_{k}"))
+    for name, value in (
+        ("prev_valuation_date", pa.array([prev_valuation_date], pa.date32())),
+        ("cu_act", pa.array([cu_act], pa.float64())),
+    ):
+        groups = groups.set_column(groups.column_names.index(name), name, value)
+    return data.with_previous_run(groups, previous)
+
+
+@pytest.mark.parametrize("k", VARIANTS)
+def test_a_second_period_reads_the_first_as_its_previous_run(
+    k: str, chains: dict[str, Chain], compiled_in_force_group: CompiledModel
+) -> None:
+    """In-force 3.4 ("in a later period prev_run_id would name the previous in-force run") and
+    the case of section 4, tau0 not equal to tau: the reference period split at 2026-06-30. The
+    first close (tau0 = tau = 6) reads the recognition run; the second, at V, reads the first as
+    its previous run, with tau0 = 12 from the recognition date and tau = 6 from the previous
+    valuation date, so i_acc = 6 and CSM_acc = (csm_prev x P_rec(6)) / P_rec(12) bit for bit,
+    and the locked-in files are held to tau0 = 12, never to tau (a p_l re-based at 6 is
+    refused). Its derived fields are the first close's FCF(0), FCF(6), LC(6) and P_g, K7 holds
+    against the first close's monthly LC(6), and its old basis is the first close's cur runs'
+    expected in-force at V on their tables, the expense table rebased from June to December
+    prices. Every invariant holds on both closes, each equal to its recomputation from its own
+    copies (D19)."""
+    chain = chains[k]
+    root, gid = chain.root, chain.gid
+    cpi_act = _cpi_act_mid()
+    p_rec_mid, p_l_mid = locked_in_curve(_file("discount_rec"), _file("ilp"), TAU_MID, T_MID)
+    cpi_locked = locked_in_cpi(cpi_act, _file("cpi_rec"), TAU_MID, T_MID)
+    expense_v2 = data.expense_table(data.MAINT_PM_V2, data.price_base(V_MID))
+    discount_cur = data.discount_table(lambda s, t: data.rf_df(t, data.RF_LEVEL_CUR), t_max=T_MID)
+    cpi_cur = data.cpi_table(
+        lambda s, u: _cpi_mid(u) if u <= 0 else _cpi_mid(0) * data.CPI_CURRENT ** (u / 12),
+        u_lo=data.IF_CPI_U_LO,
+        u_hi=T_MID,
+    )
+    points = {
+        c: data.model_points_table(
+            [
+                {**r, "pols_if_init": SURVIVORS_MID[k][c]}
+                for r in data.IN_FORCE_MODEL_POINTS[k]
+                if r["cls"] == c
+            ],
+            valuation_date=V_MID,
+        )
+        for c in CLASSES
+    }
+    expense_old = rebase_expense_table(
+        _file("expense_v1"), cpi_act, TAU_MID, data.price_base(V_MID)
+    )
+    files = {
+        "OLD": ({**OLD_TABLES, "expense": expense_old}, p_l_mid, cpi_locked),
+        "NEW": ({**NEW_TABLES, "expense": expense_v2}, p_l_mid, cpi_locked),
+        "CUR": ({**CUR_TABLES, "expense": expense_v2}, discount_cur, cpi_cur),
+    }
+    bases: dict[str, list[RunResult]] = {}
+    for name, (tables, rf_df, cpi) in files.items():
+        bases[name.lower()] = [
+            _project(
+                chain.compiled[c],
+                expected_in_force(chain.rec[c], TAU_MID, points[c]) if name == "OLD" else points[c],
+                root / f"mid-{k}-{name}-{c}",
+                at=V_MID,
+                tables=tables,
+                rf_df=rf_df,
+                cpi=cpi,
+                horizon=T_MID,
+            )
+            for c in CLASSES
+        ]
+    first = run_aggregation(
+        compiled_in_force_group,
+        groups=_groups_at(k, V_REC, CU_ACT_MID[k], chain.recognised),
+        bases=bases,
+        scenarios={
+            "p_l": p_l_mid,
+            "df_cur": composed_curve(discount_cur, _file("ilp"), T_MID),
+            "p_rec": p_rec_mid,
+        },
+        tables={"cpi_act": cpi_act},
+        settings=RunSettings(valuation_date=V_MID, runs_root=root),
+        run_dir=root / f"mid-{k}-in-force",
+    )
+    assert first.H == T_MID
+    derived = pq.read_table(first.run_dir / "inputs" / "derived_groups.parquet").to_pylist()[0]
+    assert (derived["tau0"], derived["tau"], derived["i_acc"], derived["i_rec"]) == (6, 6, 0, 6)
+    assert first.manifest["locked_in"][gid]["tau0"] == TAU_MID
+
+    old = [
+        chain.at_v(
+            "OLD",
+            c,
+            root / f"late-{k}-OLD-{c}",
+            points=expected_in_force(bases["cur"][i], TAU_MID, _file(f"mp_{c}_{k}_v")),
+            tables={
+                **CUR_TABLES,
+                "ilp": "ilp_zero",
+                "expense": rebase_expense_table(
+                    expense_v2, _file("cpi_act"), TAU_MID, data.price_base(V)
+                ),
+            },
+        )
+        for i, c in enumerate(CLASSES)
+    ]
+    groups = _groups_at(k, V_MID, data.IN_FORCE_CU_ACT[k] - CU_ACT_MID[k], first)
+    second = chain.in_force(root / f"late-{k}-in-force", groups=groups, bases=chain.bases(old=old))
+    m = second.manifest
+    assert m["previous"]["run_id"] == first.run_id
+    assert m["locked_in"][gid]["tau0"] == TAU  # from the recognition date, not from V_MID
+    derived = pq.read_table(second.run_dir / "inputs" / "derived_groups.parquet").to_pylist()[0]
+    assert (derived["tau0"], derived["tau"], derived["i_acc"], derived["i_rec"]) == (12, 6, 6, 12)
+    assert derived["f_prev_0"] == first.lane("fcf_g", gid)[0]
+    assert derived["f_prev_tau"] == first.lane("fcf_g", gid)[TAU_MID]
+    assert derived["lc_prev_tau"] == first.lane("lc", gid)[TAU_MID]
+    assert derived["p_g_prev"] == first.lane("p_g", gid)[0] == chain.lane("p_g", 0)
+    csm_prev = float(first.lane("csm", gid)[0])
+    assert second.lane("csm_open_per", gid)[0] == csm_prev
+    p_rec = pq.read_table(_file("p_rec")).column("rf_df").to_pylist()
+    assert second.lane("csm_acc", gid)[0] == (csm_prev * p_rec[6]) / p_rec[12]
+    if k == "P":
+        assert second.lane("csm_acc", gid)[0] > csm_prev > 0.0  # six months' accretion
+    else:
+        assert second.lane("lc_alloc_per", gid)[0] > 0.0
+    p_g = chain.lane("p_g", 0)  # K7, against the first close's own monthly LC(6)
+    assert abs(second.lane("lc_alloc_per", gid)[0] - first.lane("lc", gid)[TAU_MID]) <= 1e-12 * p_g
+    for res in (first, second):
+        assert all(r.passed for r in res.invariants)
+        _assert_close_exact(res)
+    sources = {e["value"] for e in m["provenance"] if e["key"] == "derived_from"}
+    assert sources == {r.run_id for r in bases["cur"]}
+    _r, p_l_6 = locked_in_curve(_file("discount_rec"), _file("ilp"), TAU_MID, T)
+    _refused(
+        chain,
+        root / f"late-{k}-p_l-6",
+        r"scenario input p_l.*halley\.tau0 is 6; the stage rebuilds .* at its tau0 = 12",
+        groups=groups,
+        bases=chain.bases(old=old),
+        scenarios={"p_l": p_l_6},
+    )
+
+
 # ------------------------------------------------------------------- G6 and 12.4 at load
 
 
@@ -1127,8 +1586,9 @@ def test_the_load_time_checks_of_section_12_4(chains: dict[str, Chain], tmp_path
         LoadError,
         match=r"input rule the locked-in curve covers \[0, tau0 \+ H\] fails \(p_rec, the "
         r"composed curve at recognition, reaches the run-off",
-    ):
+    ) as info:
         chain.in_force(tmp_path / "short", scenarios={"p_rec": p_rec})
+    assert info.value.loc is None  # the data's failure, not the rule's (as every input rule's)
     assert not (tmp_path / "short" / "manifest.json").exists()
     act = pq.read_table(_file("cpi_act"))
     late = act.slice(-13 - CPI_ACT_FIRST_MONTH)  # u = -13..0
@@ -1162,30 +1622,32 @@ def test_the_locked_in_files_are_rebuilt_at_the_groups_tau0(
     chain = chains["P"]
     discount, ilp = _file("discount_rec"), _file("ilp")
     _p_rec, p_l_0 = locked_in_curve(discount, ilp, 0, T)
-    with pytest.raises(
-        LoadError, match=r"scenario input p_l.*halley\.tau0 is 0; the stage rebuilds .* tau0 = 12"
-    ):
-        chain.in_force(tmp_path / "p_l-0", scenarios={"p_l": p_l_0})
     p_rec_6, _p_l = locked_in_curve(discount, ilp, 6, T)
-    with pytest.raises(LoadError, match=r"scenario input p_rec.*halley\.tau0 is 6"):
-        chain.in_force(tmp_path / "p_rec-6", scenarios={"p_rec": p_rec_6})
     bare = _without(pq.read_table(_file("p_l")), "rebased_from")
-    with pytest.raises(
-        LoadError,
-        match=r"scenario input p_l.*carries no metadata halley\.rebased_from; the stage rebuilds",
-    ):
-        chain.in_force(tmp_path / "bare", scenarios={"p_l": bare})
     spliced = locked_in_cpi(_file("cpi_act"), _file("cpi_rec"), 6, T)
     old = [chain.at_v("OLD", c, tmp_path / f"old-6-{c}", cpi=spliced) for c in CLASSES]
     new = [chain.at_v("NEW", c, tmp_path / f"new-6-{c}", cpi=spliced) for c in CLASSES]
-    with pytest.raises(
-        LoadError,
-        match=rf"basis old run {old[0].run_id}: scenario input cpi.*halley\.tau0 is 6; .*"
-        r"locked_in_cpi",
-    ):
-        chain.in_force(tmp_path / "cpi-6", bases=chain.bases(old=old, new=new))
-    for name in ("p_l-0", "p_rec-6", "bare", "cpi-6"):
-        assert not (tmp_path / name / "manifest.json").exists()
+    cases: list[tuple[str, str, dict[str, Any]]] = [
+        (
+            "p_l-0",
+            r"scenario input p_l.*halley\.tau0 is 0; the stage rebuilds .* tau0 = 12",
+            {"scenarios": {"p_l": p_l_0}},
+        ),
+        ("p_rec-6", r"scenario input p_rec.*halley\.tau0 is 6", {"scenarios": {"p_rec": p_rec_6}}),
+        (
+            "bare",
+            r"scenario input p_l.*carries no metadata halley\.rebased_from; the stage rebuilds",
+            {"scenarios": {"p_l": bare}},
+        ),
+        (
+            "cpi-6",
+            rf"basis old run {old[0].run_id}: scenario input cpi.*halley\.tau0 is 6; .*"
+            r"locked_in_cpi",
+            {"bases": chain.bases(old=old, new=new)},
+        ),
+    ]
+    for name, match, given in cases:
+        _refused(chain, tmp_path / name, match, **given)
     locked = chain.stage.manifest["locked_in"][chain.gid]
     assert locked["tau0"] == TAU
     files = {e["file"].split(": ")[-1] for es in locked["verified_by"].values() for e in es}
@@ -1195,6 +1657,219 @@ def test_the_locked_in_files_are_rebuilt_at_the_groups_tau0(
         "scenario input rf_df",
         "scenario input cpi",
     } <= files
+
+
+def _refused(chain: Chain, run_dir: Path, match: str, **given: Any) -> None:
+    """The in-force stage on the chain's inputs with ``given`` replaced is a LoadError matching
+    ``match``, located at no model line (the data's failure), before anything is written."""
+    with pytest.raises(LoadError, match=match) as info:
+        chain.in_force(run_dir, **given)
+    assert info.value.loc is None
+    assert not (run_dir / "manifest.json").exists()
+
+
+def _with_metadata(table: Any, **entries: str) -> Any:
+    meta = dict(table.schema.metadata)
+    meta.update({f"halley.{k}".encode(): v.encode() for k, v in entries.items()})
+    return table.replace_schema_metadata(meta)
+
+
+def test_each_locked_in_curve_is_the_curve_it_is_read_as(
+    chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """Review B3b's blocker: p_rec read as p_l carries the group's hashes and tau0, rebuilds bit
+    for bit and has P_rec(0) = 1, so only its halley.curve tells (CSM(0) was 257741.16 instead of
+    257517.17); likewise p_l read as p_rec, and the old and new runs discounting on p_rec
+    (delta_FCF_L 488584.37 instead of 482558.64) or on another file than the stage's p_l. Each is
+    a LoadError naming the file and what it is."""
+    chain = chains["P"]
+    _refused(
+        chain,
+        tmp_path / "p_l-is-p_rec",
+        r"scenario input p_l .*halley\.curve is p_rec, the composed curve at recognition P_rec\(t\)"
+        r", not re-based.*; it is read as p_l, the locked-in curve re-based to V",
+        scenarios={"p_l": _file("p_rec")},
+    )
+    _refused(
+        chain,
+        tmp_path / "p_rec-is-p_l",
+        r"scenario input p_rec .*halley\.curve is p_l, the locked-in curve re-based to V.*; it "
+        r"is read as p_rec, the composed curve at recognition",
+        scenarios={"p_rec": _file("p_l")},
+    )
+    old = [chain.at_v("OLD", c, tmp_path / f"old-p_rec-{c}", rf_df="p_rec") for c in CLASSES]
+    new = [chain.at_v("NEW", c, tmp_path / f"new-p_rec-{c}", rf_df="p_rec") for c in CLASSES]
+    _refused(
+        chain,
+        tmp_path / "runs-on-p_rec",
+        rf"basis old run {old[0].run_id}: scenario input rf_df .*halley\.curve is p_rec, .*it is "
+        r"read as p_l",
+        bases=chain.bases(old=old, new=new),
+    )
+    other = _with_metadata(pq.read_table(_file("p_l")), note="a second copy of p_l")
+    _refused(
+        chain,
+        tmp_path / "another-p_l",
+        rf"basis old run {chain.old['level'].run_id}: scenario input rf_df .*is not the file the "
+        r"stage reads as p_l .*the runs of bases old and new discount on the group's one "
+        r"locked-in curve \(in-force 5\.5\)",
+        scenarios={"p_l": other},
+    )
+
+
+def test_the_locked_in_runs_read_an_ilp_of_zero(chains: dict[str, Chain], tmp_path: Path) -> None:
+    """Review B3b's blocker: the old and new runs on P_L with the 0.005 ILP table beside it count
+    the premium twice; both share it, so the structural check passes, and CSM(0) was
+    281840.06. P_L holds the premium already, so a locked-in run reads an ilp of 0.0 (C17, the
+    note NOTE_LOCKED_IN_RUNS discloses), read from its verified copy."""
+    chain = chains["P"]
+    old = [
+        chain.at_v("OLD", c, tmp_path / f"old-ilp-{c}", tables={**OLD_TABLES, "ilp": "ilp"})
+        for c in CLASSES
+    ]
+    new = [
+        chain.at_v("NEW", c, tmp_path / f"new-ilp-{c}", tables={**NEW_TABLES, "ilp": "ilp"})
+        for c in CLASSES
+    ]
+    _refused(
+        chain,
+        tmp_path / "ilp-twice",
+        rf"basis old run {old[0].run_id}: table ilp .*holds ilp \[0\.005\], not one row of 0\.0; "
+        r"the runs of basis old read P_L, which holds the group's locked-in illiquidity premium "
+        r"already, .*another premium is counted twice",
+        bases=chain.bases(old=old, new=new),
+    )
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_the_runs_files_name_the_stages_actual_cpi_history(
+    chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """The rebased expense table names its actual CPI history by halley.cpi_act_sha256 and the
+    locked-in CPI path by halley.act_sha256; both must be the stage's table cpi_act, the history
+    its run directory copies and flags (C9), not one the provenance check finds elsewhere. And
+    the history holds exactly the months -26..0, a limit of this version: a longer one is
+    refused by the table's key, naming its range."""
+    chain = chains["P"]
+    shifted = _shifted_cpi_act()
+    _refused(
+        chain,
+        tmp_path / "other-history",
+        rf"basis old run {chain.old['level'].run_id}: table expense .*halley\.cpi_act_sha256 is "
+        rf"{_sha(_file('cpi_act'))}, but the stage's table cpi_act .*is {data.sha256(shifted)}",
+        tables={"cpi_act": shifted},
+    )
+    spliced = locked_in_cpi(shifted, _file("cpi_rec"), TAU, T)
+    old = [chain.at_v("OLD", c, tmp_path / f"old-act-{c}", cpi=spliced) for c in CLASSES]
+    new = [chain.at_v("NEW", c, tmp_path / f"new-act-{c}", cpi=spliced) for c in CLASSES]
+    _refused(
+        chain,
+        tmp_path / "spliced-elsewhere",
+        rf"basis old run {old[0].run_id}: scenario input cpi .*halley\.act_sha256 is "
+        rf"{data.sha256(shifted)}, but the stage's table cpi_act",
+        bases=chain.bases(old=old, new=new),
+    )
+    act = pq.read_table(_file("cpi_act"))
+    longer = pa.table(
+        {
+            "u": pa.array([CPI_ACT_FIRST_MONTH - 1, *act.column("u").to_pylist()], pa.int32()),
+            "cpi": pa.array(
+                [data.cpi_actual(CPI_ACT_FIRST_MONTH - 1), *act.column("cpi").to_pylist()],
+                pa.float64(),
+            ),
+        }
+    ).replace_schema_metadata(act.schema.metadata)
+    expense = rebase_expense_table(_file("expense_v1"), longer, TAU, data.price_base(V))
+    cpi = locked_in_cpi(longer, _file("cpi_rec"), TAU, T)
+    tables = {**OLD_TABLES, "expense": expense}
+    old = [chain.at_v("OLD", c, tmp_path / f"old-27-{c}", tables=tables, cpi=cpi) for c in CLASSES]
+    new = [chain.at_v("NEW", c, tmp_path / f"new-27-{c}", cpi=cpi) for c in CLASSES]
+    with pytest.raises(
+        LoadError, match=r"key u has rows outside its declared range \[-26, 0\]: -27"
+    ):
+        chain.in_force(
+            tmp_path / "longer", bases=chain.bases(old=old, new=new), tables={"cpi_act": longer}
+        )
+    assert not (tmp_path / "longer" / "manifest.json").exists()
+
+
+def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_points(
+    chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """Review B3b's major: in-force 3.4 reads the expected in-force and the previous
+    non-financial tables from the previous run, never retyped (C16), and 5.5 gives NEW the
+    actual in-force CUR has. The old runs on the actual in-force at V (delta_FCF_L was the
+    spec's 14.4 'basis change only' 279198.15), derived from a run that is not the previous
+    run's, on the expense table typed at V prices without its rebase, or on the version 2 base
+    table, and the new runs on the expected in-force, are each a LoadError naming the copy."""
+    chain = chains["P"]
+    previous = chain.recognised.run_id
+    rec_level = chain.rec["level"].run_id
+
+    def old_runs(name: str, **kw: Any) -> list[RunResult]:
+        return [chain.at_v("OLD", c, tmp_path / f"old-{name}-{c}", **kw) for c in CLASSES]
+
+    actual = [
+        chain.at_v("OLD", c, tmp_path / f"old-at-v-{c}", points=_file(f"mp_{c}_P_v"))
+        for c in CLASSES
+    ]
+    _refused(
+        chain,
+        tmp_path / "actual",
+        rf"basis old run {actual[0].run_id}: model points .*carries no metadata "
+        rf"halley\.derived_from; basis old projects the expected in-force at V of a run of basis "
+        rf"cur of the previous run {previous}",
+        bases=chain.bases(old=actual),
+    )
+    elsewhere = [
+        chain.at_v(
+            "OLD",
+            c,
+            tmp_path / f"old-elsewhere-{c}",
+            points=expected_in_force(chain.new[c], 0, _file(f"mp_{c}_P_v")),
+        )
+        for c in CLASSES
+    ]
+    _refused(
+        chain,
+        tmp_path / "elsewhere",
+        rf"basis old run {elsewhere[0].run_id}: model points .*halley\.derived_from is "
+        rf"{chain.new['level'].run_id}, which is not a run of basis cur of the previous run "
+        rf"{previous}",
+        bases=chain.bases(old=elsewhere),
+    )
+    typed = _with_metadata(pq.read_table(_file("expense_v1")), price_base=data.price_base(V))
+    hand = old_runs("typed", tables={**OLD_TABLES, "expense": typed})
+    _refused(
+        chain,
+        tmp_path / "typed",
+        rf"basis old run {hand[0].run_id}: table expense .*is not the table expense of basis cur "
+        rf"run {rec_level} of the previous run {previous} .*nor a rebase of it "
+        r"\(halley\.rebased_from is absent\)",
+        bases=chain.bases(old=hand),
+    )
+    v2 = old_runs("v2", tables={**OLD_TABLES, "mort_base": "mort_base_v2"})
+    _refused(
+        chain,
+        tmp_path / "v2",
+        rf"basis old run {v2[0].run_id}: table mort_base .*is not the table mort_base of basis "
+        rf"cur run {rec_level}",
+        bases=chain.bases(old=v2),
+    )
+    expected = [
+        chain.at_v("NEW", c, tmp_path / f"new-expected-{c}", points=chain.points("OLD", c))
+        for c in CLASSES
+    ]
+    _refused(
+        chain,
+        tmp_path / "new-expected",
+        rf"basis new run {expected[0].run_id}: model points .*is not the model point file of "
+        rf"basis cur run {chain.cur['level'].run_id}, which holds policy 11",
+        bases=chain.bases(new=expected),
+    )
 
 
 class Unlocked(InForceGroup):
@@ -1207,18 +1882,33 @@ class Stringly(InForceGroup):
     rebuilds_locked_in: ClassVar[Any] = "yes"
 
 
+class Unprevious(InForceGroup):
+    """An in-force stage whose groups name no previous run, so its old basis is held to none."""
+
+    model_point = group_schema(locked_in=True)
+
+
 def test_the_stage_is_checked_at_build_and_refused_by_run(
     chains: dict[str, Chain], compiled_in_force_group: CompiledModel, tmp_path: Path
 ) -> None:
     """``rebuilds_locked_in`` is a bool, and a stage that sets it declares the locked-in basis
-    (a BuildError at the class otherwise); ``run()``, which reads no previous run and checks no
-    hash, refuses the in-force stage before anything is written."""
-    with pytest.raises(BuildError, match=r"Unlocked is rebuilds_locked_in.*discount_rec_sha256"):
-        build(Unlocked)
-    with pytest.raises(
-        BuildError, match=r"Stringly\.rebuilds_locked_in is True or False, not 'yes'"
+    and, reading the old basis, the previous run it is held to (a BuildError at the class, the
+    user's model source, otherwise); ``run()``, which reads no previous run and checks no hash,
+    refuses the in-force stage before anything is written."""
+    for broken, match in (
+        (Unlocked, r"Unlocked is rebuilds_locked_in.*discount_rec_sha256"),
+        (Stringly, r"Stringly\.rebuilds_locked_in is True or False, not 'yes'"),
+        (Unprevious, r"Unprevious is rebuilds_locked_in and reads basis old.*no prev_run_id"),
     ):
-        build(Stringly)
+        with pytest.raises(BuildError, match=match) as info:
+            build(broken)
+        loc = info.value.loc
+        assert loc is not None
+        assert (loc.file, loc.line, loc.function) == (
+            __file__,
+            inspect.getsourcelines(broken)[1],
+            broken.__qualname__,
+        )
     with pytest.raises(LoadError, match=r"reads a previous run .*run_aggregation"):
         run(
             compiled_in_force_group,
@@ -1566,9 +2256,9 @@ def test_the_run_directory_records_the_period(chains: dict[str, Chain]) -> None:
 
 
 GROUP_CLOSE_ROWS = {
-    "csm_prev": lambda c: c.groups.to_pylist()[0]["csm_prev"],
-    "lc_prev": lambda c: c.groups.to_pylist()[0]["lc_prev"],
-    "cu_act": lambda c: c.groups.to_pylist()[0]["cu_act"],
+    "csm_prev": lambda c: c.lane("csm_open_per", 0),
+    "lc_prev": lambda c: c.lane("lc_open_per", 0),
+    "cu_act": lambda c: c.lane("cu_act_per", 0),
     "step 1: CSM_acc": lambda c: c.lane("csm_acc", 0),
     "acc_per": lambda c: c.lane("acc_per", 0),
     "F_prev(0)": lambda c: c.recognised.lane("fcf_g", c.gid)[0],
@@ -1590,16 +2280,16 @@ GROUP_CLOSE_ROWS = {
     "LC(0) = LC_adj": lambda c: c.lane("lc_0", 0),
     "FCF_g^cur(0)": lambda c: c.lane("aoc_e", 0),
     "LRC(0)": lambda c: c.lane("lrc_0", 0),
-    "Opening CSM": lambda c: c.groups.to_pylist()[0]["csm_prev"],
+    "Opening CSM": lambda c: c.lane("csm_open_per", 0),
     "Interest accretion": lambda c: c.lane("acc_per", 0),
     "Changes for future service": lambda c: c.lane("csm_fs", 0),
     "Currency differences": lambda c: 0.0,
     "Release": lambda c: -c.lane("r_per", 0),
     "Closing CSM": lambda c: c.lane("csm_0", 0),
-    "Opening LC": lambda c: c.groups.to_pylist()[0]["lc_prev"],
+    "Opening LC": lambda c: c.lane("lc_open_per", 0),
     "Systematic allocation": lambda c: -c.lane("lca_per", 0),
-    "Losses on remeasurement": lambda c: max(c.lane("lc_fs", 0), 0.0),
-    "Reversals of losses": lambda c: min(c.lane("lc_fs", 0), 0.0),
+    "Losses on remeasurement": lambda c: c.lane("lc_loss", 0),
+    "Reversals of losses": lambda c: c.lane("lc_reversal", 0),
     "Closing LC": lambda c: c.lane("lc_0", 0),
     "A = ": lambda c: c.lane("aoc_a", 0),
     "B = ": lambda c: c.lane("aoc_b", 0),
@@ -1653,34 +2343,123 @@ MONTHS_COLUMNS = {
 """The group sheet's months block (in-force 10): by header, the stage's variable and the first
 month defined (month quantities are blank in row 0, in-force 4)."""
 
-POLICY_COLUMNS = {"bel": 0, "ra": 0, "pols_if": 0, "cu": 1}
-"""The (run, policy) sheets' columns reconciled, and the first month each is defined."""
+POLICY_COLUMNS = {
+    "x": "age",
+    "Y": "cal_year",
+    "q_ann": "q_ann",
+    "q_mth": "q_mth",
+    "deaths": "deaths",
+    "pols_if": "pols_if",
+    "anniv": "anniv",
+    "esc_factor": "esc_factor",
+    "ann_pp": "ann_pp",
+    "exp_pp": "exp_pp",
+    "ann_out": "ann_out",
+    "exp_out": "exp_out",
+    "df": "df",
+    "v": "v",
+    "s_pp": "s_pp",
+    "q_ann_st": "q_ann_st",
+    "q_mth_st": "q_mth_st",
+    "s_pp_st": "s_pp_st",
+    "cu": "cu",
+    "bel": "bel",
+    "inv_exp": "inv_exp",
+    "v_be": "v_be",
+    "v_st": "v_st",
+    "ra": "ra",
+}
+"""Every column of section 6.10 on the (run, policy) sheets, by header, and the run's stored
+variable: from t = 0 for a state, from 1 otherwise, per-life columns to the policy's run-off
+only (in-force 6.11); the integer and boolean columns exactly. The level class stores no
+``anniv`` (its instalment never escalates), so the level sheets' is not compared."""
+
+POLICY_SCALARS = {
+    "bel(0)": ("bel", 0),
+    "ra(0)": ("ra", 0),
+    "pva": ("pva", 0),
+    "pve": ("pve", 0),
+    "ann_pp(1)": ("ann_pp", 1),
+    "v_be(0)": ("v_be", 0),
+    "v_st(0)": ("v_st", 0),
+}
+"""The (run, policy) sheets' scalars of section 7.2, by label, and the run's variable and
+month."""
+
+POLICY_CONSTANTS = {"ie_m": "ie_m", "mort_mult": "mort_mult", "exp_mult": "exp_mult"}
+"""The (run, policy) sheets' derived constants the run stores, by label (in-force 14.1)."""
+
+GROUP_TOTALS = {
+    "rec": ("BEL_g^rec(t)", "RA_g^rec(t)", "FCF_g^rec(t)", "CU_g^rec(t)"),
+    "old": ("BEL_g^L_old(t)", "RA_g^L_old(t)", "FCF_g^L_old(t)", "CU_g^L_old(t)"),
+    "new": ("BEL_g^L_new(t)", "RA_g^L_new(t)", "FCF_g^L_new(t)", "CU_g^L_new(t)"),
+    "cur": ("BEL_g^cur(t)", "RA_g^cur(t)", "FCF_g^cur(t)", "CU_g^cur(t)"),
+}
+"""The group sheet's totals of section 7.1 per run, BEL_g, RA_g, FCF_g and CU_g by t."""
 
 
 def _workbook(k: str, folder: Path = IF_DIR) -> Any:
     """The committed workbook of variant ``k``, read through its cached values; a missing
-    workbook fails the reconciliation rather than skipping it."""
+    workbook, or no openpyxl to read it with, fails the reconciliation rather than skipping it."""
     path = folder / f"in-force-group-{k}.xlsx"
     if not path.exists():
         pytest.fail(f"the reference workbook {path} is missing (in-force 11.3)")
-    openpyxl = pytest.importorskip("openpyxl")
+    try:
+        openpyxl = importlib.import_module("openpyxl")
+    except ImportError:
+        pytest.fail("openpyxl, a development dependency, is needed to read the workbooks")
     return openpyxl.load_workbook(path, data_only=True, read_only=True)
 
 
-def _cached(value: Any, where: str) -> float:
+def _cached(value: Any, where: str) -> Any:
+    """A compared cell's cached value; one without (a workbook saved without recalculation)
+    fails the reconciliation, naming the cell, as a missing workbook does."""
     if value is None:
-        pytest.skip(
+        pytest.fail(
             f"{where} holds no cached value; recalculate the workbook (docs/spec/recalc_excel.py)"
         )
-    return float(value)
+    return value
+
+
+def _group_totals(chain: Chain) -> dict[str, tuple[np.ndarray, int]]:
+    """The engine's side of :data:`GROUP_TOTALS`, by header, with the first month defined: the
+    recognition stage's series and the in-force stage's for REC and CUR, the in-force stage's
+    copies of ``fcf_old`` and ``fcf_new`` for the locked-in FCF, and the runs' own sums in
+    ascending policy id for the locked-in BEL, RA and CU, which the stage does not store."""
+    series = chain.stage.manifest["inputs"]["series"]
+    out: dict[str, tuple[np.ndarray, int]] = {}
+    for basis, headers in GROUP_TOTALS.items():
+        if basis in ("rec", "cur"):
+            stage = chain.recognised if basis == "rec" else chain.stage
+            values = [stage.lane(name, chain.gid) for name in ("bel_g", "ra_g", "fcf_g", "cu_g")]
+        else:
+            runs = list(chain.runs(basis.upper()).values())
+            fcf = pq.read_table(chain.stage.run_dir / series[f"fcf_{basis}"]["copy"])
+            values = [
+                _sum_lanes(runs, "bel"),
+                _sum_lanes(runs, "ra"),
+                np.asarray(fcf.column("value"), dtype=np.float64),
+                _sum_lanes(runs, "cu"),
+            ]
+        for header, lane in zip(headers, values, strict=True):
+            out[header] = (np.asarray(lane, dtype=np.float64), 1 if header.startswith("CU") else 0)
+    return out
+
+
+def _sheet_values(rows: list[tuple[Any, ...]], label: str) -> dict[str, Any]:
+    """A (run, policy) sheet's block of labels and values whose label header is ``label``."""
+    j = list(rows[0]).index(label)
+    return {r[j]: r[j + 1] for r in rows[1:] if isinstance(r[j], str)}
 
 
 @pytest.mark.parametrize("k", VARIANTS)
 def test_the_engine_reconciles_to_the_reference_workbook(k: str, chains: dict[str, Chain]) -> None:
-    """In-force 1 and 11.3: the group sheet's recognition, close and roll-forward blocks and its
-    months block (t = 0..T), and every (run, policy) sheet's bel, ra, pols_if and cu columns,
-    against the engine within 1e-9 x max(|engine|, |workbook|, scale), with the spec's scales;
-    the cached values are the spreadsheet's (read with data_only=True)."""
+    """In-force 1 and 11.3: the group sheet's recognition, close and roll-forward blocks, its
+    totals of every run (7.1) and its months block (t = 0..T); every column of every (run,
+    policy) sheet, with its 7.2 scalars and the constants the run stores; against the engine
+    within 1e-9 x max(|engine|, |workbook|, scale), with the spec's scales, integer and boolean
+    columns exactly; and the checks sheet's all_ok, with every check it holds, true. The cached
+    values are the spreadsheet's (read with data_only=True)."""
     chain = chains[k]
     wb = _workbook(k)
     p_g = chain.lane("p_g", 0)
@@ -1703,21 +2482,28 @@ def test_the_engine_reconciles_to_the_reference_workbook(k: str, chains: dict[st
         )
         assert getter is not None, f"{where} has no engine counterpart"
         try:
-            _agree(getter(chain), _cached(row[labels + 1], where), p_g, rel=SPEC_REL)
+            _agree(getter(chain), float(_cached(row[labels + 1], where)), p_g, rel=SPEC_REL)
         except AssertionError as exc:
             raise AssertionError(f"{where}: {exc}") from None
         seen.add(label)
     assert len(seen) >= 50
-    for title, (name, first) in MONTHS_COLUMNS.items():
+    columns = {
+        **{title: (chain.lane(name), first) for title, (name, first) in MONTHS_COLUMNS.items()},
+        **_group_totals(chain),
+    }
+    assert set(columns) == {title for title in header if isinstance(title, str) and "(t)" in title}
+    for title, (engine, first) in columns.items():
         j = header.index(title)
-        engine = chain.lane(name)
-        scale = 1.0 if name in ("d_l", "j_l") else p_g
-        for t in range(first, T + 1):
-            cell = _cached(rows[t + 1][j], f"group {title} t = {t}")
+        scale = 1.0 if title in ("d_L(t)", "j_L(t)") else p_g
+        last = len(engine) - 1  # the run's H: T_rec = 501 for REC, T = 489 at V
+        assert last == (T_REC if title.endswith("^rec(t)") else T), title
+        for t in range(first, last + 1):
+            cell = float(_cached(rows[t + 1][j], f"group {title} t = {t}"))
             try:
                 _agree(engine[t], cell, scale, rel=SPEC_REL)
             except AssertionError as exc:
                 raise AssertionError(f"group {title} t = {t}: {exc}") from None
+    compared = 0
     for name in RUN_NAMES:
         for c in CLASSES:
             res = chain.runs(name)[c]
@@ -1725,27 +2511,57 @@ def test_the_engine_reconciles_to_the_reference_workbook(k: str, chains: dict[st
             sheet = f"{name}-{pid}"
             prows = list(wb[sheet].iter_rows(values_only=True))
             pheader = list(prows[0])
+            assert len(prows) == res.H + 2, sheet
             n_rec = 100.0 if c == "level" else 50.0
             premium = _premium(chain, pid)
-            for col, first in POLICY_COLUMNS.items():
-                j = pheader.index(col)
-                scale = n_rec if col == "pols_if" else n_rec * premium
+            mp = {"n_rec": n_rec, "single_premium": premium}
+            constants = _sheet_values(prows, "constant")
+            t_end = int(_cached(constants["T_i"], f"{sheet} T_i"))
+            for title, col in POLICY_COLUMNS.items():
+                if col not in res.arrays:
+                    assert (c, col) == ("level", "anniv"), (sheet, col)
+                    continue
+                j = pheader.index(title)
                 lane = res.lane(col, pid)
-                assert len(prows) == res.H + 2, sheet
-                for t in range(first, res.H + 1):
-                    cell = _cached(prows[t + 1][j], f"{sheet} {col} t = {t}")
+                first = 0 if col in STATE_COLS else 1
+                last = res.H if col not in PER_LIFE_LAST else t_end + PER_LIFE_LAST[col]
+                for t in range(first, last + 1):
+                    where = f"{sheet} {title} t = {t}"
+                    cell = _cached(prows[t + 1][j], where)
+                    if col in EXACT_COLS:
+                        assert int(cell) == int(lane[t]), where
+                        continue
                     try:
-                        _agree(lane[t], cell, scale, rel=SPEC_REL)
+                        _agree(lane[t], float(cell), _scale(col, mp), rel=SPEC_REL)
                     except AssertionError as exc:
-                        raise AssertionError(f"{sheet} {col} t = {t}: {exc}") from None
+                        raise AssertionError(f"{where}: {exc}") from None
+                compared += 1
+            for label, (col, t) in POLICY_SCALARS.items():
+                where = f"{sheet} {label}"
+                cell = float(_cached(_sheet_values(prows, "scalar (7.2)")[label], where))
+                _agree(res.lane(col, pid)[t], cell, _scale(col, mp), rel=SPEC_REL)
+            for label, col in POLICY_CONSTANTS.items():
+                cell = float(_cached(constants[label], f"{sheet} {label}"))
+                _agree(res.lane(col, pid)[0], cell, 1.0, rel=SPEC_REL)
+    assert compared == len(RUN_NAMES) * (2 * len(POLICY_COLUMNS) - 1)
+    headings = ("(run, policy) sheet", "group check (12.2)")
+    checks = {
+        row[0]: row[1:]
+        for row in wb["checks"].iter_rows(values_only=True)
+        if row[0] is not None and row[0] not in headings
+    }
+    assert checks["all_ok"][0] is True
+    for name, cells in checks.items():
+        assert all(c is None or c is True or c == "n/a (level class)" for c in cells), name
+        assert cells[0] is True, name
 
 
-def test_a_missing_workbook_fails_and_an_uncached_cell_skips(tmp_path: Path) -> None:
-    """The reconciliation's two outcomes besides a pass: a workbook that is not there fails it,
-    and a compared cell without a cached value (a workbook saved without recalculation) skips
-    it with the cell named."""
+def test_a_missing_workbook_and_an_uncached_cell_fail(tmp_path: Path) -> None:
+    """The reconciliation's outcomes besides a pass: a workbook that is not there fails it, and
+    so does a compared cell without a cached value (a workbook saved without recalculation),
+    with the cell named; neither skips."""
     with pytest.raises(pytest.fail.Exception, match=r"in-force-group-P\.xlsx is missing"):
         _workbook("P", tmp_path)
-    with pytest.raises(pytest.skip.Exception, match=r"group!AJ19 holds no cached value"):
+    with pytest.raises(pytest.fail.Exception, match=r"group!AJ19 holds no cached value"):
         _cached(None, "group!AJ19")
     assert _cached(1.5, "group!AJ19") == 1.5

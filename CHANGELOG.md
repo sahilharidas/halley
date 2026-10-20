@@ -408,35 +408,62 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   `p_rec` (the composed curve at recognition, value column `rf_df`, rule `p_rec(0) = 1`), and
   groups built with `group_schema(previous=True, locked_in=True)`, so the loader fills
   `f_prev_0`, `f_prev_tau`, `lc_prev_tau`, `p_g_prev`, `tau0`, `tau`, `i_acc` and `i_rec` from
-  the previous run and the dates. It computes and stores `p_g` (P_g carried forward),
-  `delta_fcf_l`, the close's `csm_acc` (`(csm_prev x P_rec(i_acc)) / P_rec(i_rec)`), `acc_per`,
-  `lc_alloc_per`, `lca_per`, `rev`, `raw`, `csm_adj`, `lc_adj`, `csm_fs`, `lc_fs`, `n_0`,
-  `u_per`, `r_per`, `csm_0`, `lc_0` and `lrc_0`, and the analysis of change `aoc_a` to `aoc_e`
-  with `aoc_ba`, `aoc_cb`, `aoc_dc` (delta_FCF_L bit for bit) and `aoc_ed`, in the scalars file
-  beside the roll's monthly lines. Its invariants are K1 to K7 (in-force 12.2: K4's
+  the previous run and the dates. It computes and stores `p_g` (P_g carried forward), the
+  group inputs of the close as the lines it reads them through, `csm_open_per` and
+  `lc_open_per` (the opening lines of in-force 11.1's tables, `csm_prev` and `lc_prev`) and
+  `cu_act_per` (`cu_act`), `delta_fcf_l`, the close's `csm_acc` (`(csm_prev x P_rec(i_acc)) /
+  P_rec(i_rec)`), `acc_per`, `lc_alloc_per`, `lca_per`, `rev`, `raw`, `csm_adj`, `lc_adj`,
+  `csm_fs`, `lc_fs` with its two lines of the loss-component table, `lc_loss` (where positive)
+  and `lc_reversal` (where negative), `n_0`, `u_per`, `r_per`, `csm_0`, `lc_0` and `lrc_0`, and
+  the analysis of change `aoc_a` to `aoc_e` with `aoc_ba`, `aoc_cb`, `aoc_dc` (delta_FCF_L bit
+  for bit) and `aoc_ed`, in the scalars file beside the roll's monthly lines. Its invariants
+  are K1 to K7 (in-force 12.2: K1 and K2 sum the stored lines of the period's tables; K4's
   inequalities and "at most one positive" exactly; K5 where `cu_act > 0` and `CSM(0) > 0`; K7
   against the previous run's `lc(tau)`) beside I11 to I13, M1 and M2, every run. Its input rule
-  `the locked-in curve covers [0, tau0 + H]` holds `p_rec` to the months of in-force 12.4.
+  `the locked-in curve covers [0, tau0 + H]` holds `p_rec` to the months of in-force 12.4. A
+  later period's stage names the previous in-force run by `prev_run_id`, with `tau0` counted
+  from the recognition date and `tau` from `prev_valuation_date` (in-force 3.4, 4).
 - The stage also reads a table `cpi_act`, the actual CPI history at V (key `u` in [-26, 0],
   column `cpi`, metadata `estimated_rows`), which no formula reads: the loader rebuilds the old
   and new runs' rebased expense table and locked-in CPI path from it, and as an input of the
   stage it is copied into the run directory, enters the run id and carries its C9 estimate
   flag into the manifest. Every `run_aggregation` of the stage passes
-  `tables={"cpi_act": ...}`.
+  `tables={"cpi_act": ...}`. A limit of this version: the key is a dense grid, so the history
+  holds exactly the months -26..0 (a longer one is a LoadError naming the range), and the
+  expense rebase, which reads `I_act(-tau)`, serves periods of at most 26 months.
 - Its manifest discloses the analysis of change's labels under `analysis_of_change` and five
   notes (`csm.in_force_notes`): the period's single release with the monthly step after V
   (`NOTE_PERIOD_RELEASE`, C12, in place of the monthly-step note, which says a period's release
   is the sum of its monthly releases), the ignored timing convexity, the coverage-unit approach
   as built, the C11 period allocation and the C17 locked-in runs.
 - A stage class may set `rebuilds_locked_in` (a bool; `InForceGroup` sets it, and its groups
-  must declare the locked-in hashes, a BuildError at the class otherwise): every input the
-  loader checks against the group's locked-in hashes (the stage's `p_l` and `p_rec`, the old
-  and new runs' `rf_df` and `cpi`) must then also carry `halley.rebased_from`, so the provenance
-  check rebuilds it bit for bit, and `halley.tau0` equal to the group's months from its
-  recognition date to V. A curve re-based or a CPI path spliced at another month, which would
-  rebuild from its own metadata and pass every invariant, and a file that names no source, are
-  LoadErrors naming the file before anything is written. The manifest's `locked_in` block
-  records the `tau0` held. A variable may not be named `rebuilds_locked_in` in a stage.
+  must declare the locked-in hashes and, when it reads the basis `old`, `prev_run_id`, a
+  BuildError at the class otherwise). The loader then holds its locked-in runs and files to
+  what they were built from, each a LoadError naming the file before anything is written, since
+  each of these rebuilds bit for bit from its own metadata and passes every invariant:
+  - every input checked against the group's locked-in hashes (the stage's `p_l` and `p_rec`,
+    the old and new runs' `rf_df` and `cpi`) carries `halley.rebased_from`, so the provenance
+    check rebuilds it, and `halley.tau0` equal to the group's months from its recognition date
+    to V, never from `prev_valuation_date`; the manifest's `locked_in` block records the `tau0`
+    held;
+  - each curve is the one it is read as (`halley.curve`: `p_l` for the stage's `p_l` and the old
+    and new runs' `rf_df`, `p_rec` for the stage's `p_rec`), the old and new runs discount on
+    the stage's own `p_l` file, and they read an `ilp` table of exactly 0.0 when they read one
+    (C17: P_L holds the premium already, so another would count it twice);
+  - every file of a basis run that names the actual CPI history it was built from
+    (`halley.act_sha256` of the locked-in CPI path, `halley.cpi_act_sha256` of a rebased expense
+    table) names the stage's table `cpi_act`;
+  - each old run's model point copy carries `halley.derived_from` naming a run of the previous
+    aggregation run's cur basis (the expected in-force at V, never retyped), and its
+    non-financial tables are that run's by sha256, or a rebase of one (`halley.rebased_from`,
+    the expense table in V prices); each new run reads the model point file of the cur run that
+    holds its policies.
+
+  A variable may not be named `rebuilds_locked_in` in a stage.
+- The provenance check finds a source in the previous runs back to the group's recognition (each
+  named by the `previous` block of the run after it) and the runs they read, beside the
+  previous run's and the stage's bases: in a later period the files a group locks in at
+  recognition are read only by the recognition run's bases.
 
 ### Notes on determinism
 

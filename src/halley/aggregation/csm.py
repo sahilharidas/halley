@@ -37,9 +37,9 @@ fulfilment cash flows ``FCF_g^L_new(0) - FCF_g^L_old(0)`` of its bases ``new`` a
 release for the period on the units actually provided and those still to come, and the closing
 balances, which open the months after V of the roll-forward above on the ``cur`` basis. It
 stores the analysis of change of in-force section 11.2 and checks K1 to K7 beside I11 to I13,
-M1 and M2. Its locked-in files are rebuilt from the basis the group locks in
-(``rebuilds_locked_in``), so it reads the actual CPI history ``cpi_act`` the old and new runs'
-inputs were built from.
+M1 and M2. Its locked-in files are rebuilt from the basis the group locks in and its old basis
+is held to the previous run (``rebuilds_locked_in``), so it reads the actual CPI history
+``cpi_act`` the old and new runs' inputs were built from.
 """
 
 from __future__ import annotations
@@ -813,7 +813,9 @@ run-off."""
 
 CPI_ACT_FIRST_MONTH = -26
 """The first month of the actual CPI history at V: the runs read ``u >= -14``, and ``-26``
-leaves twelve months of margin for the splice (in-force 3.6 and 4)."""
+leaves twelve months of margin for the splice (in-force 3.6 and 4). A limit of this version:
+the table's key is a dense grid, so the history holds exactly the months -26..0, and the
+expense rebase, which reads ``I_act(-tau)``, serves periods of at most 26 months."""
 
 CPI_ACT = Table(
     "cpi_act",
@@ -827,9 +829,11 @@ CPI_ACT = Table(
 reads it: the stage reads it so that the loader can rebuild, bit for bit, the files its old and
 new runs read that were built from it, the expense table rebased to V prices
 (``rebase_expense_table``, in-force 5.4) and the locked-in CPI path (``locked_in_cpi``, 5.2),
-which name it by ``halley.cpi_act_sha256`` and ``halley.act_sha256`` (design sections 9 and
-10). As an input of the stage it is copied into the run directory and enters the run id (D21);
-its ``estimated_rows`` flag, the C9 estimate of the valuation month, enters the manifest."""
+which must name this file by ``halley.cpi_act_sha256`` and ``halley.act_sha256`` (design
+sections 9 and 10; the loader's ``_check_actual_cpi``). As an input of the stage it is copied
+into the run directory and enters the run id (D21); its ``estimated_rows`` flag, the C9
+estimate of the valuation month, enters the manifest. It holds exactly the months -26..0
+(:data:`CPI_ACT_FIRST_MONTH`)."""
 
 
 def _p_rec_covers(v: InputView) -> bool:
@@ -852,6 +856,9 @@ P_REC_COVERS = InputRule(
 
 CLOSE_OUTPUTS = (
     "p_g",
+    "csm_open_per",
+    "lc_open_per",
+    "cu_act_per",
     "delta_fcf_l",
     "csm_acc",
     "acc_per",
@@ -863,6 +870,8 @@ CLOSE_OUTPUTS = (
     "lc_adj",
     "csm_fs",
     "lc_fs",
+    "lc_loss",
+    "lc_reversal",
     "n_0",
     "u_per",
     "r_per",
@@ -879,10 +888,12 @@ CLOSE_OUTPUTS = (
     "aoc_dc",
     "aoc_ed",
 )
-"""What :class:`InForceGroup` stores beside :data:`ROLL_OUTPUTS`: P_g, the change in locked-in
-fulfilment cash flows, every step of the period close in the spec's order (in-force 9.2 to
-9.6), which are the lines of the period's roll-forward tables (11.1), and the analysis of change
-of the fulfilment cash flows, five values and four differences (11.2)."""
+"""What :class:`InForceGroup` stores beside :data:`ROLL_OUTPUTS`: P_g, the group inputs of the
+close (the opening CSM and loss component, ``csm_prev`` and ``lc_prev``, and the period's units
+``cu_act``), the change in locked-in fulfilment cash flows, every step of the period close in
+the spec's order (in-force 9.2 to 9.6), which with the loss component's losses and reversals
+(``lc_fs`` split by sign) are every line of the period's roll-forward tables (11.1), and the
+analysis of change of the fulfilment cash flows, five values and four differences (11.2)."""
 
 AOC_LABELS = (
     "aoc_a: A, the previous run's FCF at its t = 0; FCF at recognition in the first period",
@@ -922,13 +933,15 @@ def in_force_notes(statics: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _k1_rhs(a: BatchView) -> NDArray[Any]:
-    """csm_prev + acc_per + csm_fs - R_per, left to right."""
-    return ((a.mp.csm_prev + a.var("acc_per")) + a.var("csm_fs")) - a.var("r_per")
+    """csm_prev + acc_per + csm_fs - R_per, left to right: the opening line and the movements
+    of the period's CSM table."""
+    return ((a.var("csm_open_per") + a.var("acc_per")) + a.var("csm_fs")) - a.var("r_per")
 
 
 def _k2_rhs(a: BatchView) -> NDArray[Any]:
-    """lc_prev - lca_per + lc_fs, left to right."""
-    return (a.mp.lc_prev - a.var("lca_per")) + a.var("lc_fs")
+    """lc_prev - lca_per + lc_fs, left to right: the opening line and the movements of the
+    period's loss-component table."""
+    return (a.var("lc_open_per") - a.var("lca_per")) + a.var("lc_fs")
 
 
 def _k3_lhs(a: BatchView) -> NDArray[Any]:
@@ -942,7 +955,7 @@ def _k3_rhs(a: BatchView) -> NDArray[Any]:
 
 def _k5_lhs(a: BatchView) -> NDArray[Any]:
     """R_per / cu_act, guarded where cu_act = 0."""
-    return a.var("r_per") / _guard(np.asarray(a.mp.cu_act, dtype=np.float64))
+    return a.var("r_per") / _guard(a.var("cu_act_per"))
 
 
 def _k5_rhs(a: BatchView) -> NDArray[Any]:
@@ -951,8 +964,7 @@ def _k5_rhs(a: BatchView) -> NDArray[Any]:
 
 
 def _k5_where(a: BatchView) -> NDArray[np.bool_]:
-    cu_act = np.asarray(a.mp.cu_act, dtype=np.float64)
-    return np.asarray((cu_act > 0) & (a.var("csm_0") > 0) & (a.var("n_0") > 0))
+    return np.asarray((a.var("cu_act_per") > 0) & (a.var("csm_0") > 0) & (a.var("n_0") > 0))
 
 
 CLOSE_INVARIANTS = (
@@ -962,7 +974,7 @@ CLOSE_INVARIANTS = (
         _k1_rhs,
         tol=EPS,
         scale=_p_g,
-        reads=("csm_0", "acc_per", "csm_fs", "r_per", "p_g"),
+        reads=("csm_0", "csm_open_per", "acc_per", "csm_fs", "r_per", "p_g"),
         doc="the lines of the period's CSM roll-forward sum to the closing CSM (in-force 11.1)",
     ),
     Invariant(
@@ -971,7 +983,7 @@ CLOSE_INVARIANTS = (
         _k2_rhs,
         tol=EPS,
         scale=_p_g,
-        reads=("lc_0", "lca_per", "lc_fs", "p_g"),
+        reads=("lc_0", "lc_open_per", "lca_per", "lc_fs", "p_g"),
         doc="the lines of the period's loss-component roll-forward sum to the closing LC",
     ),
     Invariant(
@@ -1025,7 +1037,7 @@ CLOSE_INVARIANTS = (
         tol=EPS,
         scale=_rel,
         where=_k5_where,
-        reads=("r_per", "csm_0", "n_0"),
+        reads=("r_per", "cu_act_per", "csm_0", "n_0"),
         doc="equal allocation at the period level, where cu_act > 0 and CSM(0) > 0 (B119)",
     ),
     Invariant(
@@ -1077,7 +1089,12 @@ class InForceGroup(CsmRollForward):
     curves are the locked-in curve re-based to V ``p_l``, the composed curve at recognition
     ``p_rec`` and the current curve ``df_cur``; ``cpi_act`` is read for the provenance of the
     locked-in runs' inputs. P_g is carried forward from recognition (``p_g_prev``), the scale of
-    every K, M1 and M2."""
+    every K, M1 and M2. The close reads the group's inputs once each, through the lines it
+    stores (``csm_open_per``, ``lc_open_per``, ``cu_act_per``) and ``fcf_prev_0``,
+    ``fcf_prev_tau``, so that K1 and K2 sum the stored lines of the tables of in-force 11.1 and
+    K5 divides by the units the release used. The loader holds the old basis to the previous
+    run, the new basis's model points to the cur basis's and every locked-in file to the group's
+    basis and tau0 (``rebuilds_locked_in``)."""
 
     model_point = group_schema(previous=True, locked_in=True)
     bases = (
@@ -1111,6 +1128,33 @@ class InForceGroup(CsmRollForward):
         """P_g, the group's premiums at recognition, carried forward by every run."""
         return self.group.p_g_prev
 
+    # ---- the group inputs of the close: the opening lines of 11.1, the period's units and
+    # ---- the previous run's FCF (3.3, 3.4), each read once from the group ----------------
+    @var
+    def csm_open_per(self) -> Money:
+        """csm_prev, the closing CSM at V_prev: the opening line of the period's CSM table."""
+        return self.group.csm_prev
+
+    @var
+    def lc_open_per(self) -> Money:
+        """lc_prev, the closing loss component at V_prev: the opening line of its table."""
+        return self.group.lc_prev
+
+    @var
+    def cu_act_per(self) -> CoverageUnits:
+        """cu_act, the coverage units actually provided in the period, undiscounted (9.5)."""
+        return self.group.cu_act
+
+    @var
+    def fcf_prev_0(self) -> Money:
+        """F_prev(0), the previous run's FCF at its own t = 0, V_prev (3.4)."""
+        return self.group.f_prev_0
+
+    @var
+    def fcf_prev_tau(self) -> Money:
+        """F_prev(tau), the previous run's FCF at V, on its own basis and curve (3.4)."""
+        return self.group.f_prev_tau
+
     # ---- section 8: the change in locked-in fulfilment cash flows ---------------------
     @var
     def delta_fcf_l(self) -> Money:
@@ -1123,26 +1167,26 @@ class InForceGroup(CsmRollForward):
         """CSM_acc = csm_prev x P_rec(tau0 - tau) / P_rec(tau0), left to right as the spec
         writes it: the opening CSM at the locked-in forward rates of the period (para 44(b))."""
         p_rec = self.scen.p_rec
-        return (self.group.csm_prev * p_rec.at(self.group.i_acc)) / p_rec.at(self.group.i_rec)
+        return (self.csm_open_per() * p_rec.at(self.group.i_acc)) / p_rec.at(self.group.i_rec)
 
     @var
     def acc_per(self) -> Money:
         """The period's interest accretion, a line of the CSM roll-forward."""
-        return self.csm_acc() - self.group.csm_prev
+        return self.csm_acc() - self.csm_open_per()
 
     # ---- 9.3 step 2: the systematic allocation of the loss component --------------------
     @var
     def lc_alloc_per(self) -> Money:
         """LC_alloc = lc_prev x F_prev(tau) / F_prev(0), and 0 where F_prev(0) = 0 (paras
         50(a), 51; C11)."""
-        f0 = self.group.f_prev_0
-        ratio = self.group.f_prev_tau / where(f0 > 0, f0, 1.0)
-        return where(f0 > 0, self.group.lc_prev * ratio, 0.0)
+        f0 = self.fcf_prev_0()
+        ratio = self.fcf_prev_tau() / where(f0 > 0, f0, 1.0)
+        return where(f0 > 0, self.lc_open_per() * ratio, 0.0)
 
     @var
     def lca_per(self) -> Money:
         """The period's systematic allocation, a line of the loss-component roll-forward."""
-        return self.group.lc_prev - self.lc_alloc_per()
+        return self.lc_open_per() - self.lc_alloc_per()
 
     # ---- 9.4 step 3: the remeasurement rules ---------------------------------------------
     @var
@@ -1184,6 +1228,16 @@ class InForceGroup(CsmRollForward):
         """The loss component's losses (> 0, para 48(a)) or reversals (< 0, para 50(b))."""
         return self.lc_adj() - self.lc_alloc_per()
 
+    @var
+    def lc_loss(self) -> Money:
+        """Losses on remeasurement: lc_fs where positive, a line of the LC table (48(a))."""
+        return where(self.lc_fs() > 0, self.lc_fs(), 0.0)
+
+    @var
+    def lc_reversal(self) -> Money:
+        """Reversals of losses: lc_fs where negative, a line of the LC table (50(b))."""
+        return where(self.lc_fs() < 0, self.lc_fs(), 0.0)
+
     # ---- 9.5 step 4: release -------------------------------------------------------------
     @var
     def n_0(self) -> CoverageUnits:
@@ -1193,14 +1247,14 @@ class InForceGroup(CsmRollForward):
     @var
     def u_per(self) -> CoverageUnits:
         """The units of the period, actually provided and undiscounted, and those to come."""
-        return self.group.cu_act + self.n_0()
+        return self.cu_act_per() + self.n_0()
 
     @var
     def r_per(self) -> Money:
         """R_per = CSM_adj x cu_act / (cu_act + N(0)), the whole CSM_adj where no coverage
         remains (para 44(e), B119; Method 1 at the period level)."""
         u = self.u_per()
-        share = self.group.cu_act / where(u > 0, u, 1.0)
+        share = self.cu_act_per() / where(u > 0, u, 1.0)
         return where(u > 0, self.csm_adj() * share, self.csm_adj())
 
     # ---- 9.6 step 5: the closing balances, the opening balances of the months after V ------
@@ -1218,12 +1272,12 @@ class InForceGroup(CsmRollForward):
     @var
     def aoc_a(self) -> Money:
         """A: the previous run's FCF at its t = 0; FCF at recognition in the first period."""
-        return self.group.f_prev_0
+        return self.fcf_prev_0()
 
     @var
     def aoc_b(self) -> Money:
         """B = F_prev(tau): the previous run's FCF at V."""
-        return self.group.f_prev_tau
+        return self.fcf_prev_tau()
 
     @var
     def aoc_c(self) -> Money:
