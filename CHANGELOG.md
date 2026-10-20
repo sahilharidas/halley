@@ -209,8 +209,7 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   are recorded relative to its `runs_root`: they are resolved under the stage's
   `RunSettings.runs_root` or, without one, under the absolute root the previous run recorded,
   and skipped otherwise, never resolved against the working directory. The design's section 10
-  helpers register themselves in a later stage; until then no file of the shipped products
-  carries either key.
+  helpers register their recomputations for both keys (below).
 - An aggregation run's directory also keeps `inputs/groups.parquet` (the file as given),
   `inputs/derived_groups.parquet` (`group_id` and the derived fields), `inputs/membership.parquet`
   (`policy_id`, `basis`, `group_id`: every member of every basis run, by basis in the declared
@@ -259,7 +258,65 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   it.
 - A run's copy of an input is the bytes it read and hashed, not what the file's path holds when
   the copy is made, and a `ReadFile` already read is accepted as an input source.
-- A variable may not be named `disclosures` in a stage.
+- A variable may not be named `disclosures` or `member_rules` in a stage.
+
+### The CSM of one group (M7) and the cross-run helpers (M9)
+
+- `halley.aggregation.CsmRollForward` is the monthly CSM and loss-component roll-forward of one
+  group on its `cur` basis, as the annuity spec writes it ("Accretion and release", "Onerous
+  groups and the loss component"), and `halley.aggregation.NewGroup` the stage of a group
+  recognised at the valuation date. The roll-forward reads the group series `cu_g` (`cu`),
+  `fcf_g` (`bel` + `ra`, formed first), `bel_g` and `ra_g`, and its own scenario input `p_l`,
+  the locked-in curve (value column `rf_df`, months 0..H, rule `p_l(0) = 1`). It computes
+  `j_l` and `d_l` (the locked-in one-month rate and discount factor), `d_cu` (d_L, or 1 with
+  the build-time switch `discount_coverage_units = False`), `cu_next` (N(t), a backward
+  recursion from 0 at H), `units`, `acc`, `csm_pre`, `release`, `csm` (from the hook `csm_0`),
+  `lc` (from the hook `lc_0`, by the ratio of Illustrative Example 8), `lc_alloc`, `lrc` and
+  `lrc_0`, every division guarded inside its `where`, and stores them with the series by
+  month. `NewGroup` adds the series `premium_total` and the hooks `p_g`, `csm_0 = max(0, P_g -
+  FCF_g(0))` and `lc_0 = max(0, FCF_g(0) - P_g)`, which it stores. Both check the annuity
+  spec's I11 (with the exact zero of the CSM from the last month with coverage units on, the
+  last month included), I12 (both forms), I13 and, on `NewGroup`, I14 (CSM(0) = 0 in an
+  `ONEROUS` group, LC(0) = 0 in any other) on every run. Their manifests disclose the
+  approaches to discount rates and to the risk adjustment and two notes (the monthly CSM
+  allocation step, the ignored timing convexity) beside the confidence level; the notes of an
+  in-force close (C11, C17) are defined in `halley.aggregation.csm` for its stage.
+- Member rules: `halley.aggregation.MemberRule(name, check, basis="cur", *, reads=(), doc="")`
+  is a rule on every member of a basis, declared in the new stage attribute
+  `Aggregation.member_rules`. `run_aggregation` evaluates each on every run of its basis with
+  a `MemberView` (the run's verified model point copy as `mp`, its stored outputs through
+  `output(name)`, the valuation date, J): a failure is a LoadError naming the rule, the copy,
+  the first failing row and its policy, and the file the run read its model points from; a
+  check that returns no booleans, or another shape, a rule whose `reads` the run did not store
+  and a basis the stage does not declare (a BuildError at the rule's line) are errors too.
+  `NewGroup` declares G5 (every contract issued on the valuation date) and G3 (a contract is
+  onerous, by its run's `onerous` output, exactly in an `ONEROUS` group; at one scenario,
+  `require_deterministic`). `run()` refuses a stage that declares member rules, as it refuses
+  one that reads a previous run: it sees only the group series.
+- `halley.aggregation.inforce` (exported by `halley.aggregation`) builds the inputs of an
+  in-force group's runs at V as files that name their sources: `expected_in_force(prev, tau,
+  cur_mps)` (the OLD run's model points: the previous projection run's `pols_if(tau)` at full
+  precision as `pols_if_init`, the actual instalment at V, every previous model point kept;
+  `halley.derived_from`, `halley.tau`), `check_membership(prev_mps, cur_mps)` (G4: no policy
+  joins, no group key changes), `rebase_expense_table(table, cpi_act, tau, price_base)`
+  (`maint_pm x I_act(0) / I_act(-tau)` priced at V; `halley.rebased_from`,
+  `halley.cpi_act_sha256`, `halley.price_base`), `composed_curve(discount, ilp_table,
+  horizon)`, `locked_in_curve(discount_rec, ilp_table, tau0, horizon)` (`p_rec` and `p_l`,
+  with `halley.source_sha256`, `ilp_sha256`, `ilp`, `tau0`, `curve`) and
+  `locked_in_cpi(cpi_act, cpi_rec, tau0, horizon)` (`halley.act_sha256`, `rec_sha256`,
+  `estimated_rows`, `tau0`). Every such file also carries `halley.helper`, naming the helper
+  that made it, and the curves and the CPI splice `halley.rebased_from`. Importing the package
+  registers the recomputations `recompute_rebased` and `recompute_derived` for the two
+  provenance keys, so the stage loader recomputes every one of these files a stage or its bases
+  read, from the sources it names, and requires bit equality.
+- `halley.aggregation` also exports `run_aggregation` and `replay_aggregation`.
+- `halley.products.annuity_data` builds the in-force group's reference inputs (in-force spec
+  sections 3, 5 and 13): the model points of each variant and class at recognition and at V,
+  the groups rows (at V with the three locked-in hashes; `with_previous_run` adds `prev_run_id`,
+  `csm_prev` and `lc_prev` from the recognition run), the tables of versions 1 and 2, the
+  curves, the CPI paths and the files the helpers derive from them; `model_points_table` takes
+  the `valuation_date` its metadata records. `docs/spec/in_force_group_inputs.py` writes them to
+  `docs/spec/in-force-group/*.parquet`.
 
 ### Notes on determinism
 

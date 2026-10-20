@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from halley import CompiledModel, RunResult, RunSettings, build, run
+from halley.aggregation import NewGroup
 from halley.products.annuity import (
     CPILinkedAnnuity,
     FixedEscalationAnnuity,
@@ -66,6 +67,15 @@ def compiled_annuity() -> dict[str, CompiledModel]:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         return {name: build(cls) for name, cls in classes.items()}
+
+
+@pytest.fixture(scope="session")
+def compiled_new_group() -> dict[bool, CompiledModel]:
+    """The recognition stage ``NewGroup`` by its ``discount_coverage_units`` switch (True, the
+    default, and False), built with every build warning an error."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return {switch: build(NewGroup, discount_coverage_units=switch) for switch in (True, False)}
 
 
 @pytest.fixture(scope="session")

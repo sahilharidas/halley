@@ -355,6 +355,22 @@ def _require_no_previous_run(graph: ir.Graph) -> None:
     )
 
 
+def _require_no_member_rules(model: type[Any]) -> None:
+    """A stage that declares member rules (the annuity's G3 and G5, design section 9) checks
+    every member of a basis on the basis's runs, which only
+    :func:`~halley.aggregation.stage.run_aggregation` reads; :func:`run` sees the group series
+    alone, so it refuses such a stage rather than skip the rules."""
+    rules = getattr(model, "member_rules", ())
+    if not rules:
+        return
+    names = ", ".join(str(getattr(rule, "name", rule)) for rule in rules)
+    raise LoadError(
+        f"{model.__qualname__} checks every member of its bases ({names}); run it with "
+        "halley.aggregation.stage.run_aggregation, which reads the bases' runs the rules check, "
+        "not with run(), which sees only the group series (design section 9)"
+    )
+
+
 def _stage_identity(
     manifest: dict[str, Any],
     record: StageRecord,
@@ -470,8 +486,9 @@ def run(
     directories (:func:`~halley.aggregation.stage.run_aggregation`) also passes its
     ``stage_record``: the groups file and the fields the loader derived are copied too, the
     record's blocks enter the manifest, and the run id is the stage's identity
-    (:class:`StageRecord`). A stage whose groups name a previous run or lock in a basis runs
-    only that way (:func:`_require_no_previous_run`)."""
+    (:class:`StageRecord`). A stage whose groups name a previous run or lock in a basis, or
+    that declares member rules, runs only that way (:func:`_require_no_previous_run`,
+    :func:`_require_no_member_rules`)."""
     graph = compiled.graph
     model = compiled.model
     run_path = Path(run_dir)
@@ -484,6 +501,7 @@ def run(
         raise LoadError(f"{graph.model} is a projection; a stage record belongs to a stage")
     if stage and stage_record is None:
         _require_no_previous_run(graph)
+        _require_no_member_rules(model)
     lanes = "groups" if stage else "policies"  # what the messages call the model points
     inputs = load_inputs(
         graph,

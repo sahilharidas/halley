@@ -7,6 +7,10 @@ whose model points are groups and whose extra inputs are group series, each a :c
 over the runs of a :class:`Basis`. The scenario dimension is kept throughout (D4): a series is a
 mean over its basis's scenarios or keeps them, and the one-scenario requirement of a stage that
 reads a mean is a single check, :func:`require_deterministic`, not a shape assumption.
+
+The CSM of one group is :mod:`halley.aggregation.csm` (``CsmRollForward``, ``NewGroup``); the
+cross-run helpers that build an in-force group's inputs, and the recomputations the loader runs
+to verify them, are :mod:`halley.aggregation.inforce`.
 """
 
 from __future__ import annotations
@@ -16,12 +20,25 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
+from halley.aggregation.csm import CsmRollForward, NewGroup
+from halley.aggregation.inforce import (
+    check_membership,
+    composed_curve,
+    expected_in_force,
+    locked_in_cpi,
+    locked_in_curve,
+    rebase_expense_table,
+)
 from halley.aggregation.stage import (
     Aggregation,
     Basis,
     BasisInfo,
     GroupSum,
+    MemberRule,
+    MemberView,
     group_series,
+    replay_aggregation,
+    run_aggregation,
     sequential_sum,
 )
 from halley.errors import HalleyError, RunError
@@ -71,10 +88,22 @@ __all__ = [
     "Aggregation",
     "Basis",
     "BasisInfo",
+    "CsmRollForward",
     "GroupSum",
     "HasScenarios",
+    "MemberRule",
+    "MemberView",
+    "NewGroup",
+    "check_membership",
+    "composed_curve",
+    "expected_in_force",
     "group_series",
+    "locked_in_cpi",
+    "locked_in_curve",
     "portfolio_totals",
+    "rebase_expense_table",
+    "replay_aggregation",
     "require_deterministic",
+    "run_aggregation",
     "sequential_sum",
 ]

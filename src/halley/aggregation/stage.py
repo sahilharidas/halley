@@ -45,6 +45,7 @@ from halley.authoring.contracts import (
     GROUP_ID,
     GROUP_KEY,
     LOCKED_IN_FIELDS,
+    LoadContext,
 )
 from halley.authoring.product import ModelPoint, Product, VarDef
 from halley.codegen import CompiledModel
@@ -91,6 +92,7 @@ _STAGE_NAMES = {
     "series": "the group series accessor (self.series)",
     "bases": "a stage class attribute",
     "disclosures": "a stage class attribute",
+    "member_rules": "a stage class attribute",
 }
 """Names a stage's variable may not take, beside the projection's own reserved names."""
 
@@ -356,6 +358,82 @@ class GroupSum:
         )
 
 
+class MemberView:
+    """What a :class:`MemberRule`'s check sees: one projection run of a basis, read from its
+    directory with every file verified. ``mp`` is the run's model point copy, one value per row
+    by field (strings as ``str`` objects, dates as ``datetime.date`` objects, numbers as int64
+    or float64), as a rule of a schema sees its fields; ``output(name)`` a stored output of the
+    run, shaped ``(time or 1, rows, scenarios)`` with its rows in the copy's order, read-only;
+    ``valuation_date`` the stage's; ``n_scenarios`` the run's J, for
+    :func:`~halley.aggregation.require_deterministic`."""
+
+    def __init__(
+        self,
+        basis: str,
+        result: RunResult,
+        columns: dict[str, NDArray[Any]],
+        rows: Sequence[Any],
+        valuation_date: dt.date,
+    ) -> None:
+        self.basis = basis
+        self.run_id = result.run_id
+        self.mp = LoadContext(columns, valuation_date)
+        self.valuation_date = valuation_date
+        self.n_scenarios = result.n_scenarios
+        self._result = result
+        index = {pid: j for j, pid in enumerate(result.ids.tolist())}
+        self._order = np.asarray([index[pid] for pid in rows], dtype=np.int64)
+
+    def output(self, name: str) -> NDArray[Any]:
+        if name not in self._result.arrays:
+            raise LoadError(
+                f"basis {self.basis} run {self.run_id} did not store {name}, which a member rule "
+                "reads; add it to outputs"
+            )
+        values = np.array(self._result.var(name)[:, self._order, :])
+        values.flags.writeable = False
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class MemberRule:
+    """A rule on every member of a basis, checked by the stage's loader on each run of the basis
+    (design section 9: the annuity spec's G3 and G5 are rules on the contracts of a group, not
+    on the group): ``check(view)`` receives a :class:`MemberView` of one run and returns a bool
+    or a boolean array with one value per row of the run's model point copy, true where the
+    rule holds. A failure is a LoadError naming the rule, the copy, its first failing row and
+    that row's policy, and the file the run read its model points from. ``reads`` names the
+    outputs of the basis's runs the check reads: a run that did not store one is a LoadError
+    before the check runs. A stage that declares member rules runs through
+    :func:`run_aggregation`, which reads the bases' runs; :func:`~halley.runtime.run.run`, which
+    sees only the group series, refuses it."""
+
+    name: str
+    check: Callable[[MemberView], Any]
+    basis: str = CUR_BASIS
+    _: KW_ONLY
+    reads: tuple[str, ...] = ()
+    doc: str = ""
+    loc: Loc | None = field(default=None, init=False, compare=False)
+    """Where the rule is declared: the line that constructs it (:func:`_declaration_loc`)."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "loc", _declaration_loc())
+        if not _is_str(self.name) or not self.name:
+            raise BuildError(f"a member rule is named, not {self.name!r}", self.loc)
+        what = f"member rule {self.name}"
+        if not _is_name(self.basis):
+            raise BuildError(f"{what}: its basis is a Basis name, not {self.basis!r}", self.loc)
+        if not callable(self.check):
+            raise BuildError(f"{what}: check is a function of the member view", self.loc)
+        reads: object = self.reads
+        if not _is_tuple(reads) or not all(_is_name(n) for n in reads):
+            raise BuildError(
+                f"{what}: reads is a tuple of output names, as ('onerous',), not {reads!r}",
+                self.loc,
+            )
+
+
 # ------------------------------------------------------------------------------------ stage
 
 
@@ -371,7 +449,9 @@ class Aggregation(Product):
       ``self.series.<name>(t + k)``, ``self.series.<name>.at(k)`` or ``self.series.<name>()``;
     * ``scenario_inputs``: its own curves, such as a locked-in discount curve;
     * ``disclosures``: the approach strings and notes its run manifest discloses beside the
-      confidence level and the para 120 curve (:func:`run_aggregation`).
+      confidence level and the para 120 curve (:func:`run_aggregation`);
+    * ``member_rules``: the :class:`MemberRule` checks on every member of a basis, which
+      :func:`run_aggregation` evaluates on the bases' runs.
 
     The class attribute ``series`` holds the declarations; inside a formula ``self.series`` is
     the accessor that turns them into reads. A series' unit, time dimension, domain and
@@ -388,6 +468,8 @@ class Aggregation(Product):
     """What the manifest's ``disclosures`` block adds to the data-derived entries: by name, a
     string (the approach to discount rates, ``discount_rates``, or to the risk adjustment,
     ``risk_adjustment``) or a tuple of strings (``notes``)."""
+    member_rules: ClassVar[tuple[MemberRule, ...]] = ()
+    """Rules on every member of a basis (:class:`MemberRule`), checked on the bases' runs."""
 
     @property
     def group(self) -> ModelPoint:
@@ -424,6 +506,14 @@ class Aggregation(Product):
             if b.name in declared:
                 raise BuildError(f"{cls.__qualname__} declares basis {b.name} twice", b.loc)
             declared[b.name] = b
+        for rule in _member_rules(cls):
+            if rule.basis not in declared:
+                known = ", ".join(declared) or "none"
+                raise BuildError(
+                    f"member rule {rule.name} checks basis {rule.basis!r}, which "
+                    f"{cls.__qualname__} does not declare; it declares: {known}",
+                    rule.loc,
+                )
         out: dict[str, ir.SeriesDecl] = {}
         for s in _sums(cls):
             if s.name in out:
@@ -477,6 +567,10 @@ def _bases(cls: type[Aggregation]) -> tuple[Basis, ...]:
 
 def _sums(cls: type[Aggregation]) -> tuple[GroupSum, ...]:
     return _tuple_of(cls, "series", GroupSum)
+
+
+def _member_rules(cls: type[Aggregation]) -> tuple[MemberRule, ...]:
+    return _tuple_of(cls, "member_rules", MemberRule)
 
 
 class _Read(NamedTuple):
@@ -1068,6 +1162,65 @@ def _check_keys_agree(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
                         f"{r.at(m)} is in group {m.group}, but {r0.at(m0)} is in group "
                         f"{m0.group}; a policy's group key is the same in every run (G4)"
                     )
+
+
+def _check_member_rules(
+    stage: type[Aggregation],
+    runs: Mapping[str, Sequence[_BasisRun]],
+    valuation_date: dt.date,
+) -> None:
+    """Every :class:`MemberRule` of the stage on every run of its basis, in declaration order,
+    each on the run's verified model point copy and stored outputs (:class:`MemberView`). The
+    first failure is a LoadError naming the rule, the copy, the row and its policy, and the file
+    the run read its model points from (annuity spec, "Level of aggregation": each failure names
+    the model point file and row)."""
+    for rule in _member_rules(stage):
+        for r in runs.get(rule.basis, ()):
+            for name in rule.reads:
+                if name not in r.result.arrays:
+                    raise LoadError(
+                        f"member rule {rule.name}: basis {r.basis} run {r.run_id} did not store "
+                        f"{name}; add it to outputs"
+                    )
+            f = r.inputs[MODEL_POINTS]
+            view = MemberView(
+                r.basis,
+                r.result,
+                table_columns(f),
+                [m.pid for m in r.members],
+                valuation_date,
+            )
+            try:
+                raw = np.asarray(rule.check(view))
+            except LoadError as exc:  # a check the rule makes of the run (its J, an output)
+                raise LoadError(
+                    f"member rule {rule.name} on basis {r.basis} run {r.run_id}: {exc}"
+                ) from exc
+            except Exception as exc:  # the rule's own failure
+                raise LoadError(
+                    f"member rule {rule.name} on basis {r.basis} run {r.run_id} raised "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if raw.dtype != np.bool_:
+                raise LoadError(f"member rule {rule.name} must return booleans, not {raw.dtype}")
+            try:
+                ok = np.broadcast_to(raw, (len(r.members),))
+            except ValueError:
+                raise LoadError(
+                    f"member rule {rule.name} returned shape {raw.shape}; it gives one value per "
+                    f"row of the model point copy, {len(r.members)} here"
+                ) from None
+            if ok.all():
+                continue
+            bad = np.flatnonzero(~ok)
+            m = r.members[int(bad[0])]
+            given: object = r.result.manifest["inputs"]["model_points"].get("path")
+            source = "" if given is None else f", which the run read from {given}"
+            doc = f" ({rule.doc})" if rule.doc else ""
+            raise LoadError(
+                f"member rule {rule.name} fails for {bad.size} of {len(r.members)} members of "
+                f"basis {r.basis} run {r.run_id}, first at {r.at(m)}{source}{doc}"
+            )
 
 
 # ---------------------------------------------------------------------------- the groups
@@ -2013,8 +2166,9 @@ def load_aggregation_inputs(
     the stage's valuation date; the groups file and its rules (:func:`_read_groups`); G1
     (:func:`require_one_group`); the previous run by ``prev_run_id`` (:func:`_resolve_previous`)
     and G4 against its members, or, without one, one group key per policy across the bases;
-    every member mapped to exactly one group row, issued on its recognition date; the
-    membership as a table (:func:`_membership_file`); the structural hashes; the locked-in
+    every member mapped to exactly one group row, issued on its recognition date; the stage's
+    member rules on every run of their bases (:func:`_check_member_rules`); the membership as
+    a table (:func:`_membership_file`); the structural hashes; the locked-in
     hashes; the provenance of every file that names a source; the derived group fields, after
     the group's fixed attributes are held to the previous run's (:func:`_check_fixed`); the
     group series, summed in ascending policy id across each basis's runs
@@ -2053,6 +2207,7 @@ def load_aggregation_inputs(
     else:
         _check_g4(runs, prev)
     members = _members_by_group(runs, group_rows)
+    _check_member_rules(stage, runs, valuation_date)
     membership = _membership_file(runs)
     _check_structure(runs)
     stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
