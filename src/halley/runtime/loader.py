@@ -897,20 +897,23 @@ def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int |
 def _require_zero_after(label: str, s: LoadedSeries, horizon: int) -> None:
     """A series of a stage that reads its series to the run-off holds exactly 0 after ``H``,
     where the loader cuts it (:func:`load_series`); a LoadError names the series, its basis and
-    source runs, the group, the first month dropped and the last month with a value."""
+    source runs, the group (and the scenario, for a series of several), the first month dropped
+    and the last month with a value."""
     late = np.argwhere(s.values[horizon + 1 :] != 0)
     if not late.size:
         return
-    t, g, _j = (int(i) for i in late[0])
+    t, g, j = (int(i) for i in late[0])
     month = horizon + 1 + t
     held = np.flatnonzero((s.values != 0).any(axis=(1, 2)))
     runs = [str(e.get("run_id")) for e in s.provenance.get("source_runs", ())]
     source = f"run {runs[0]}" if len(runs) == 1 else f"runs {_listing(runs)}"
+    scenario = f", scenario {j}" if s.values.shape[2] > 1 else ""
     raise LoadError(
-        f"{label}: basis {s.basis} ({source}) holds {s.values[month, g, 0].item()!r} for group "
-        f"{s.group_ids[g]} at t = {month}, after the stage's horizon H = {horizon}, where the "
-        "loader cuts it; the stage reads its series to the run-off, so its results would change "
-        f"with H (D5): leave RunSettings.horizon out or set it to at least {int(held[-1])}"
+        f"{label}: basis {s.basis} ({source}) holds {s.values[month, g, j].item()!r} for group "
+        f"{s.group_ids[g]}{scenario} at t = {month}, after the stage's horizon H = {horizon}, "
+        "where the loader cuts it; the stage reads its series to the run-off, so its results "
+        "would change with H (D5): leave RunSettings.horizon out or set it to at least "
+        f"{int(held[-1])}"
     )
 
 

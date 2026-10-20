@@ -35,6 +35,7 @@ import numbers
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, ClassVar, Final, NamedTuple, TypeGuard
 
 import numpy as np
@@ -99,6 +100,7 @@ _STAGE_NAMES = {
     "member_rules": "a stage class attribute",
     "reads_to_run_off": "a stage class attribute",
     "recognised_at_valuation": "a stage class attribute",
+    "discloses_current_curve": "a stage class attribute",
 }
 """Names a stage's variable may not take, beside the projection's own reserved names."""
 
@@ -369,9 +371,13 @@ class MemberView:
     directory with every file verified. ``mp`` is the run's model point copy, one value per row
     by field (strings as ``str`` objects, dates as ``datetime.date`` objects, numbers as int64
     or float64), as a rule of a schema sees its fields; ``output(name)`` a stored output of the
-    run, shaped ``(time or 1, rows, scenarios)`` with its rows in the copy's order, read-only;
-    ``valuation_date`` the stage's; ``n_scenarios`` the run's J, for
-    :func:`~halley.aggregation.require_deterministic`."""
+    run that the rule declares in its ``reads``, shaped ``(time or 1, rows, scenarios)`` with its
+    rows in the copy's order, read-only; ``valuation_date`` the stage's; ``n_scenarios`` the
+    run's J, for :func:`~halley.aggregation.require_deterministic`.
+
+    ``reads`` are the outputs the rule declares, ``loc`` its declaration: an output it reads
+    without declaring it is a LoadError located there, since the manifest's ``member_rules``
+    block records the declared reads as what the rule read (D21)."""
 
     def __init__(
         self,
@@ -380,6 +386,9 @@ class MemberView:
         columns: dict[str, NDArray[Any]],
         rows: Sequence[Any],
         valuation_date: dt.date,
+        *,
+        reads: Sequence[str] = (),
+        loc: Loc | None = None,
     ) -> None:
         self.basis = basis
         self.run_id = result.run_id
@@ -387,10 +396,20 @@ class MemberView:
         self.valuation_date = valuation_date
         self.n_scenarios = result.n_scenarios
         self._result = result
+        self._reads = tuple(reads)
+        self._loc = loc
         index = {pid: j for j, pid in enumerate(result.ids.tolist())}
         self._order = np.asarray([index[pid] for pid in rows], dtype=np.int64)
 
     def output(self, name: str) -> NDArray[Any]:
+        if name not in self._reads:
+            declared = ", ".join(self._reads) or "none"
+            raise LoadError(
+                f"output({name!r}) reads {name}, which the rule does not declare in reads "
+                f"(it declares: {declared}); a member rule declares every output it reads, as "
+                f"reads=({name!r},), and the manifest records them (D21)",
+                self._loc,
+            )
         if name not in self._result.arrays:
             raise LoadError(
                 f"basis {self.basis} run {self.run_id} did not store {name}, which a member rule "
@@ -407,10 +426,12 @@ class MemberRule:
     (design section 9: the annuity spec's G3 and G5 are rules on the contracts of a group, not
     on the group): ``check(view)`` receives a :class:`MemberView` of one run and returns a bool
     or a boolean array with one value per row of the run's model point copy, true where the
-    rule holds. A failure is a LoadError naming the rule, the copy, its first failing row and
-    that row's policy, and the file the run read its model points from. ``reads`` names the
-    outputs of the basis's runs the check reads: a run that did not store one is a LoadError
-    before the check runs. A stage that declares member rules runs through
+    rule holds; any other shape is an error at the rule's declaration. A failure is a LoadError
+    naming the rule, the copy, its first failing row and that row's policy, and the file the
+    run read its model points from. ``reads`` names the outputs of the basis's runs the check
+    reads, and the view serves no other: a run that did not store one is a LoadError before the
+    check runs, and an output read without being declared is a LoadError at the rule's
+    declaration. A stage that declares member rules runs through
     :func:`run_aggregation`, which reads the bases' runs; :func:`~halley.runtime.run.run`, which
     sees only the group series, refuses it."""
 
@@ -442,6 +463,14 @@ class MemberRule:
 
 # ------------------------------------------------------------------------------------ stage
 
+type DisclosureText = str | tuple[str, ...]
+"""A disclosure as the manifest records it: an approach string or a tuple of notes."""
+
+type Disclosure = DisclosureText | Callable[[Mapping[str, object]], DisclosureText]
+"""A disclosure a stage declares: fixed, or a function of the stage's statics (its build-time
+settings by name, as built), which the loader calls with the compiled stage's
+(:func:`_disclosures`)."""
+
 
 class Aggregation(Product):
     """Base class of an aggregation stage (design section 9).
@@ -455,13 +484,16 @@ class Aggregation(Product):
       ``self.series.<name>(t + k)``, ``self.series.<name>.at(k)`` or ``self.series.<name>()``;
     * ``scenario_inputs``: its own curves, such as a locked-in discount curve;
     * ``disclosures``: the approach strings and notes its run manifest discloses beside the
-      confidence level and the para 120 curve (:func:`run_aggregation`);
+      confidence level and the para 120 curve (:func:`run_aggregation`), each fixed or a
+      function of the stage's build-time settings;
     * ``member_rules``: the :class:`MemberRule` checks on every member of a basis, which
       :func:`run_aggregation` evaluates on the bases' runs;
     * ``reads_to_run_off``: whether a month's results read later months of its series, so that
       the stage runs to its bases' run-off;
     * ``recognised_at_valuation``: whether its groups are recognised at the valuation date, so
-      that their locked-in curve ``p_l`` is the composed curve of the cur basis's runs.
+      that their locked-in curve ``p_l`` is the composed curve of the cur basis's runs;
+    * ``discloses_current_curve``: whether its scenario input ``df_cur`` is the composed curve
+      of the cur basis's runs, which the manifest discloses as the para 120 curve.
 
     The class attribute ``series`` holds the declarations; inside a formula ``self.series`` is
     the accessor that turns them into reads. A series' unit, time dimension, domain and
@@ -474,10 +506,12 @@ class Aggregation(Product):
     series: ClassVar[Any] = ()
     """A tuple of :class:`GroupSum`. Typed ``Any`` because a formula reads ``self.series`` as
     the accessor of the same name, which a tuple's type would refuse."""
-    disclosures: ClassVar[dict[str, str | tuple[str, ...]]] = {}
+    disclosures: ClassVar[dict[str, Disclosure]] = {}
     """What the manifest's ``disclosures`` block adds to the data-derived entries: by name, a
     string (the approach to discount rates, ``discount_rates``, or to the risk adjustment,
-    ``risk_adjustment``) or a tuple of strings (``notes``)."""
+    ``risk_adjustment``), a tuple of strings (``notes``) or a function of the stage's statics
+    (its build-time settings by name, as built) that returns one of those, for a disclosure
+    that depends on a setting, such as how the coverage units are weighted."""
     member_rules: ClassVar[tuple[MemberRule, ...]] = ()
     """Rules on every member of a basis (:class:`MemberRule`), checked on the bases' runs."""
     reads_to_run_off: ClassVar[bool] = False
@@ -495,7 +529,18 @@ class Aggregation(Product):
     spec, "Locked-in rates": "P_L = P of the same run"). The loader requires ``p_l`` to say so
     in its metadata, built by ``locked_in_curve`` from the ``rf_df`` and ``ilp`` files those runs
     read with ``tau0 = 0``, and recomputes it from them bit for bit
-    (:func:`_check_recognised_curve`)."""
+    (:func:`_check_composed_curve`). :func:`~halley.runtime.run.run`, which reads no basis
+    run, refuses such a stage."""
+    discloses_current_curve: ClassVar[bool] = False
+    """True for a stage whose scenario input ``df_cur`` is the composed current curve of the
+    runs of the cur basis, the curve their BEL and RA unwind on, whose forward rates the stage
+    reads and whose file its manifest discloses as the para 120 curve (design section 9). The
+    loader requires ``df_cur`` to say so in its metadata, built by ``composed_curve`` from the
+    ``rf_df`` and ``ilp`` files those runs read, recomputes it from them bit for bit
+    (:func:`_check_composed_curve`) and records the files under the disclosures'
+    ``para_120_curve_verified``. :func:`~halley.runtime.run.run` makes no such check; a stage
+    run there discloses nothing (``CsmRollForward``'s M1 still checks the curve's values on
+    every run)."""
 
     @property
     def group(self) -> ModelPoint:
@@ -601,34 +646,39 @@ def _member_rules(cls: type[Aggregation]) -> tuple[MemberRule, ...]:
 
 
 def _check_flags(cls: type[Aggregation], bases: Mapping[str, Basis]) -> None:
-    """``reads_to_run_off`` and ``recognised_at_valuation`` are True or False (a string there
-    would be true and say nothing); a stage recognised at the valuation date declares the cur
-    basis and the scenario input ``p_l``, the curve the loader verifies against that basis's
-    runs (:func:`_check_recognised_curve`). A BuildError at the class otherwise."""
-    for name in ("reads_to_run_off", "recognised_at_valuation"):
+    """``reads_to_run_off``, ``recognised_at_valuation`` and ``discloses_current_curve`` are
+    True or False (a string there would be true and say nothing); a stage recognised at the
+    valuation date declares the cur basis and the scenario input ``p_l``, and a stage that
+    discloses the current curve the cur basis and ``df_cur``: the curves the loader verifies
+    against that basis's runs (:func:`_check_composed_curve`). A BuildError at the class
+    otherwise."""
+    for name in ("reads_to_run_off", "recognised_at_valuation", "discloses_current_curve"):
         value: object = getattr(cls, name)
         if not _is_bool(value):
             raise BuildError(
                 f"{cls.__qualname__}.{name} is True or False, not {value!r}", _class_loc(cls)
             )
-    if not cls.recognised_at_valuation:
-        return
     scenarios = {getattr(s, "name", None) for s in cls.scenario_inputs}
-    missing = [
-        what
-        for what, ok in (
-            (f"basis {CUR_BASIS}", CUR_BASIS in bases),
-            (f"scenario input {RECOGNISED_CURVE}", RECOGNISED_CURVE in scenarios),
-        )
-        if not ok
-    ]
-    if missing:
-        raise BuildError(
-            f"{cls.__qualname__} is recognised_at_valuation, so its locked-in curve "
-            f"{RECOGNISED_CURVE} is the composed curve of its {CUR_BASIS} basis's runs, but it "
-            f"declares no {' and no '.join(missing)}",
-            _class_loc(cls),
-        )
+    for flag, curve, what in (
+        ("recognised_at_valuation", RECOGNISED_CURVE, "its locked-in curve"),
+        ("discloses_current_curve", PARA_120_CURVE, "the current curve it discloses"),
+    ):
+        if getattr(cls, flag) is not True:
+            continue
+        missing = [
+            item
+            for item, ok in (
+                (f"basis {CUR_BASIS}", CUR_BASIS in bases),
+                (f"scenario input {curve}", curve in scenarios),
+            )
+            if not ok
+        ]
+        if missing:
+            raise BuildError(
+                f"{cls.__qualname__} is {flag}, so {what} {curve} is the composed curve of its "
+                f"{CUR_BASIS} basis's runs, but it declares no {' and no '.join(missing)}",
+                _class_loc(cls),
+            )
 
 
 class _Read(NamedTuple):
@@ -731,20 +781,28 @@ def _check_group_fields(cls: type[Aggregation], fields: Mapping[str, ir.FieldDec
         )
 
 
-DATA_DISCLOSURES: Final = ("confidence_level", "para_120_curve_sha256")
+DATA_DISCLOSURES: Final = ("confidence_level", "para_120_curve_sha256", "para_120_curve_verified")
 """The disclosures the loader reads from the data (the cur basis's ``alpha``, the ``df_cur``
-file's hash), which a stage's declared :attr:`Aggregation.disclosures` may not name."""
+file's hash and the files it was verified against), which a stage's declared
+:attr:`Aggregation.disclosures` may not name."""
+
+
+def _is_disclosure_text(value: object) -> TypeGuard[DisclosureText]:
+    return isinstance(value, str) or (_is_tuple(value) and all(isinstance(x, str) for x in value))
 
 
 def _check_disclosures(cls: type[Aggregation]) -> None:
-    """``disclosures`` is a dict from a name to a string or a tuple of strings, and names none
-    of :data:`DATA_DISCLOSURES`: a declared value would replace what the data says, and a value
-    of another type would fail only when the manifest is written, after the run."""
+    """``disclosures`` is a dict from a name to a string, a tuple of strings or a function of
+    the stage's statics, and names none of :data:`DATA_DISCLOSURES`: a declared value would
+    replace what the data says, and a value of another type would fail only when the manifest
+    is written, after the run. What a function returns is checked when the loader calls it
+    (:func:`_disclosures`)."""
     value: object = getattr(cls, "disclosures", {})
     where = f"{cls.__qualname__}.disclosures"
     if not _is_dict(value):
         raise BuildError(
-            f"{where} is a dict of strings or tuples of strings, not {type(value).__name__}",
+            f"{where} is a dict of strings or tuples of strings (or functions of the stage's "
+            f"statics), not {type(value).__name__}",
             _class_loc(cls),
         )
     for key, entry in value.items():
@@ -758,11 +816,10 @@ def _check_disclosures(cls: type[Aggregation]) -> None:
                 "alpha, the df_cur file); a stage declares its approach strings and notes",
                 _class_loc(cls),
             )
-        if not isinstance(entry, str) and not (
-            _is_tuple(entry) and all(isinstance(x, str) for x in entry)
-        ):
+        if not _is_disclosure_text(entry) and not callable(entry):
             raise BuildError(
-                f"{where}: {key} is a string or a tuple of strings, not {entry!r}",
+                f"{where}: {key} is a string or a tuple of strings, or a function of the stage's "
+                f"statics that returns one, not {entry!r}",
                 _class_loc(cls),
             )
 
@@ -1033,12 +1090,13 @@ RECOGNISED_CURVE: Final = "p_l"
 """The scenario input of a stage recognised at the valuation date that holds its locked-in curve,
 the composed curve of the cur basis's runs (:attr:`Aggregation.recognised_at_valuation`)."""
 
-RECOGNISED_SOURCES: Final = (
+COMPOSED_SOURCES: Final = (
     ("source_sha256", ("scenario input", LOCKED_IN_RUN_CURVE)),
     ("ilp_sha256", ("table", "ilp")),
 )
-"""The metadata of :data:`RECOGNISED_CURVE` and the copied input of every cur run whose sha256
-each must be: the discount file and the ILP table the run composed its curve from."""
+"""The metadata of a stage's curve that is the composed curve of the cur basis's runs
+(:data:`RECOGNISED_CURVE`, :data:`PARA_120_CURVE`) and the copied input of every cur run whose
+sha256 each must be: the discount file and the ILP table the run composed its curve from."""
 
 STAGE_BLOCKS: Final = (
     "previous",
@@ -1272,11 +1330,16 @@ def _check_member_rules(
                 table_columns(f),
                 [m.pid for m in r.members],
                 valuation_date,
+                reads=rule.reads,
+                loc=rule.loc,
             )
             try:
                 raw = np.asarray(rule.check(view))
             except LoadError as exc:  # a check the rule makes of the run (its J, an output)
-                raise LoadError(f"member rule {rule.name} on {who}: {exc}") from exc
+                # an output read without being declared is the rule's fault, located at it
+                raise LoadError(
+                    f"member rule {rule.name} on {who}: {exc.message}", exc.loc
+                ) from exc
             except Exception as exc:  # the rule's own failure, at its declaration
                 raise LoadError(
                     f"member rule {rule.name} on {who} raised {type(exc).__name__}: {exc}",
@@ -1286,14 +1349,16 @@ def _check_member_rules(
                 raise LoadError(
                     f"member rule {rule.name} must return booleans, not {raw.dtype}", rule.loc
                 )
-            try:
-                ok = np.broadcast_to(raw, (len(r.members),))
-            except ValueError:
+            # one bool for every row, or one per row: a (1,) answer for a run of several rows
+            # would be one row's answer applied to every row
+            if raw.shape not in ((), (len(r.members),)):
                 raise LoadError(
                     f"member rule {rule.name} returned shape {raw.shape}; it gives one value per "
-                    f"row of the model point copy, {len(r.members)} here",
+                    f"row of the model point copy, {len(r.members)} here, or one bool for every "
+                    "row",
                     rule.loc,
-                ) from None
+                )
+            ok = np.broadcast_to(raw, (len(r.members),))
             if not ok.all():
                 bad = np.flatnonzero(~ok)
                 m = r.members[int(bad[0])]
@@ -1964,53 +2029,89 @@ def _check_locked_in(
     return {**hashes, "verified_by": verified}
 
 
-def _check_recognised_curve(
-    stage_files: Mapping[str, ReadFile], runs: Mapping[str, Sequence[_BasisRun]]
+class _CurveCheck(NamedTuple):
+    """A stage's curve that must be the composed curve of the cur basis's runs: its scenario
+    input, whether its metadata must carry ``tau0`` (a locked-in curve does; a composed current
+    curve need not, but may not be re-based either), what it is, for a message, and why the
+    check is made, with how to build it."""
+
+    name: str
+    needs_tau0: bool
+    what: str
+    why: str
+
+
+RECOGNISED_CHECK: Final = _CurveCheck(
+    RECOGNISED_CURVE,
+    True,
+    "the group's locked-in curve",
+    "a group recognised at the valuation date locks in the composed curve of the runs it "
+    "reads, P_L = P (annuity spec, 'Locked-in rates'): build it with "
+    "halley.aggregation.locked_in_curve(<their rf_df>, <their ilp>, 0, H)",
+)
+"""The check of :attr:`Aggregation.recognised_at_valuation`."""
+
+CURRENT_CHECK: Final = _CurveCheck(
+    PARA_120_CURVE,
+    False,
+    "the current curve the stage discloses",
+    "the stage's current curve is the composed curve of its cur basis's runs, the curve their "
+    "BEL and RA unwind on, which the manifest discloses as the para 120 curve (design section "
+    "9): build it with halley.aggregation.composed_curve(<their rf_df>, <their ilp>, H)",
+)
+"""The check of :attr:`Aggregation.discloses_current_curve`."""
+
+
+def _check_composed_curve(
+    check: _CurveCheck,
+    stage_files: Mapping[str, ReadFile],
+    runs: Mapping[str, Sequence[_BasisRun]],
 ) -> dict[str, Any]:
-    """The locked-in curve of a group recognised at the valuation date is the composed curve of
-    the runs it reads (annuity spec, "Locked-in rates": "For a group new at V (G5), P_L = P of
-    the same run"; :attr:`Aggregation.recognised_at_valuation`). The stage's ``p_l`` must say
-    so in its metadata: ``source_sha256`` and ``ilp_sha256`` are the ``rf_df`` and ``ilp``
-    files every cur run read, from their verified copies, ``tau0`` is 0, and ``rebased_from``
-    names its source, so that the provenance check rebuilds it from those files with the
-    section 10 helper and requires bit equality. A curve without that metadata, such as a bare
-    discount file without its illiquidity premium, or one re-based at another month, is a
-    LoadError naming ``p_l``; so is a cur basis whose runs composed their curves from different
-    files. Comparing the files, not the values with each run's ``df``, keeps the check exact on
-    every platform: the helper composes in Python floats and the run in NumPy, whose ``exp`` need
-    not round alike. Returns what the manifest's ``locked_in`` block records under ``p_l``."""
-    f = stage_files.get(RECOGNISED_CURVE)
+    """A stage's curve is the composed curve of the runs of its cur basis: for a group
+    recognised at the valuation date its locked-in curve ``p_l`` (annuity spec, "Locked-in
+    rates": "For a group new at V (G5), P_L = P of the same run";
+    :attr:`Aggregation.recognised_at_valuation`), and for a stage that discloses the current
+    curve its ``df_cur`` (design section 9; :attr:`Aggregation.discloses_current_curve`). The
+    file must say so in its metadata: ``source_sha256`` and ``ilp_sha256`` are the ``rf_df`` and
+    ``ilp`` files every cur run read, from their verified copies, ``rebased_from`` names its
+    source, so that the provenance check rebuilds it from those files with the section 10
+    helper and requires bit equality, and ``tau0``, which a locked-in curve must carry, is 0. A
+    curve without that metadata, such as a bare discount file without its illiquidity premium,
+    one composed from another discount or ILP file, or one re-based at another month, is a
+    LoadError naming the scenario input; so is a cur basis whose runs composed their curves from
+    different files. Comparing the files, not the values with each run's ``df``, keeps the check
+    exact on every platform: the helper composes in Python floats and the run in NumPy, whose
+    ``exp`` need not round alike. Returns the record of the curve: its sha256, ``tau0`` when it
+    carries one, the two source hashes and the copies they were compared with."""
+    name, why = check.name, check.why
+    f = stage_files.get(name)
     if f is None:
-        raise LoadError(f"the stage reads scenario input {RECOGNISED_CURVE}, which was not given")
-    why = (
-        "a group recognised at the valuation date locks in the composed curve of the runs it "
-        "reads, P_L = P (annuity spec, 'Locked-in rates'): build it with "
-        "halley.aggregation.locked_in_curve(<their rf_df>, <their ilp>, 0, H)"
-    )
+        raise LoadError(f"the stage reads scenario input {name}, which was not given")
     sources: dict[str, tuple[str, str]] = {}  # metadata key -> (sha256, the first copy's label)
     for r in runs.get(CUR_BASIS, ()):
-        for meta, key in RECOGNISED_SOURCES:
+        for meta, key in COMPOSED_SOURCES:
             copy = r.inputs.get(key)
             if copy is None:
                 raise LoadError(
                     f"basis {CUR_BASIS} run {r.run_id} read no {key[0]} {key[1]}, which "
-                    f"{RECOGNISED_CURVE} is composed from; {why}"
+                    f"{name} is composed from; {why}"
                 )
             known = sources.setdefault(meta, (copy.sha256, copy.label))
             if known[0] != copy.sha256:
                 raise LoadError(
                     f"{copy.where} is not the file {known[1]} is (sha256 {copy.sha256[:12]}... "
                     f"and {known[0][:12]}...); the runs of basis {CUR_BASIS} compose one curve, "
-                    f"the group's locked-in curve {RECOGNISED_CURVE} (B72(b))"
+                    f"{check.what} {name}"
                 )
-    for meta in ("source_sha256", "ilp_sha256", "tau0", "rebased_from"):
+    required = ("source_sha256", "ilp_sha256", *(("tau0",) if check.needs_tau0 else ()))
+    for meta in (*required, "rebased_from"):
         if f.metadata.get(meta) is None:
             raise LoadError(f"{f.where}: carries no metadata halley.{meta}; {why}")
-    if f.metadata["tau0"] != "0":
+    tau0 = f.metadata.get("tau0")
+    if tau0 is not None and tau0 != "0":
         raise LoadError(
-            f"{f.where}: halley.tau0 is {f.metadata['tau0']}, a curve re-based "
-            f"{f.metadata['tau0']} months after its discount file's first month, not at the "
-            f"valuation date (tau0 = 0); {why}"
+            f"{f.where}: halley.tau0 is {tau0}, a curve re-based {tau0} months after its "
+            f"discount file's first month, not at the valuation date (tau0 = 0); {why}"
         )
     for meta, (sha, label) in sources.items():
         if f.metadata[meta] != sha:
@@ -2018,12 +2119,10 @@ def _check_recognised_curve(
                 f"{f.where}: halley.{meta} is {f.metadata[meta]}, but {label} is {sha}; {why}"
             )
     return {
-        RECOGNISED_CURVE: {
-            "sha256": f.sha256,
-            "tau0": 0,
-            **{meta: sha for meta, (sha, _label) in sources.items()},
-            "composed_from": [label for _sha, label in sources.values()],
-        }
+        "sha256": f.sha256,
+        **({} if tau0 is None else {"tau0": 0}),
+        **{meta: sha for meta, (sha, _label) in sources.items()},
+        "composed_from": [label for _sha, label in sources.values()],
     }
 
 
@@ -2282,17 +2381,50 @@ def _verify_provenance(
 # ----------------------------------------------------------------------------- disclosures
 
 
+def _declared_disclosures(
+    stage: type[Aggregation], statics: Mapping[str, object]
+) -> dict[str, Any]:
+    """What the stage declares (:attr:`Aggregation.disclosures`), as the manifest records it:
+    a function entry called with the compiled stage's statics (read-only), so that a disclosure
+    that depends on a build-time setting says what the run was built with. A function that
+    raises, or returns no string or tuple of strings, is a LoadError at the stage class."""
+    view = MappingProxyType(dict(statics))
+    out: dict[str, Any] = {}
+    for key, entry in stage.disclosures.items():
+        text: object = entry
+        if callable(entry):
+            try:
+                text = entry(view)
+            except Exception as exc:  # the stage's own failure, at the class
+                raise LoadError(
+                    f"{stage.__qualname__}.disclosures: {key} raised {type(exc).__name__}: {exc}",
+                    _class_loc(stage),
+                ) from exc
+        if not _is_disclosure_text(text):
+            raise LoadError(
+                f"{stage.__qualname__}.disclosures: {key} gives {text!r}, not a string or a "
+                "tuple of strings",
+                _class_loc(stage),
+            )
+        out[key] = text if isinstance(text, str) else list(text)
+    return out
+
+
 def _disclosures(
     stage: type[Aggregation],
     runs: Mapping[str, Sequence[_BasisRun]],
     stage_files: Mapping[str, ReadFile],
+    statics: Mapping[str, object],
+    current: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """The manifest's ``disclosures`` block (design section 9, "Outputs"): the confidence level
     (para 119), ``alpha`` of the cur basis's ``ra_param`` copies; the sha256 of the para 120
-    curve, the stage's ``df_cur`` file; and what the stage declares (:attr:`Aggregation.
-    disclosures`, checked at build not to name either). ``None`` where the stage reads no such
-    input; a cur run's ``ra_param`` that holds no single ``alpha`` is a LoadError naming the
-    copy, since the disclosure would otherwise vanish."""
+    curve, the stage's ``df_cur`` file, and, for a stage that discloses the current curve
+    (:attr:`Aggregation.discloses_current_curve`), ``para_120_curve_verified``, the files it was
+    found to be composed from (``current``, :func:`_check_composed_curve`); and what the stage
+    declares (:func:`_declared_disclosures`, checked at build not to name any of these).
+    ``None`` where the stage reads no such input; a cur run's ``ra_param`` that holds no single
+    ``alpha`` is a LoadError naming the copy, since the disclosure would otherwise vanish."""
     table, column = CONFIDENCE_LEVEL
     levels: dict[float, str] = {}
     for r in runs.get(CUR_BASIS, ()):
@@ -2315,12 +2447,14 @@ def _disclosures(
             f"the runs of basis {CUR_BASIS} read different confidence levels: {listing}"
         )
     curve = stage_files.get(PARA_120_CURVE)
-    declared = {k: list(v) if isinstance(v, tuple) else v for k, v in stage.disclosures.items()}
-    return {
-        **declared,
+    out = {
+        **_declared_disclosures(stage, statics),
         "confidence_level": next(iter(levels), None),
         "para_120_curve_sha256": None if curve is None else curve.sha256,
     }
+    if current is not None:
+        out["para_120_curve_verified"] = {k: v for k, v in current.items() if k != "sha256"}
+    return out
 
 
 # ------------------------------------------------------------------------ the entry points
@@ -2368,11 +2502,12 @@ def load_aggregation_inputs(
     and G4 against its members, or, without one, one group key per policy across the bases;
     every member mapped to exactly one group row, issued on its recognition date; the stage's
     member rules on every run of their bases (:func:`_check_member_rules`); the membership as
-    a table (:func:`_membership_file`); the structural hashes; the locked-in
-    hashes, and for a stage recognised at the valuation date its locked-in curve against the
-    cur basis's runs (:func:`_check_recognised_curve`); the provenance of every file that names
-    a source; the derived group fields, after the group's fixed attributes are held to the
-    previous run's (:func:`_check_fixed`); the group series, summed in ascending policy id
+    a table (:func:`_membership_file`); the structural hashes; the locked-in hashes, and for
+    a stage recognised at the valuation date its locked-in curve, and for a stage that
+    discloses the current curve its ``df_cur``, against the cur basis's runs
+    (:func:`_check_composed_curve`); the provenance of every file that names a source; the
+    derived group fields, after the group's fixed attributes are held to the previous run's
+    (:func:`_check_fixed`); the group series, summed in ascending policy id
     across each basis's runs (:func:`group_series`); a horizon below the cur basis's against a
     stage that reads its series to the run-off (:func:`_check_run_off`); and the manifest
     blocks. A LoadError names the file and the row or key of the first failure."""
@@ -2419,9 +2554,14 @@ def load_aggregation_inputs(
         for row, gid in enumerate(group_rows.ids):
             locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs)
     if stage.recognised_at_valuation:
-        curve = _check_recognised_curve(stage_files, runs)
+        curve = {RECOGNISED_CURVE: _check_composed_curve(RECOGNISED_CHECK, stage_files, runs)}
         for gid in group_rows.ids:
             locked_in[gid] = {**locked_in.get(gid, {}), **curve}
+    current = (
+        _check_composed_curve(CURRENT_CHECK, stage_files, runs)
+        if stage.discloses_current_curve
+        else None
+    )
     derived: dict[str, list[Any]] = {GROUP_ID: list(group_rows.ids)}
     # a schema that declares one of these declares prev_run_id (a BuildError otherwise), so the
     # previous run is resolved whenever one is wanted
@@ -2469,7 +2609,7 @@ def load_aggregation_inputs(
         "member_rules": member_rules,
         "locked_in": locked_in or None,
         "provenance": provenance,
-        "disclosures": _disclosures(stage, runs, stage_files),
+        "disclosures": _disclosures(stage, runs, stage_files, graph.statics, current),
     }
     columns: dict[str, NDArray[Any]] = {
         name: np.asarray(values, dtype=_dtype(values)) for name, values in derived.items()

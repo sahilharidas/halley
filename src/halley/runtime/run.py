@@ -371,6 +371,23 @@ def _require_no_member_rules(model: type[Any]) -> None:
     )
 
 
+def _require_no_recognised_curve(model: type[Any]) -> None:
+    """A stage of groups recognised at the valuation date (``recognised_at_valuation``, as
+    ``NewGroup`` declares) locks in the composed curve of its cur basis's runs: P_L = P (annuity
+    spec, "Locked-in rates"). Only :func:`~halley.aggregation.stage.run_aggregation` verifies
+    its ``p_l`` against the files those runs read; :func:`run` sees the group series alone, and
+    no invariant can see a wrong ``p_l`` (the accretion is on both sides of I11 and M1), so it
+    refuses such a stage rather than skip the check."""
+    if getattr(model, "recognised_at_valuation", False) is not True:
+        return
+    raise LoadError(
+        f"{model.__qualname__} locks in the composed curve of its cur basis's runs (P_L = P), "
+        "which only run_aggregation can verify; run it with "
+        "halley.aggregation.stage.run_aggregation, not with run(), which sees only the group "
+        "series (annuity spec, 'Locked-in rates'; design section 9)"
+    )
+
+
 def _stage_identity(
     manifest: dict[str, Any],
     record: StageRecord,
@@ -486,9 +503,10 @@ def run(
     directories (:func:`~halley.aggregation.stage.run_aggregation`) also passes its
     ``stage_record``: the groups file and the fields the loader derived are copied too, the
     record's blocks enter the manifest, and the run id is the stage's identity
-    (:class:`StageRecord`). A stage whose groups name a previous run or lock in a basis, or
-    that declares member rules, runs only that way (:func:`_require_no_previous_run`,
-    :func:`_require_no_member_rules`)."""
+    (:class:`StageRecord`). A stage whose groups name a previous run or lock in a basis, that
+    declares member rules, or whose groups are recognised at the valuation date, runs only that
+    way (:func:`_require_no_previous_run`, :func:`_require_no_member_rules`,
+    :func:`_require_no_recognised_curve`)."""
     graph = compiled.graph
     model = compiled.model
     run_path = Path(run_dir)
@@ -502,6 +520,7 @@ def run(
     if stage and stage_record is None:
         _require_no_previous_run(graph)
         _require_no_member_rules(model)
+        _require_no_recognised_curve(model)
     lanes = "groups" if stage else "policies"  # what the messages call the model points
     inputs = load_inputs(
         graph,

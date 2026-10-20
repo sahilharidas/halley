@@ -33,7 +33,7 @@ import datetime as dt
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pyarrow as pa
@@ -69,23 +69,33 @@ def _read(source: Source, label: str) -> ReadFile:
     return read_source(source, label)
 
 
-def _single_scenario(f: ReadFile, cols: Mapping[str, Any]) -> None:
-    if "scenario" in cols and len(set(cols["scenario"].tolist())) > 1:
-        raise LoadError(
-            f"{f.where}: holds several scenarios; a locked-in or actual path has one (J = 1)"
-        )
+class _FileScenarios(NamedTuple):
+    """A scenario file's number of scenarios (its distinct ``scenario`` ids, 1 without the
+    column), for :func:`~halley.aggregation.require_deterministic`."""
+
+    n_scenarios: int
 
 
-def _by_month(f: ReadFile, value: str) -> dict[int, float]:
+def _require_one_scenario(f: ReadFile, cols: Mapping[str, Any], reason: str) -> None:
+    """The file holds one scenario, through the one J = 1 check of D4
+    (:func:`~halley.aggregation.require_deterministic`), with the file as what is checked."""
+    from halley.aggregation import require_deterministic  # the one J = 1 check (D4)
+
+    n = len(set(cols["scenario"].tolist())) if "scenario" in cols else 1
+    require_deterministic(_FileScenarios(n), f.where, reason, LoadError)
+
+
+def _by_month(f: ReadFile, value: str, reason: str) -> dict[int, float]:
     """A one-scenario file's values by month: the month column is ``t`` or ``u``, as the loader
-    reads a scenario file; each month once."""
+    reads a scenario file; each month once. ``reason`` says why the helper reads one scenario,
+    for the message of :func:`_require_one_scenario`."""
     cols = table_columns(f)
     months = [name for name in ("t", "u") if name in cols]
     if len(months) != 1:
         raise LoadError(f"{f.where}: one month column, t or u, is needed")
     if value not in cols:
         raise LoadError(f"{f.where}: column {value} is missing")
-    _single_scenario(f, cols)
+    _require_one_scenario(f, cols, reason)
     out: dict[int, float] = {}
     for m, x in zip(cols[months[0]].tolist(), cols[value].tolist(), strict=True):
         if m in out:
@@ -259,7 +269,7 @@ def rebase_expense_table(table: Source, cpi_act: Source, tau: int, price_base: s
         raise LoadError(
             f"{src.where}: priced at {old}, which is not tau = {tau} months before {price_base}"
         )
-    index = _by_month(act, "cpi")
+    index = _by_month(act, "cpi", "the expense rebase reads one actual CPI history")
     _covering(act, index, -tau, 0, "the rebase")
     i_0, i_tau = index[0], index[-tau]
     cols = table_columns(src)
@@ -299,7 +309,7 @@ def _curve_table(values: list[float], meta: dict[bytes, bytes]) -> Any:
 def _composed(discount: ReadFile, ilp_table: ReadFile, last: int) -> tuple[list[float], float]:
     """``P(t) = rf_df(t) x exp(((-ilp) x t) / 12)`` for t = 0..last, in plain float64 scalars
     (the engine's ``cc_discount`` form), and the ILP."""
-    rf = _by_month(discount, "rf_df")
+    rf = _by_month(discount, "rf_df", "a composed or locked-in curve is one deterministic path")
     _covering(discount, rf, 0, last, "the composed curve")
     ilp = _one_value(ilp_table, "ilp")
     return [rf[t] * math.exp(((-ilp) * t) / 12) for t in range(last + 1)], ilp
@@ -368,8 +378,9 @@ def locked_in_cpi(cpi_act: Source, cpi_rec: Source, tau0: int, horizon: int) -> 
     act, rec = _read(cpi_act, "cpi_act"), _read(cpi_rec, "cpi_rec")
     tau0 = _check_tau(tau0, "tau0")
     horizon = _check_tau(horizon, "horizon", lo=1)
-    i_act = _by_month(act, "cpi")
-    i_rec = _by_month(rec, "cpi")
+    why = "the locked-in CPI path splices one actual history with one expected path"
+    i_act = _by_month(act, "cpi", why)
+    i_rec = _by_month(rec, "cpi", why)
     if not i_act or max(i_act) != 0:
         raise LoadError(f"{act.where}: the actual history ends at u = 0, the valuation month")
     first = min(i_act)

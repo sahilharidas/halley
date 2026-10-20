@@ -536,7 +536,12 @@ def test_the_curve_and_cpi_helpers_need_every_month(tmp_path: Path) -> None:
     assert p_l.column("rf_df").to_pylist() == p_rec.column("rf_df").to_pylist()  # P_L = P
     assert p_l.column("rf_df").to_pylist()[0] == 1.0
     two = data.discount_table(n_scenarios=2)
-    with pytest.raises(LoadError, match="holds several scenarios"):
+    # the one J = 1 check of D4, with the file as what it checks
+    with pytest.raises(
+        LoadError,
+        match=r"a composed or locked-in curve is one deterministic path; discount file has J = 2 "
+        r"scenarios.*\(require_deterministic\)",
+    ):
         composed_curve(two, ilp, 12)
     act, rec = _file("cpi_act"), _file("cpi_rec")
     with pytest.raises(LoadError, match="covers no month 502; the splice needs every month"):

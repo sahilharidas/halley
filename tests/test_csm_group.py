@@ -12,13 +12,16 @@ ten-significant-figure values and against ``in_force_group_numbers``: the figure
 rolled monthly on ``p_rec``) at full precision, and the same functions on the group totals of
 example 3. Then the M12 lines and M1 and M2, the member rules G3 and G5 at load, I11 to I14, M1
 and M2 as run-time invariants (and failing on broken subclasses), the locked-in curve of a group
-new at V, the horizon against the run-off (D5), twelve monthly steps against one step with
-undiscounted units, and the aggregation run's directory: keyed on ``group_id``, with its
-disclosures, notes and member rules.
+new at V and the current curve ``df_cur``, each held to the files the cur runs read (and
+``run()`` refusing a stage it cannot hold to them), the horizon against the run-off (D5), twelve
+monthly steps against one step with undiscounted units, and the aggregation run's directory:
+keyed on ``group_id``, with its disclosures, notes (the coverage-unit approach as built) and
+member rules.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 import inspect
@@ -51,7 +54,10 @@ from halley import (
     where,
 )
 from halley.aggregation import (
+    Aggregation,
+    Basis,
     CsmRollForward,
+    GroupSum,
     MemberRule,
     NewGroup,
     composed_curve,
@@ -65,8 +71,12 @@ from halley.aggregation.csm import (
     DISCOUNT_RATES,
     NOTE_MONTHLY_STEP,
     NOTE_TIMING_CONVEXITY,
+    NOTE_UNITS_DISCOUNTED,
+    NOTE_UNITS_UNDISCOUNTED,
+    P_L,
     RISK_ADJUSTMENT,
 )
+from halley.authoring.contracts import group_schema
 from halley.products import annuity_data as data
 from halley.products.annuity import VALUATION_DATE
 from halley.runtime import within
@@ -497,6 +507,12 @@ def test_every_month_reconciles_with_the_script(
     np.testing.assert_array_equal(
         res.lane("lrc", gid), res.lane("fcf_g", gid) + res.lane("csm", gid)
     )
+    # the CSM table's opening line is the previous month's closing CSM (annuity spec, "Outputs")
+    csm = res.lane("csm", gid)
+    np.testing.assert_array_equal(res.lane("csm_open", gid)[1:], csm[:-1])
+    np.testing.assert_array_equal(
+        res.lane("csm_pre", gid)[1:], res.lane("csm_open", gid)[1:] + res.lane("acc", gid)[1:]
+    )
 
 
 def test_the_undiscounted_switch(stages: dict[tuple[int, bool], RunResult]) -> None:
@@ -607,38 +623,71 @@ def test_m1_and_m2_hold_and_the_m12_lines_are_the_designs(
         assert (x["revenue"][1:] > 0.0).all() or example == 2
 
 
-def test_m1_checks_the_current_curve_and_df_cur_is_deterministic(
+def test_df_cur_is_the_composed_curve_of_the_cur_runs(
     compiled_new_group: dict[bool, CompiledModel],
     class_runs: dict[int, RunResult],
     curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
-    """M1 holds only on the curve the runs' BEL and RA unwind on: a df_cur at another level
-    (a file that names no source, so nothing recomputes it) fails M1 at month 1. A df_cur of two
-    scenarios beside the stage's mean series is refused by the one J = 1 check (D4)."""
+    """Design section 9: df_cur is the cur runs' composed curve, whose file the manifest
+    discloses as the para 120 curve (``discloses_current_curve``). The loader requires its
+    metadata to name the rf_df and ilp files every cur run read, and the provenance check then
+    rebuilds it from them, so a df_cur that names no source, one composed from another discount
+    file, one re-based 24 months on, or one whose values are not what its sources give is a
+    LoadError naming scenario input df_cur, before anything is written."""
     stage = compiled_new_group[True]
+    level = class_runs[1]
+    why = "the stage's current curve is the composed curve of its cur basis's runs"
+    other_file = data.discount_table(lambda s, t: data.rf_df(t, 0.05))
+    other = composed_curve(other_file, TABLES["ilp"], T_EXAMPLE)
+    _p_rec, later = locked_in_curve(SCENARIOS["rf_df"], TABLES["ilp"], 24, T_EXAMPLE - 24)
+    good = pq.read_table(curves["df_cur"])
+    forged = data.discount_table(lambda s, t: data.rf_df(t, 0.05))
+    forged = forged.cast(good.schema.remove_metadata()).replace_schema_metadata(
+        good.schema.metadata
+    )
+    rf_sha = _sha(SCENARIOS["rf_df"])
+    cases = {
+        "bare": (other_file, r"carries no metadata halley\.source_sha256", True),
+        "other": (
+            other,
+            rf"halley\.source_sha256 is \w+, but basis cur run {level.run_id}: scenario input "
+            rf"rf_df is {rf_sha}",
+            True,
+        ),
+        "later": (later, r"halley\.tau0 is 24, a curve re-based 24 months after", True),
+        "forged": (
+            forged,
+            r"it is not what its source \(halley\.rebased_from = \w+\) gives",
+            False,
+        ),
+    }
+    for name, (curve, message, explained) in cases.items():
+        with pytest.raises(LoadError, match=rf"^scenario input df_cur: {message}") as info:
+            _stage(
+                stage, [level], {**curves, "df_cur": curve}, tmp_path / name, groups_file("OTHER")
+            )
+        assert (why in str(info.value)) is explained, name
+        assert not (tmp_path / name).exists()
+
+
+def test_m1_checks_the_current_curve_and_df_cur_is_deterministic(
+    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
+) -> None:
+    """M1 is the run-time check of the curve: through run(), which reads no basis run and so
+    cannot hold df_cur to the runs' files, a df_cur at another level fails M1 at month 1, since
+    M1 holds only on the curve the runs' BEL and RA unwind on. A df_cur of two scenarios beside
+    the stage's mean series is refused by the one J = 1 check (D4)."""
     level = data.discount_table(lambda s, t: data.rf_df(t, 0.05))
     with pytest.raises(RunError, match=rf"invariant {re.escape(M1)} failed: group {GID[1]}, t = 1"):
-        _stage(
-            stage,
-            [class_runs[1]],
-            {**curves, "df_cur": level},
-            tmp_path / "level",
-            groups_file("OTHER"),
-        )
+        _run_unlocked(class_runs, {**curves, "df_cur": level}, tmp_path / "level")
     two = data.discount_table(n_scenarios=2)
     with pytest.raises(
         LoadError,
         match=r"the stage reads the mean series \w+, so it runs at S = 1; scenario input df_cur "
         r"has J = 2 scenarios.*require_deterministic",
     ):
-        _stage(
-            stage,
-            [class_runs[1]],
-            {**curves, "df_cur": two},
-            tmp_path / "two",
-            groups_file("OTHER"),
-        )
+        _run_unlocked(class_runs, {**curves, "df_cur": two}, tmp_path / "two")
 
 
 # ---------------------------------------------------------------------------- invariants
@@ -901,7 +950,10 @@ def _always(view: Any) -> Any:
 
 
 def test_member_rules_are_checked_at_build_and_at_load(
-    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
+    compiled_annuity: dict[str, CompiledModel],
+    class_runs: dict[int, RunResult],
+    curves: dict[str, Path],
+    tmp_path: Path,
 ) -> None:
     line = 0
 
@@ -955,20 +1007,54 @@ def test_member_rules_are_checked_at_build_and_at_load(
             MemberRule("shape", lambda v: np.ones(3, dtype=bool)),
             "returned shape \\(3,\\); it gives one value per row",
         ),
-        "output": (
-            MemberRule("output", lambda v: v.output("q_mth")[0, :, 0] > 0),
-            "did not store q_mth, which a member rule reads",
+        # an output the rule reads without declaring it: the manifest records the declared reads
+        # as what the rule read (D21), so the view serves no other
+        "undeclared": (
+            MemberRule("undeclared", lambda v: v.output("bel")[0, :, 0] > 0),
+            r"output\('bel'\) reads bel, which the rule does not declare in reads \(it declares: "
+            r"none\)",
+        ),
+        "other": (
+            MemberRule("other", lambda v: v.output("bel")[0, :, 0] > 0, reads=("onerous",)),
+            r"reads bel, which the rule does not declare in reads \(it declares: onerous\)",
         ),
     }
     for name, (rule, message) in cases.items():
         with pytest.raises(LoadError, match=f"^member rule {name}.*{message}") as info:
             _stage(stage_with(rule), [class_runs[1]], curves, tmp_path / name, groups_file("OTHER"))
-        if name in ("floats", "raises", "shape"):
+        if name in ("floats", "raises", "shape", "undeclared", "other"):
             assert info.value.loc == rule.loc, name
             assert info.value.loc is not None
             assert info.value.loc.file == __file__
         else:
             assert info.value.loc is None, name
+        assert not (tmp_path / name).exists()
+
+    # a run of two members: one bool for every row, or one per row; a (1,) answer would be one
+    # row's answer applied to both
+    rows = [data.example_policy(1), {**data.example_policy(1), "policy_id": 5}]
+    two = _project(compiled_annuity["level"], data.model_points_table(rows), tmp_path / "two")
+    one_row = MemberRule("one_row", lambda v: np.ones(1, dtype=bool))
+    with pytest.raises(
+        LoadError,
+        match=r"^member rule one_row returned shape \(1,\); it gives one value per row of the "
+        r"model point copy, 2 here, or one bool for every row",
+    ) as info:
+        _stage(stage_with(one_row), [two], curves, tmp_path / "one-row", groups_file("OTHER"))
+    assert info.value.loc == one_row.loc
+    declared = MemberRule(
+        "declared", lambda v: np.asarray(v.output("bel")[0, :, 0] > 0), reads=("bel",)
+    )
+    for rule in (MemberRule("every", lambda v: True), declared):
+        res = _stage(stage_with(rule), [two], curves, tmp_path / rule.name, groups_file("OTHER"))
+        assert res.manifest["member_rules"] == [
+            {
+                "rule": rule.name,
+                "basis": "cur",
+                "reads": list(rule.reads),
+                "runs": [{"run_id": two.run_id, "members": 2}],
+            }
+        ]
 
 
 def test_run_refuses_a_stage_with_member_rules(
@@ -990,6 +1076,35 @@ def test_run_refuses_a_stage_with_member_rules(
             run_dir=tmp_path / "stage",
         )
     assert not (tmp_path / "stage").exists()
+
+
+def test_run_refuses_a_stage_that_locks_in_the_curve_of_its_runs(
+    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
+) -> None:
+    """P_L = P for a group new at V is verified by run_aggregation from the files the cur runs
+    read. run() reads no basis run, and no invariant can see a p_l that is not the runs' curve
+    (the bare discount file, without its illiquidity premium, passes every one), so it refuses
+    a recognised_at_valuation stage even without member rules, before anything is written."""
+    series = group_series(Unchecked, {"cur": [class_runs[1]]}, {GID[1]: [1]})
+    groups = groups_file("OTHER").append_column("group_id", pa.array([GID[1]]))
+    bare = pq.read_table(SCENARIOS["rf_df"])
+    stage = build(Unchecked)
+    for name, p_l in (("bare", bare), ("good", curves["p_l"])):
+        with pytest.raises(
+            LoadError,
+            match=r"^Unchecked locks in the composed curve of its cur basis's runs \(P_L = P\), "
+            r"which only run_aggregation can verify; run it with "
+            r"halley\.aggregation\.stage\.run_aggregation",
+        ):
+            run(
+                stage,
+                model_points=groups,
+                scenarios={**curves, "p_l": p_l},
+                series=series,
+                settings=RunSettings(valuation_date=VALUATION_DATE),
+                run_dir=tmp_path / name,
+            )
+        assert not (tmp_path / name).exists()
 
 
 # --------------------------------------------------------------- the locked-in curve
@@ -1047,14 +1162,23 @@ def test_a_new_group_locks_in_the_composed_curve_of_its_runs(
 
 
 def test_the_stage_flags_are_checked_at_build() -> None:
-    """``reads_to_run_off`` and ``recognised_at_valuation`` are bools, and a stage recognised
-    at the valuation date declares the curve the loader verifies against its cur runs."""
+    """``reads_to_run_off``, ``recognised_at_valuation`` and ``discloses_current_curve`` are
+    bools, and a stage recognised at the valuation date, or one that discloses the current
+    curve, declares the curve the loader verifies against its cur runs."""
 
     class Stringly(NewGroup):
         reads_to_run_off: Any = "yes"
 
     with pytest.raises(BuildError, match=r"Stringly\.reads_to_run_off is True or False, not 'yes'"):
         build(Stringly)
+
+    class Numeric(NewGroup):
+        discloses_current_curve: Any = 1
+
+    with pytest.raises(
+        BuildError, match=r"Numeric\.discloses_current_curve is True or False, not 1"
+    ):
+        build(Numeric)
 
     class NoCurve(NewGroup):
         scenario_inputs = (DF_CUR,)
@@ -1065,6 +1189,25 @@ def test_the_stage_flags_are_checked_at_build() -> None:
         "curve of its cur basis's runs, but it declares no scenario input p_l",
     ):
         build(NoCurve)
+
+    class NoCurrent(NewGroup):
+        scenario_inputs = (P_L,)
+
+    with pytest.raises(
+        BuildError,
+        match="NoCurrent is discloses_current_curve, so the current curve it discloses df_cur "
+        "is the composed curve of its cur basis's runs, but it declares no scenario input "
+        "df_cur",
+    ):
+        build(NoCurrent)
+
+    class Named(NewGroup):
+        @var
+        def discloses_current_curve(self) -> Money:
+            return self.p_g()
+
+    with pytest.raises(BuildError, match="discloses_current_curve is a stage class attribute"):
+        build(Named)
 
 
 class Unlocked(NewGroup):
@@ -1188,6 +1331,51 @@ def test_stage_results_do_not_depend_on_t(
         _stage(stage, [long], curves, tmp_path / "h622", groups_file("OTHER"), horizon=622)
 
 
+class EachToTheRunOff(Aggregation):
+    """A stage that reads a per-scenario series to the run-off."""
+
+    model_point = group_schema()
+    bases = (Basis("cur"),)
+    series = (GroupSum("cu_each", "cur", "cu", "CoverageUnits", scenarios="each"),)
+    reads_to_run_off: ClassVar[bool] = True
+    outputs: ClassVar[tuple[str, ...] | None] = ("units",)
+
+    @var
+    def units(self, t: Int) -> CoverageUnits:
+        return self.series.cu_each(t)
+
+
+def test_the_run_off_check_names_the_scenario_of_a_per_scenario_series(
+    compiled_annuity: dict[str, CompiledModel], tmp_path: Path
+) -> None:
+    """The series loader's refusal of a horizon that cuts the run-off names the value that would
+    be dropped: for a series of several scenarios, the scenario that holds it and its value
+    there, not scenario 0's."""
+    two = {"rf_df": data.discount_table(n_scenarios=2), "cpi": data.cpi_table(n_scenarios=2)}
+    level = _project(compiled_annuity["level"], _one_policy(1), tmp_path / "two", scenarios=two)
+    s = group_series(EachToTheRunOff, {"cur": [level]}, {GID[1]: [1]})["cu_each"]
+    values = np.array(s.values)
+    assert values.shape == (T_EXAMPLE + 1, 1, 2)
+    values[13:, :, 0] = 0.0  # scenario 0 holds no units after month 12, scenario 1 does
+    late = float(values[13, 0, 1])
+    assert late > 0.0
+    groups = groups_file("OTHER").append_column("group_id", pa.array([GID[1]]))
+    with pytest.raises(
+        LoadError,
+        match=rf"^series cu_each: basis cur \(run {level.run_id}\) holds {re.escape(repr(late))} "
+        rf"for group {GID[1]}, scenario 1 at t = 13, after the stage's horizon H = 12, where the "
+        r"loader cuts it; .* at least 655$",
+    ):
+        run(
+            build(EachToTheRunOff),
+            model_points=groups,
+            series={"cu_each": dataclasses.replace(s, values=values)},
+            settings=RunSettings(valuation_date=VALUATION_DATE, horizon=12),
+            run_dir=tmp_path / "stage",
+        )
+    assert not (tmp_path / "stage").exists()
+
+
 # ------------------------------------------------------------------ the run directory
 
 
@@ -1207,7 +1395,9 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
     assert scalars.column_names[:2] == ["group_id", "scenario"]
     assert set(monthly.column("group_id").to_pylist()) == {gid}
     assert monthly.num_rows == T_EXAMPLE + 1
-    for name in ("csm", "lc", "release", "cu_next", "cu_g", "fcf_g", "lrc", *M12_LINES):
+    for name in ("csm_open", "csm", "lc", "release", "cu_next", "cu_g", "fcf_g", "lrc"):
+        assert name in monthly.column_names, name
+    for name in M12_LINES:
         assert name in monthly.column_names, name
     for name in ("p_g", "csm_0", "lc_0", "lrc_0"):
         assert name in scalars.column_names, name
@@ -1220,17 +1410,39 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
     assert variables["sar"]["unit"] == "Factor"
     assert variables["revenue"] == {"time": True, "unit": "Money", "start": 1, "role": None}
     assert variables["p_g"] == {"time": False, "unit": "Money", "start": 0, "role": None}
-    # the disclosures: alpha of the cur basis, the para 120 curve df_cur, the stage's approach
-    # strings and its notes
+    # the disclosures: alpha of the cur basis, the para 120 curve df_cur and the files it was
+    # verified to be composed from, the stage's approach strings and its notes, the coverage-unit
+    # approach the stage was built with among them
+    run_ids = [class_runs[p].run_id for p in (1, 2, 3)]
+    rf_sha = _sha(SCENARIOS["rf_df"])
+    composed_from = [
+        f"basis cur run {run_ids[0]}: scenario input rf_df",
+        f"basis cur run {run_ids[0]}: table ilp",
+    ]
     assert m["disclosures"] == {
         "discount_rates": DISCOUNT_RATES,
         "risk_adjustment": RISK_ADJUSTMENT,
-        "notes": [NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY],
+        "notes": [NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY, NOTE_UNITS_DISCOUNTED],
         "confidence_level": 0.75,
         "para_120_curve_sha256": _sha(curves["df_cur"]),
+        "para_120_curve_verified": {
+            "source_sha256": rf_sha,
+            "ilp_sha256": _sha(TABLES["ilp"]),
+            "composed_from": composed_from,
+        },
     }
+    assert "coverage units" not in DISCOUNT_RATES
+    # a stage built with undiscounted units discloses them as such (para 117(c))
+    off = stages[(1, False)].manifest
+    assert off["model"]["statics"] == {"discount_coverage_units": False}
+    assert off["disclosures"]["notes"] == [
+        NOTE_MONTHLY_STEP,
+        NOTE_TIMING_CONVEXITY,
+        NOTE_UNITS_UNDISCOUNTED,
+    ]
+    assert off["disclosures"]["discount_rates"] == DISCOUNT_RATES
+    assert stages[(1, True)].manifest["disclosures"]["notes"][-1] == NOTE_UNITS_DISCOUNTED
     # both curves name their source, so the loader recomputed them with the registered helper
-    rf_sha = _sha(SCENARIOS["rf_df"])
     assert m["provenance"] == [
         {
             "file": f"scenario input {name}",
@@ -1242,7 +1454,6 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
         for name in ("p_l", "df_cur")
     ]
     # P_L = P: the locked-in curve was verified against the files the cur runs read
-    run_ids = [class_runs[p].run_id for p in (1, 2, 3)]
     assert m["locked_in"] == {
         gid: {
             "p_l": {
@@ -1250,10 +1461,7 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
                 "tau0": 0,
                 "source_sha256": rf_sha,
                 "ilp_sha256": _sha(TABLES["ilp"]),
-                "composed_from": [
-                    f"basis cur run {run_ids[0]}: scenario input rf_df",
-                    f"basis cur run {run_ids[0]}: table ilp",
-                ],
+                "composed_from": composed_from,
             }
         }
     }
@@ -1284,6 +1492,52 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
     for name in ("csm", "lc", "cu_next", "p_g", "revenue", "ifie"):
         np.testing.assert_array_equal(loaded.var(name), res.var(name))
     assert loaded.run_id == res.run_id
+
+
+class BadNotes(NewGroup):
+    """Notes that depend on the build but give no strings."""
+
+    disclosures: ClassVar[Any] = {**NewGroup.disclosures, "notes": lambda statics: 1}
+
+
+class FailingNotes(NewGroup):
+    """Notes that read a static the stage does not have."""
+
+    disclosures: ClassVar[Any] = {
+        **NewGroup.disclosures,
+        "notes": lambda statics: (statics["no_such_static"],),
+    }
+
+
+def test_a_disclosure_of_the_build_is_checked_when_the_stage_loads(
+    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
+) -> None:
+    """A disclosure may be a function of the stage's statics (the coverage-unit note is); the
+    loader calls it with the compiled stage's, and one that raises or gives no string or tuple
+    of strings is a LoadError at the stage class, before anything is written. At build, an
+    entry that is neither text nor a function is a BuildError."""
+    cases = (
+        (BadNotes, r"notes gives 1, not a string or a tuple of strings"),
+        (FailingNotes, r"notes raised KeyError: 'no_such_static'"),
+    )
+    for broken, message in cases:
+        where = tmp_path / broken.__name__
+        with pytest.raises(LoadError, match=rf"^{broken.__name__}\.disclosures: {message}") as info:
+            _stage(build(broken), [class_runs[1]], curves, where, groups_file("OTHER"))
+        loc = info.value.loc
+        assert loc is not None
+        assert (loc.file, loc.line) == (__file__, inspect.getsourcelines(broken)[1])
+        assert not where.exists()
+
+    class Mistyped(NewGroup):
+        disclosures: ClassVar[Any] = {"notes": 1}
+
+    with pytest.raises(
+        BuildError,
+        match=r"Mistyped\.disclosures: notes is a string or a tuple of strings, or a function of "
+        r"the stage's statics that returns one, not 1",
+    ):
+        build(Mistyped)
 
 
 def test_the_stage_reads_factor_and_rate_units_of_the_curve(

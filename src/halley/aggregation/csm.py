@@ -15,26 +15,37 @@ lines of milestone M12 for the months on the ``cur`` basis (design section 9): t
 revenue of an expected run and the insurance finance expense, at the current forward rates of
 the composed current curve ``df_cur``, with the invariants M1 (the LRC moves by IFIE less
 revenue and the loss component's share of the service items) and M2 (the loss component's
-allocation is that share less its share of the finance unwind). Its N(t) needs every later
-month of the units, so it runs to its bases' run-off (``reads_to_run_off``).
+allocation is that share less its share of the finance unwind); the loader holds ``df_cur`` to
+the files the cur runs composed their curve from (``discloses_current_curve``). Its N(t) needs
+every later month of the units, so it runs to its bases' run-off (``reads_to_run_off``).
 
 :class:`NewGroup` is the stage of milestone M7: a group recognised at the valuation date, whose
 ``P_g`` is the sum of its members' premiums and whose opening CSM or loss component is
 ``max(0, P_g - FCF_g(0))`` or ``max(0, FCF_g(0) - P_g)``, with ``FCF_g = BEL_g + RA_g`` formed
 first (paras 38 and 47), and whose locked-in curve is the composed curve of the runs it reads
 (``recognised_at_valuation``: P_L = P). Its member rules G5 and G3 check every contract on the
-runs the stage reads; its invariants I11 to I14, M1 and M2 are checked on every run.
+runs the stage reads; its invariants I11 to I14, M1 and M2 are checked on every run. It reads a
+deterministic basis (J = 1): G3 is each contract's para 47 test at one scenario, and P_L = P
+names the curve of one run (annuity spec, G6 and "Scenarios", until M12).
 """
 
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from typing import Any, ClassVar, NoReturn, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
-from halley.aggregation.stage import Aggregation, Basis, GroupSum, MemberRule, MemberView
+from halley.aggregation.stage import (
+    Aggregation,
+    Basis,
+    Disclosure,
+    GroupSum,
+    MemberRule,
+    MemberView,
+)
 from halley.authoring import (
     BatchView,
     CoverageUnits,
@@ -102,9 +113,11 @@ DF_CUR = ScenarioInput(
 """The composed current curve, built by :func:`halley.aggregation.inforce.composed_curve` from
 the discount file and the ILP table the cur basis's runs read (value column ``rf_df``): the
 curve their BEL and RA unwind on, whose forward rates the M12 lines read (design section 9) and
-whose file the manifest discloses as the para 120 curve. One scenario: the stage reads mean
-series, so the loader holds every scenario input of the stage to ``require_deterministic`` (the
-one J = 1 check, D4)."""
+whose file the manifest discloses as the para 120 curve. The loader requires its metadata to
+name the ``rf_df`` and ``ilp`` files every cur run read and recomputes it from them
+(:attr:`CsmRollForward.discloses_current_curve`); M1 checks its values on every run. One
+scenario: the stage reads mean series, so the loader holds every scenario input of the stage to
+``require_deterministic`` (the one J = 1 check, D4)."""
 
 ROLL_OUTPUTS = (
     "cu_g",
@@ -116,6 +129,7 @@ ROLL_OUTPUTS = (
     "d_cu",
     "cu_next",
     "units",
+    "csm_open",
     "acc",
     "csm_pre",
     "release",
@@ -137,16 +151,21 @@ ROLL_OUTPUTS = (
     "ifie",
 )
 """What :class:`CsmRollForward` stores: the group series it reads, every line of the
-roll-forward tables of the annuity spec and the M12 lines (revenue and IFIE), by month."""
+roll-forward tables of the annuity spec and the M12 lines (revenue and IFIE), by month. The
+CSM table's opening line is ``csm_open``; its changes for future service are 0 in every month
+of the roll (annuity spec, "Roll-forward table"; in-force section 10: the next remeasurement is
+at the next period close), so they are not a stored line, and an in-force group's change is
+its close's, a figure of the in-force stage."""
 
 DISCOUNT_RATES = (
     "Bottom-up (B80): a liquid risk-free curve plus an illiquidity premium, continuously "
     "compounded, composed as P(t) = rf_df(t) x exp(-ilp x t / 12). The fulfilment cash flows are "
     "discounted at the current composed curve; the CSM accretes at the forward rates of the "
-    "composed curve at the group's initial recognition, re-based to the valuation date (B72(b)), "
-    "and the coverage units are discounted on that locked-in curve."
+    "composed curve at the group's initial recognition, re-based to the valuation date (B72(b))."
 )
-"""The approach to discount rates (para 117(c)(iii)), annuity spec "Discounting"."""
+"""The approach to discount rates (para 117(c)(iii)), annuity spec "Discounting". How the
+coverage units are weighted depends on the build (``discount_coverage_units``), so it is a note
+(:func:`roll_notes`), not part of this fixed string."""
 
 RISK_ADJUSTMENT = (
     "Confidence-level technique on one latent factor: the risk adjustment for non-financial risk "
@@ -181,6 +200,30 @@ NOTE_LOCKED_IN_RUNS = (
 """The notes a stage's manifest discloses (design section 9, "Outputs"). The first two are the
 annuity spec's ("Outputs", "Manifest") and every CSM stage's; the last two belong to the period
 close of an in-force group, whose stage adds them."""
+
+NOTE_UNITS_DISCOUNTED = (
+    "Coverage units (B119): the units of a month are the payments expected to be validly "
+    "claimable in it, and the units still to be provided are discounted on the locked-in curve "
+    "(Method 1 of the IFRS Interpretations Committee's 2022 agenda decision; annuity spec, "
+    "'Coverage units')."
+)
+NOTE_UNITS_UNDISCOUNTED = (
+    "Coverage units (B119): the units of a month are the payments expected to be validly "
+    "claimable in it, undiscounted, so every month's units are weighted equally "
+    "(discount_coverage_units = False; annuity spec, 'Coverage units')."
+)
+"""The coverage-unit approach a CSM stage discloses, by its ``discount_coverage_units``
+(:func:`roll_notes`)."""
+
+
+def roll_notes(statics: Mapping[str, object]) -> tuple[str, ...]:
+    """The notes of a CSM roll-forward's manifest: the monthly allocation step, the ignored
+    timing convexity and the coverage-unit approach the stage was built with, from its statics
+    (``discount_coverage_units``), so that a stage built with undiscounted units does not
+    disclose discounted ones. The loader calls it with the compiled stage's statics."""
+    units = NOTE_UNITS_DISCOUNTED if statics["discount_coverage_units"] else NOTE_UNITS_UNDISCOUNTED
+    return (NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY, units)
+
 
 # -------------------------------------------------------------------------------- invariants
 
@@ -401,7 +444,9 @@ consequence of G3 holding for every contract. The per-contract test is the membe
 
 def _g3(v: MemberView) -> NDArray[np.bool_]:
     """Contract i is onerous (its run's ``onerous`` output, ``P_i - FCF_i(0) < 0`` with FCF
-    formed first) exactly when its ``profit_bucket`` is ONEROUS."""
+    formed first) exactly when its ``profit_bucket`` is ONEROUS. At one scenario: with J > 1
+    the run's ``onerous`` is pathwise, and only the probability-weighted mean of FCF_i(0) is a
+    para 33(a) estimate (annuity spec, "Labelling"); that test is left with G6 to M12."""
     from halley.aggregation import require_deterministic  # the one J = 1 check (D4)
 
     require_deterministic(
@@ -485,12 +530,13 @@ class CsmRollForward(Aggregation):
     scenario_inputs = (P_L, DF_CUR)
     outputs: ClassVar[tuple[str, ...] | None] = ROLL_OUTPUTS
     invariants = ROLL_INVARIANTS
-    disclosures: ClassVar[dict[str, str | tuple[str, ...]]] = {
+    disclosures: ClassVar[dict[str, Disclosure]] = {
         "discount_rates": DISCOUNT_RATES,
         "risk_adjustment": RISK_ADJUSTMENT,
-        "notes": (NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY),
+        "notes": roll_notes,  # by discount_coverage_units, as built
     }
     reads_to_run_off: ClassVar[bool] = True  # N(t) sums the units of every month after t
+    discloses_current_curve: ClassVar[bool] = True  # df_cur: the cur runs' composed curve
 
     # ---- hooks: the opening balances and the premiums --------------------------------
     @var
@@ -556,6 +602,11 @@ class CsmRollForward(Aggregation):
         return self.series.cu_g(t) + self.cu_next(t)
 
     # ---- accretion and release ---------------------------------------------------------
+    @var
+    def csm_open(self, t: Int) -> Money:
+        """The opening CSM of month t, CSM(t - 1): the first line of the roll-forward table."""
+        return self.csm(t - 1)
+
     @var
     def acc(self, t: Int) -> Money:
         """Acc(t), interest accretion at the locked-in rate (para 44(b), B72(b))."""
@@ -723,10 +774,13 @@ __all__ = [
     "NOTE_MONTHLY_STEP",
     "NOTE_PERIOD_ALLOCATION",
     "NOTE_TIMING_CONVEXITY",
+    "NOTE_UNITS_DISCOUNTED",
+    "NOTE_UNITS_UNDISCOUNTED",
     "P_L",
     "RISK_ADJUSTMENT",
     "ROLL_INVARIANTS",
     "ROLL_OUTPUTS",
     "CsmRollForward",
     "NewGroup",
+    "roll_notes",
 ]
