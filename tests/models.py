@@ -926,14 +926,16 @@ def run_member(
     ra_param: Any,
     valuation_date: dt.date,
     horizon: int,
+    **settings: Any,
 ) -> RunResult:
-    """One ``Member`` class run: every run of a basis takes the same horizon."""
+    """One ``Member`` class run: every run of a basis takes the same horizon; ``settings`` adds
+    to the ``RunSettings`` (a batch size, a number of workers)."""
     return run(
         compiled_member(),
         model_points=points,
         tables={"expense": expense, "ilp": ilp, "ra_param": ra_param},
         scenarios={"rf_df": rf_df, "cpi": cpi},
-        settings=RunSettings(valuation_date=valuation_date, horizon=horizon),
+        settings=RunSettings(valuation_date=valuation_date, horizon=horizon, **settings),
         run_dir=run_dir,
     )
 

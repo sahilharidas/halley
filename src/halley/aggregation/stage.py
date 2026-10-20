@@ -69,11 +69,11 @@ from halley.runtime.run import (
     RunResult,
     RunSettings,
     StageRecord,
-    load_run,
+    VerifiedRun,
     read_manifest,
     run,
     run_files,
-    verify_run,
+    verified_run,
     write_manifest,
 )
 
@@ -479,48 +479,101 @@ def _sums(cls: type[Aggregation]) -> tuple[GroupSum, ...]:
     return _tuple_of(cls, "series", GroupSum)
 
 
-_LOADER_FILLS: Final = {
-    **dict.fromkeys(FROM_DATES, ("int", units.INT, "a month count from the dates")),
+class _Read(NamedTuple):
+    """How the loader fills or reads a group field: the kinds it accepts, the unit it requires
+    (``None``: any, for a string, an enum or a date) and what it does, for a message."""
+
+    kinds: tuple[str, ...]
+    unit: Unit | None
+    does: str
+
+
+CLOSING_FIELDS: Final = {"csm_prev": "csm", "lc_prev": "lc"}
+"""The groups file's closing balances at the previous valuation date, by field, and the previous
+run's output each equals at month 0 (design section 9)."""
+
+_LOADER_FIELDS: Final[dict[str, _Read]] = {
+    "portfolio": _Read(("string", "enum"), None, "reads it as a group key, a string"),
+    "cohort": _Read(("int",), units.INT, "reads it as a group key, an integer year"),
+    "profit_bucket": _Read(("string", "enum"), None, "reads it as a group key, a string"),
+    "recognition_date": _Read(("date",), None, "reads it as a date, every member's issue date"),
+    "prev_valuation_date": _Read(("date",), None, "reads it as a date, the previous run's"),
+    "prev_run_id": _Read(("string",), None, "reads it as the previous run's run_id, a string"),
     **{
-        name: ("number", units.MONEY, f"the previous run's {variable}, an amount")
+        name: _Read(("string",), None, "reads it as a locked-in file's sha256, a string")
+        for name in LOCKED_IN_FIELDS
+    },
+    **dict.fromkeys(
+        FROM_DATES, _Read(("int",), units.INT, "fills it with a month count from the dates")
+    ),
+    **{
+        name: _Read(
+            ("number",), units.MONEY, f"fills it with the previous run's {variable}, an amount"
+        )
         for name, (variable, _month) in FROM_PREVIOUS_RUN.items()
     },
-    "csm_prev": ("number", units.MONEY, "compared with the previous run's csm(0), an amount"),
-    "lc_prev": ("number", units.MONEY, "compared with the previous run's lc(0), an amount"),
+    **{
+        name: _Read(
+            ("number",),
+            units.MONEY,
+            f"compares it with the previous run's {variable}(0), an amount",
+        )
+        for name, variable in CLOSING_FIELDS.items()
+    },
 }
-"""The group fields the loader fills or reads as a given kind and unit, by name: the kind and
-unit a stage that declares one must give it, and what the loader puts there."""
+"""The group fields the loader reads from the groups file or fills, by name: the kinds and unit
+a stage that declares one must give it, and what the loader does with it. The group key
+(:data:`GROUP_KEY`), the dates, the run id and the locked-in hashes are read from the groups
+file's columns; the fields of :data:`FROM_PREVIOUS` are filled; ``csm_prev`` and ``lc_prev`` are
+compared with the previous run."""
 
 
 def _check_group_fields(cls: type[Aggregation], fields: Mapping[str, ir.FieldDecl]) -> None:
-    """A group field the loader fills (:data:`FROM_PREVIOUS`) or compares with the previous
-    run (``csm_prev``, ``lc_prev``) is declared as the loader fills it: the month counts as
-    ``int`` fields of unit ``Int``, the amounts as ``number`` fields of unit ``Money``, none as
-    a derived field of the schema, which the loader's would collide with (D11: a month count
-    read as Money is a unit mistake, found at build). A schema that declares a field derived
-    from the previous run declares ``prev_run_id``, which names that run."""
+    """A group field the loader reads or fills (:data:`_LOADER_FIELDS`) is declared as the
+    loader takes it, never as a derived field of the schema, which the loader's would collide
+    with: the group key as strings (or an enum) and an integer cohort, the dates as dates, the
+    run id and the hashes as strings, the month counts as ``int`` fields of unit ``Int``, the
+    amounts as ``number`` fields of unit ``Money``. A unit or a date declared otherwise is a
+    UnitError (D11: a month count read as Money, or a date read as a number, is a unit or time
+    mistake, found at build); any other kind a BuildError. A schema that declares a field
+    derived from the previous run, or a closing balance compared with it, declares
+    ``prev_run_id``, which names that run."""
     where = f"{cls.__qualname__}.model_point"
-    for name, (kind, unit, what) in _LOADER_FILLS.items():
+    for name, how in _LOADER_FIELDS.items():
         decl = fields.get(name)
         if decl is None:
             continue
         if decl.derived:
             raise BuildError(
-                f"{where} derives {name}, which the loader fills ({what}); declare it as a field",
+                f"{where} derives {name}, but the loader {how.does}; declare it as a field",
                 _class_loc(cls),
             )
-        if decl.kind != kind or decl.unit != unit:
-            got = decl.kind if decl.unit is None else f"{decl.kind} {decl.unit}"
-            raise UnitError(
-                f"{where} declares {name} as {got}, but the loader fills it with {what}: declare "
-                f"it {kind} {unit} (D11)",
-                _class_loc(cls),
-            )
+        if decl.kind in how.kinds and (how.unit is None or decl.unit == how.unit):
+            continue
+        got = decl.kind if decl.unit is None or decl.kind == "enum" else f"{decl.kind} {decl.unit}"
+        wanted = " or ".join(how.kinds) + ("" if how.unit is None else f" {how.unit}")
+        d11 = how.unit is not None or "date" in how.kinds
+        error = UnitError if d11 else BuildError
+        raise error(
+            f"{where} declares {name} as {got}, but the loader {how.does}: declare it "
+            f"{wanted}{' (D11)' if d11 else ''}",
+            _class_loc(cls),
+        )
+    if "prev_run_id" in fields:
+        return
     derived = [name for name in FROM_PREVIOUS if name in fields]
-    if derived and "prev_run_id" not in fields:
+    if derived:
         raise BuildError(
             f"{where} declares {', '.join(derived)}, which the loader derives from the previous "
             "run the groups name and the dates, but no prev_run_id to name that run; build the "
+            "schema with group_schema(previous=True)",
+            _class_loc(cls),
+        )
+    closing = [name for name in CLOSING_FIELDS if name in fields]
+    if closing:
+        raise BuildError(
+            f"{where} declares {', '.join(closing)}, which the loader compares with the previous "
+            "run's closing csm(0) and lc(0), but no prev_run_id to name that run; build the "
             "schema with group_schema(previous=True)",
             _class_loc(cls),
         )
@@ -584,8 +637,10 @@ def group_series(
     over the variables), which the loader requires to be no later than the stage's declared
     start when the stage runs. The provenance records the basis's valuation date, which the
     stage's must equal, its horizon, which bounds the stage's when the basis is ``cur``, the
-    membership the sums used and each source run's id, directory (relative to ``runs_root``
-    when it lies under it), manifest sha256 and outputs' sha256s. A mean keeps the
+    membership the sums used (each group's members that the basis's runs hold, which is what
+    the series summed: a policy that left before the valuation date is in the ``old`` basis
+    only) and each source run's id, directory (relative to ``runs_root`` when it lies under
+    it), manifest sha256 and outputs' sha256s. A mean keeps the
     per-scenario group totals it averaged as its ``pathwise`` values. A LoadError otherwise."""
     stage.series_declarations()  # the declarations are sound before anything is summed
     declared = {b.name: b for b in _bases(stage)}
@@ -621,6 +676,7 @@ def group_series(
         if pid not in found:
             raise LoadError(f"group {g}: member {pid} is in no run of the stage's bases")
     sums = _sums(stage)
+    membership: dict[str, list[list[Any]]] = {}
     for name in dict.fromkeys(s.basis for s in sums):  # each basis a series sums, in order
         held = {pid for r in bases[name] for pid in r.ids.tolist()}
         for g in group_ids:
@@ -629,12 +685,14 @@ def group_series(
                     f"group {g} has no member in the runs of basis {name}, which a series of "
                     "the stage sums; its sums there would be zero by omission"
                 )
-    membership = [
-        [_plain(g), [_plain(p) for p in _sorted_ids(list(members[g]))]] for g in group_ids
-    ]
+        # the members the sums of this basis run over: those its runs hold (_group_totals)
+        membership[name] = [
+            [_plain(g), [_plain(p) for p in _sorted_ids([p for p in members[g] if p in held])]]
+            for g in group_ids
+        ]
     return {
         s.name: _summed(
-            s, bases[s.basis], group_ids, members, shared[s.basis], membership, runs_root
+            s, bases[s.basis], group_ids, members, shared[s.basis], membership[s.basis], runs_root
         )
         for s in sums
     }
@@ -717,18 +775,23 @@ def _summed(
 
 def _source_run(s: GroupSum, r: RunResult, runs_root: Path | None) -> dict[str, Any]:
     """Where a series' values came from: the run, its directory, its manifest's hash and the
-    hashes of its outputs (design section 9)."""
-    manifest = r.run_dir / "manifest.json"
-    try:
-        raw = manifest.read_bytes()
-    except OSError:
-        raise LoadError(
-            f"series {s.name}: basis {s.basis} run {r.run_id} has no manifest at {manifest}"
-        ) from None
+    hashes of its outputs (design section 9). The manifest's hash is the one the run carries
+    (:attr:`RunResult.manifest_sha256`: as written, or as read and verified), so that the hash
+    recorded is that of the manifest whose run was summed; a run without one has its manifest
+    hashed from its directory."""
+    sha = r.manifest_sha256
+    if sha is None:
+        manifest = r.run_dir / "manifest.json"
+        try:
+            sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        except OSError:
+            raise LoadError(
+                f"series {s.name}: basis {s.basis} run {r.run_id} has no manifest at {manifest}"
+            ) from None
     return {
         "run_id": r.run_id,
         "dir": _dir_label(r.run_dir, runs_root),
-        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "manifest_sha256": sha,
         "outputs_sha256": _outputs_sha256(r.manifest),
     }
 
@@ -814,16 +877,14 @@ PREVIOUS_TOLERANCE: Final = 1e-12
 """``csm_prev`` and ``lc_prev`` agree with the previous run's ``csm(0)`` and ``lc(0)`` within this
 many times ``P_g`` (design section 9)."""
 
-STAGE_BLOCKS: Final = (
-    "previous",
-    "bases",
-    "membership",
-    "locked_in",
-    "provenance",
-    "disclosures",
-)
+STAGE_BLOCKS: Final = ("previous", "bases", "locked_in", "provenance", "disclosures")
 """The manifest blocks a run made by :func:`run_aggregation` adds beside every run's, which
 :func:`replay_aggregation` carries over."""
+
+MEMBERSHIP_COLUMNS: Final = ("policy_id", "basis", GROUP_ID)
+"""The columns of a stage run's ``inputs/membership.parquet``: every member of every basis run,
+by basis in the order the stage declares them, then policy id ascending. A later stage checks
+G4 against the ``cur`` rows of the previous run's copy, which is hashed like every copy."""
 
 PROVENANCE_KEYS: Final = ("rebased_from", "derived_from")
 """The metadata keys (``halley.<key>``) of a file that a section 10 helper made from another:
@@ -924,24 +985,23 @@ class _BasisRun:
         return self.inputs.get(("scenario input", name))
 
 
-def _input_copies(
-    path: Path, manifest: Mapping[str, Any], who: str
-) -> dict[tuple[str, str], ReadFile]:
-    """Every input a run copied (its model points, tables and scenario files), each read from
-    its copy and verified against the sha256 its manifest records (:func:`read_copy`)."""
-    inputs: Mapping[str, Any] = manifest["inputs"]
+def _input_copies(v: VerifiedRun, who: str) -> dict[tuple[str, str], ReadFile]:
+    """Every input a run copied (its model points, tables and scenario files), each parsed from
+    the bytes :func:`~halley.runtime.run.verified_run` checked against the sha256 its manifest
+    records."""
+    inputs: Mapping[str, Any] = v.manifest["inputs"]
     entries: list[tuple[tuple[str, str], Any]] = [(MODEL_POINTS, inputs["model_points"])]
     entries += [(("table", n), e) for n, e in inputs["tables"].items()]
     entries += [(("scenario input", n), e) for n, e in inputs["scenarios"].items()]
-    return {key: read_copy(path, e, f"{who}: {key[0]} {key[1]}".rstrip()) for key, e in entries}
+    return {key: v.read(e, f"{who}: {key[0]} {key[1]}".rstrip()) for key, e in entries}
 
 
 def _basis_run(basis: str, given: object) -> _BasisRun:
     """A run of a basis given as a :class:`RunResult` or a run directory, read through its
-    directory: every file its manifest records a hash for is verified (a tampered file is a
-    LoadError naming it), the run must be a projection, its copied inputs are read from the
-    copies (:func:`_input_copies`), and its model point copy gives the membership (each row's
-    group key and issue date)."""
+    directory once: every file its manifest records a hash for is verified (a tampered file is
+    a LoadError naming it), the run must be a projection, and its outputs, its manifest's hash
+    and its copied inputs (:func:`_input_copies`) are taken from the bytes verified. Its model
+    point copy gives the membership (each row's group key and issue date)."""
     if isinstance(given, RunResult):
         path, expected = given.run_dir, given.run_id
     elif isinstance(given, (str, Path)):
@@ -950,7 +1010,8 @@ def _basis_run(basis: str, given: object) -> _BasisRun:
         raise LoadError(
             f"basis {basis}: a run is a RunResult or a run directory, not {type(given).__name__}"
         )
-    manifest = verify_run(path, f"basis {basis} run")
+    v = verified_run(path, f"basis {basis} run")
+    manifest = v.manifest
     run_id = str(manifest.get("run_id"))
     if expected is not None and run_id != expected:
         raise LoadError(
@@ -959,9 +1020,9 @@ def _basis_run(basis: str, given: object) -> _BasisRun:
     kind = manifest.get("outputs", {}).get("kind", "projection")
     if kind != "projection":
         raise LoadError(f"basis {basis}: {path} holds an {kind} run; a basis reads projection runs")
-    _manifest, sha = read_manifest(path)
-    result = load_run(path)
-    copies = _input_copies(path, manifest, f"basis {basis} run {run_id}")
+    sha = v.manifest_sha256
+    result = v.result()
+    copies = _input_copies(v, f"basis {basis} run {run_id}")
     f = copies[MODEL_POINTS]
     cols = table_columns(f)
     groups = _group_ids(cols, f.where, "a basis run's model points")
@@ -1024,6 +1085,17 @@ class _Groups:
         """A row, for a message: the file, the group and the row."""
         return f"{self.file.where}: group {self.ids[row]} (row {row})"
 
+    def key(self, row: int) -> tuple[object, ...]:
+        """A row's group key (:data:`GROUP_KEY`), as read."""
+        return tuple(self.columns[name][row : row + 1].tolist()[0] for name in GROUP_KEY)
+
+    def row_of(self, key: tuple[object, ...]) -> int | None:
+        """The row whose group key is ``key``, ``None`` without one."""
+        for row in range(len(self.ids)):
+            if self.key(row) == key:
+                return row
+        return None
+
     def date(self, name: str, row: int) -> dt.date:
         value: object = self._column(name)[row]
         if not isinstance(value, dt.date):
@@ -1072,6 +1144,14 @@ def _read_groups(source: Source, valuation_date: dt.date) -> _Groups:
             "previous run and the dates; they are never typed into the groups file (design "
             "section 9)"
         )
+    groups = _groups_of(f, cols)
+    _check_group_rules(groups, valuation_date)
+    return groups
+
+
+def _groups_of(f: ReadFile, cols: dict[str, NDArray[Any]]) -> _Groups:
+    """A groups file's rows with their derived group ids: at least one row, and one row per
+    group (a duplicate key names both rows)."""
     ids = _group_ids(cols, f.where, "the groups")
     if not ids:
         raise LoadError(f"{f.where}: no rows")
@@ -1083,9 +1163,7 @@ def _read_groups(source: Source, valuation_date: dt.date) -> _Groups:
                 "and every member maps to exactly one"
             )
         seen[g] = row
-    groups = _Groups(f, cols, ids)
-    _check_group_rules(groups, valuation_date)
-    return groups
+    return _Groups(f, cols, ids)
 
 
 def _check_group_rules(groups: _Groups, valuation_date: dt.date) -> None:
@@ -1156,19 +1234,54 @@ def _members_by_group(
     return {g: list(pids) for g, pids in members.items()}
 
 
+def _membership_file(runs: Mapping[str, Sequence[_BasisRun]]) -> ReadFile:
+    """Every member of every basis run as a table (:data:`MEMBERSHIP_COLUMNS`): by basis in the
+    order the stage declares them, then policy id ascending, each with its group. The run
+    directory keeps it as ``inputs/membership.parquet``, hashed like every copy, and a later
+    stage reads the members it checks G4 against from that verified copy, never from the
+    manifest, which no hash covers. The policy ids are integers or strings, one type across the
+    bases (an id is compared across them)."""
+    rows: list[tuple[Any, str, str]] = []
+    for name, rs in runs.items():
+        group_of = {m.pid: m.group for r in rs for m in r.members}
+        rows += [(pid, name, group_of[pid]) for pid in group_of]
+    ids = [pid for pid, _basis, _group in rows]
+    if all(isinstance(p, str) for p in ids):
+        id_values = np.asarray(ids, dtype=object)
+    elif all(isinstance(p, int) and not isinstance(p, bool) for p in ids):
+        id_values = np.asarray(ids, dtype=np.int64)
+    else:
+        kinds = ", ".join(sorted({type(p).__name__ for p in ids}))
+        raise LoadError(
+            f"the bases' policy ids are of several types ({kinds}); a policy is compared across "
+            "the bases by its id, so the runs of a stage key their policies alike"
+        )
+    rank = {name: i for i, name in enumerate(runs)}
+    order = sorted(range(len(rows)), key=lambda i: (rank[rows[i][1]], ids[i]))
+    columns: dict[str, NDArray[Any]] = {
+        "policy_id": id_values[order],
+        "basis": np.asarray([rows[i][1] for i in order], dtype=object),
+        GROUP_ID: np.asarray([rows[i][2] for i in order], dtype=object),
+    }
+    return read_source(with_columns(None, columns), "membership")
+
+
 # ------------------------------------------------------------------------ the previous run
 
 
 @dataclass(frozen=True, slots=True)
 class _Previous:
-    """The previous aggregation run a group names, read from its directory with every file
-    verified: its outputs, its manifest's sha256 and its members at its valuation date (its cur
-    basis's), by policy."""
+    """The previous aggregation run a group names, read from its directory once with every file
+    verified: its outputs, its manifest's sha256, its members at its valuation date (the ``cur``
+    rows of its membership copy), by policy, and its groups copy."""
 
     path: Path
     result: RunResult
     manifest_sha256: str
     members: dict[Any, str]
+    groups: _Groups
+    """The groups file the previous run read, from its verified copy: a group's key, its
+    recognition date and its locked-in hashes do not change between runs."""
 
     @property
     def run_id(self) -> str:
@@ -1218,8 +1331,9 @@ def _resolve_previous(
 ) -> _Previous | None:
     """The previous aggregation run the groups name by ``prev_run_id``: found under
     ``settings.runs_root`` (:func:`find_run`), or ``previous=``, a test override whose manifest
-    must carry that run id; every file of it verified; an aggregation run at one scenario that
-    recorded its membership."""
+    must carry that run id; read once, every file of it verified; an aggregation run at one
+    scenario that copied its membership and its groups file, which are read from the verified
+    copies (:func:`_previous_members`)."""
     if not _needs_previous(graph):
         if previous is not None:
             raise LoadError(
@@ -1239,12 +1353,6 @@ def _resolve_previous(
     want = wanted[0]
     if previous is not None:
         path = Path(previous)
-        manifest, _sha = read_manifest(path)
-        if manifest.get("run_id") != want:
-            raise LoadError(
-                f"previous= {path} holds run {manifest.get('run_id')}, but {groups.at(0)} names "
-                f"prev_run_id {want}"
-            )
     elif settings.runs_root is None:
         raise LoadError(
             f"{groups.at(0)} names prev_run_id {want}; set RunSettings.runs_root to the directory "
@@ -1252,14 +1360,19 @@ def _resolve_previous(
         )
     else:
         path = find_run(want, settings.runs_root)
-    manifest = verify_run(path, "previous run")
-    kind = manifest.get("outputs", {}).get("kind", "projection")
+    v = verified_run(path, "previous run")  # the manifest checked is the one used from here
+    if v.manifest.get("run_id") != want:
+        given = f"previous= {path}" if previous is not None else str(path)
+        raise LoadError(
+            f"{given} holds run {v.manifest.get('run_id')}, but {groups.at(0)} names "
+            f"prev_run_id {want}"
+        )
+    kind = v.manifest.get("outputs", {}).get("kind", "projection")
     if kind != "aggregation":
         raise LoadError(
             f"prev_run_id {want} names {path}, a {kind} run; it names the previous aggregation run"
         )
-    _manifest, sha = read_manifest(path)
-    result = load_run(path)
+    result = v.result()
     from halley.aggregation import require_deterministic  # the one J = 1 check
 
     require_deterministic(
@@ -1268,22 +1381,45 @@ def _resolve_previous(
         "the loader reads the previous run's group outputs at one scenario",
         LoadError,
     )
-    membership: Any = manifest.get("membership")
-    groups_block: Any = membership.get("groups") if _is_mapping(membership) else None
-    if not _is_mapping(groups_block):
-        raise LoadError(
-            f"the previous run {want} records no membership; it was not made by run_aggregation"
-        )
+    who = f"the previous run {want}"
+    inputs: Mapping[str, Any] = v.manifest["inputs"]
+    if not _is_mapping(inputs.get("membership")) or not _is_mapping(inputs.get("groups")):
+        raise LoadError(f"{who} records no membership; it was not made by run_aggregation")
+    members = _previous_members(v.read(inputs["membership"], f"{who}: membership"), result, who)
+    f = v.read(inputs["groups"], f"{who}: groups")
+    return _Previous(path, result, v.manifest_sha256, members, _groups_of(f, table_columns(f)))
+
+
+def _previous_members(f: ReadFile, result: RunResult, who: str) -> dict[Any, str]:
+    """The previous run's members at its valuation date, by policy: the ``cur`` rows of its
+    membership copy (:data:`MEMBERSHIP_COLUMNS`), as read and verified. Their groups are the
+    groups the run measured, each with a member, so that a member of a group at that run (G4)
+    is a member of a group its outputs hold."""
+    cols = table_columns(f)
+    for name in MEMBERSHIP_COLUMNS:
+        if name not in cols:
+            raise LoadError(f"{f.where}: column {name} is missing")
+    for name in ("basis", GROUP_ID):
+        if cols[name].dtype != object:
+            raise LoadError(f"{f.where}: {name} is a string column, not {cols[name].dtype}")
     members: dict[Any, str] = {}
-    for gid, by_basis in groups_block.items():
-        cur: Any = by_basis.get(CUR_BASIS) if _is_mapping(by_basis) else None
-        if not _is_list(cur):
-            raise LoadError(
-                f"the previous run {want} records no members of basis {CUR_BASIS} for group {gid}"
-            )
-        for pid in cur:
+    for pid, basis, gid in zip(
+        cols["policy_id"].tolist(), cols["basis"].tolist(), cols[GROUP_ID].tolist(), strict=True
+    ):
+        if basis == CUR_BASIS:
             members[pid] = str(gid)
-    return _Previous(path, result, sha, members)
+    held = set(members.values())
+    measured: list[Any] = result.ids.tolist()
+    for gid in measured:
+        if gid not in held:
+            raise LoadError(f"{who} records no members of basis {CUR_BASIS} for group {gid}")
+    extra = sorted(held - {str(g) for g in measured})
+    if extra:
+        raise LoadError(
+            f"{f.where}: records members of basis {CUR_BASIS} in group {', '.join(extra)}, which "
+            f"{who} did not measure"
+        )
+    return members
 
 
 def _check_g4(runs: Mapping[str, Sequence[_BasisRun]], prev: _Previous) -> None:
@@ -1375,15 +1511,46 @@ def _previous_value(
     return float(values[k, ids.index(gid), 0])
 
 
+def _check_fixed(groups: _Groups, row: int, prev: _Previous) -> None:
+    """A group's fixed attributes are the ones the previous run read from its groups file (its
+    verified copy): the group key (:data:`GROUP_KEY`), the recognition date, which ``tau0`` and
+    ``i_rec`` count from, and every locked-in hash both files carry, since the locked-in basis
+    is fixed for the life of the group (in-force 3.3, B72(b)). A LoadError names this row and
+    the previous run's."""
+    at, then = groups.at(row), prev.groups
+    key = groups.key(row)
+    i = then.row_of(key)
+    if i is None:
+        listing = ", ".join(f"{name} {value!r}" for name, value in zip(GROUP_KEY, key, strict=True))
+        raise LoadError(
+            f"{at}: {then.file.where} holds no row with its key ({listing}); a group's key does "
+            "not change (G4)"
+        )
+    rec, was = groups.date("recognition_date", row), then.date("recognition_date", i)
+    if rec != was:
+        raise LoadError(
+            f"{at}: recognition_date is {rec}, but {then.at(i)} has recognition_date {was}; a "
+            "group's recognition date does not change (in-force 3.3)"
+        )
+    for name in LOCKED_IN_FIELDS:
+        if name in groups.columns and name in then.columns:
+            now, locked = groups.string(name, row), then.string(name, i)
+            if now != locked:
+                raise LoadError(
+                    f"{at}: {name} is {now}, but {then.at(i)} locked in {locked}; the locked-in "
+                    "basis is fixed for the life of the group (B72(b))"
+                )
+
+
 def _from_previous(
     graph: ir.Graph, groups: _Groups, row: int, prev: _Previous, valuation_date: dt.date
 ) -> dict[str, float | int]:
     """The derived fields of one group (design section 9): from the previous run its
     ``fcf_g(0)``, ``fcf_g(tau)``, ``lc(tau)`` and ``p_g`` (:data:`FROM_PREVIOUS_RUN`), and from
     the dates ``tau0``, ``tau``, ``i_acc``, ``i_rec`` (:data:`FROM_DATES`), each that the stage
-    declares. Checked first: the previous run values at ``prev_valuation_date`` and holds the
-    group; after, ``csm_prev`` and ``lc_prev`` equal its ``csm(0)`` and ``lc(0)`` within
-    ``1e-12 * P_g``."""
+    declares. Checked first: the previous run values at ``prev_valuation_date``, and the
+    group's fixed attributes it read are this row's (:func:`_check_fixed`); after,
+    ``csm_prev`` and ``lc_prev`` equal its ``csm(0)`` and ``lc(0)`` within ``1e-12 * P_g``."""
     gid, at = groups.ids[row], groups.at(row)
     prev_date = groups.date("prev_valuation_date", row)
     valued = str(prev.result.manifest["settings"]["valuation_date"])
@@ -1391,10 +1558,9 @@ def _from_previous(
         raise LoadError(
             f"{at}: prev_valuation_date is {prev_date}, but {prev.who} values at {valued}"
         )
-    if gid not in prev.result.ids.tolist():
-        raise LoadError(
-            f"{at}: {prev.who} measured no group {gid}; a group's key does not change (G4)"
-        )
+    # the previous run measured the group: G4 put a member of it in the previous run's cur
+    # membership, whose groups are the ones that run measured (_previous_members)
+    _check_fixed(groups, row, prev)
     rec = groups.date("recognition_date", row)
     tau0 = _month_index(valuation_date) - _month_index(rec)
     tau = _month_index(valuation_date) - _month_index(prev_date)
@@ -1408,7 +1574,7 @@ def _from_previous(
     for name in FROM_DATES:
         if name in graph.fields:
             out[name] = dates[name]
-    closing = [(f, v) for f, v in (("csm_prev", "csm"), ("lc_prev", "lc")) if f in groups.columns]
+    closing = [(f, v) for f, v in CLOSING_FIELDS.items() if f in groups.columns]
     if closing:
         p_g = out.get("p_g_prev")
         if p_g is None:
@@ -1589,16 +1755,47 @@ PROVENANCE_HELPERS: dict[str, ProvenanceHelper] = {}
 helpers (stage B3a) register themselves here with :func:`register_provenance`."""
 
 
-def register_provenance(key: str, helper: ProvenanceHelper) -> None:
-    """Register the helper that recomputes a file carrying ``halley.<key>``, replacing any."""
+def helper_name(helper: object) -> str:
+    """A provenance helper as the manifest records it: its module and qualified name."""
+    module: object = getattr(helper, "__module__", None) or type(helper).__module__
+    name: object = getattr(helper, "__qualname__", None) or type(helper).__qualname__
+    return f"{module}.{name}"
+
+
+def register_provenance(key: str, helper: ProvenanceHelper, *, replace: bool = False) -> None:
+    """Register the helper that recomputes a file carrying ``halley.<key>``. A key that has
+    another helper already is refused unless ``replace=True``: which helper verified a file is
+    what the manifest's provenance entry records, so it does not change silently."""
     if key not in PROVENANCE_KEYS:
         raise ValueError(f"a provenance key is one of {', '.join(PROVENANCE_KEYS)}, not {key!r}")
+    known = PROVENANCE_HELPERS.get(key)
+    if known is not None and known is not helper and not replace:
+        raise ValueError(
+            f"halley.{key} has a provenance helper already, {helper_name(known)}; pass "
+            "replace=True to replace it"
+        )
     PROVENANCE_HELPERS[key] = helper
+
+
+def _recorded_dir(label: str, root: Path | None) -> Path | None:
+    """A directory another run's manifest records (:func:`_dir_label`): an absolute path as it
+    is, a relative one under ``root``; ``None`` without a root, never resolved against the
+    working directory."""
+    d = Path(label)
+    if d.is_absolute():
+        return d
+    return None if root is None else root / d
 
 
 class _Finder:
     """Where a provenance helper looks for a source: the stage's own input files, then the run
-    directories of the previous run, the runs it read and the stage's bases."""
+    directories of the previous run, the runs it read and the stage's bases.
+
+    The previous run records its bases' directories relative to its own ``runs_root``. Each is
+    resolved under the stage's ``runs_root`` when it is set (the tree of runs moved as a whole)
+    and otherwise under the root the previous run recorded, when that is an absolute path; a
+    directory that resolves under neither is skipped, so what the finder finds never depends on
+    the working directory."""
 
     def __init__(
         self,
@@ -1612,13 +1809,17 @@ class _Finder:
         self._runs_root = runs_root
         if prev is not None:
             self._dirs.append((prev.who, prev.path))
+            settings: Any = prev.result.manifest.get("settings") or {}
+            recorded_root: Any = settings.get("runs_root") if _is_mapping(settings) else None
+            root = runs_root
+            if root is None and isinstance(recorded_root, str):
+                root = Path(recorded_root) if Path(recorded_root).is_absolute() else None
             recorded: Any = prev.result.manifest.get("bases") or {}
             for basis, entries in recorded.items():
                 for e in entries:
-                    d = Path(str(e["dir"]))
-                    if not d.is_absolute() and runs_root is not None:
-                        d = Path(runs_root) / d
-                    self._dirs.append((f"{prev.who}'s basis {basis} run {e['run_id']}", d))
+                    d = _recorded_dir(str(e["dir"]), root)
+                    if d is not None:
+                        self._dirs.append((f"{prev.who}'s basis {basis} run {e['run_id']}", d))
         for rs in runs.values():
             for r in rs:
                 self._dirs.append((f"basis {r.basis} run {r.run_id}", r.result.run_dir))
@@ -1643,14 +1844,12 @@ class _Finder:
         )
 
     def run(self, run_id: str) -> RunResult:
+        """The run of that id, read from the bytes verified (:func:`verified_run`)."""
         for _what, d, manifest in self._manifests():
             if manifest.get("run_id") == run_id:
-                verify_run(d)
-                return load_run(d)
+                return verified_run(d).result()
         if self._runs_root is not None:
-            d = find_run(run_id, self._runs_root)
-            verify_run(d)
-            return load_run(d)
+            return verified_run(find_run(run_id, self._runs_root)).result()
         raise LoadError(f"no run {run_id} among the previous run, the runs it read or the bases")
 
 
@@ -1715,7 +1914,15 @@ def _verify_provenance(
                     f"{difference}; a file that names its source equals the recomputed file bit "
                     "for bit"
                 )
-            record.append({"file": f.label, "sha256": f.sha256, "key": key, "value": value})
+            record.append(
+                {
+                    "file": f.label,
+                    "sha256": f.sha256,
+                    "key": key,
+                    "value": value,
+                    "helper": helper_name(helper),  # how the file was verified (D21)
+                }
+            )
     return record
 
 
@@ -1807,10 +2014,12 @@ def load_aggregation_inputs(
     (:func:`require_one_group`); the previous run by ``prev_run_id`` (:func:`_resolve_previous`)
     and G4 against its members, or, without one, one group key per policy across the bases;
     every member mapped to exactly one group row, issued on its recognition date; the
-    structural hashes; the locked-in hashes; the provenance of every file that names a source;
-    the derived group fields; the group series, summed in ascending policy id across each
-    basis's runs (:func:`group_series`); and the manifest blocks. A LoadError names the file and
-    the row or key of the first failure."""
+    membership as a table (:func:`_membership_file`); the structural hashes; the locked-in
+    hashes; the provenance of every file that names a source; the derived group fields, after
+    the group's fixed attributes are held to the previous run's (:func:`_check_fixed`); the
+    group series, summed in ascending policy id across each basis's runs
+    (:func:`group_series`); and the manifest blocks. A LoadError names the file and the row or
+    key of the first failure."""
     stage = _stage_of(compiled)
     graph = compiled.graph
     valuation_date = settings.valuation_date
@@ -1844,6 +2053,7 @@ def load_aggregation_inputs(
     else:
         _check_g4(runs, prev)
     members = _members_by_group(runs, group_rows)
+    membership = _membership_file(runs)
     _check_structure(runs)
     stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
     table_files = {n: read_source(s, f"table {n}") for n, s in (tables or {}).items()}
@@ -1894,21 +2104,6 @@ def load_aggregation_inputs(
             ]
             for name, rs in runs.items()
         },
-        "membership": {
-            "key": list(GROUP_KEY),
-            "groups": {
-                gid: {
-                    name: [
-                        _plain(p)
-                        for p in _sorted_ids(
-                            [m.pid for r in rs for m in r.members if m.group == gid]
-                        ).tolist()
-                    ]
-                    for name, rs in runs.items()
-                }
-                for gid in group_rows.ids
-            },
-        },
         "locked_in": locked_in or None,
         "provenance": provenance,
         "disclosures": _disclosures(stage, runs, stage_files),
@@ -1919,7 +2114,7 @@ def load_aggregation_inputs(
     return StageInputs(
         with_columns(group_rows.file, columns),
         series,
-        StageRecord(group_rows.file, with_columns(None, columns), blocks),
+        StageRecord(group_rows.file, with_columns(None, columns), membership, blocks),
         stage_files,
         table_files,
     )
@@ -1950,10 +2145,11 @@ def run_aggregation(
     loaded and checked by :func:`load_aggregation_inputs`, then the stage runs as any model does
     (:func:`~halley.runtime.run.run`), its outputs keyed on ``group_id`` with ``outputs.kind =
     "aggregation"``. Its run directory copies everything the stage read (the groups file,
-    ``inputs/derived_groups.parquet``, every series with a mean's ``.pathwise`` sibling, the
-    scenario and table files) and its manifest records the previous run, every run of every
-    basis, the membership, the locked-in hashes, the provenance checks and the disclosures, so
-    that :func:`replay_aggregation` re-runs it from the directory alone. Its run id covers the
+    ``inputs/derived_groups.parquet``, ``inputs/membership.parquet``, every series with a
+    mean's ``.pathwise`` sibling, the scenario and table files), each hashed, and its manifest
+    records the previous run, every run of every basis, the locked-in hashes, the provenance
+    checks and the disclosures, so that :func:`replay_aggregation` re-runs it from the
+    directory alone and a later stage reads its members from a verified copy. Its run id covers the
     IR, the groups file, every series' values, every scenario and table file, the previous
     run's id and manifest hash, the settings but ``label``, ``runs_root`` and ``workers``, the
     backend and the horizon: not where any run lives."""
@@ -1983,43 +2179,46 @@ def run_aggregation(
 def replay_aggregation(
     compiled: CompiledModel, from_run: str | Path, *, run_dir: str | Path
 ) -> RunResult:
-    """Re-run an aggregation run from its own directory alone (D21): every file the manifest
-    records a hash for is verified, then the stage runs on the copies as read (the groups file
-    and the derived group fields, every series, the scenario and table files) with the recorded
-    settings, into ``run_dir``. The bases and the previous run are not read, so they may have
-    moved or gone; the manifest blocks that record them are carried over, with
-    ``replayed_from``. ``compiled`` is the stage that made the run: a run directory holds the
-    generated code, not the model, and a stage with another IR is a LoadError.
+    """Re-run an aggregation run from its own directory alone (D21): the directory is read once
+    with every file its manifest records a hash for verified, then the stage runs on the copies
+    as verified (the groups file and the derived group fields, every series, the scenario and
+    table files, the membership) with the recorded settings, into ``run_dir``. The bases and
+    the previous run are not read, so they may have moved or gone; the manifest blocks that
+    record them are carried over, with ``replayed_from``. ``compiled`` is the stage that made
+    the run: a run directory holds the generated code, not the model, and a stage with another
+    IR is a LoadError.
 
     The replay is then compared with the run (:func:`_compare_replay`):
-    ``replayed_from.matches`` records whether it has the run's id and outputs bit for bit, and
-    a difference the environment does not explain is a RunError."""
+    ``replayed_from.matches`` records whether it has the run's id, values and output files bit
+    for bit, and a difference the environment does not explain is a RunError."""
     source = Path(from_run)
-    manifest = verify_run(source, "replayed run")
+    v = verified_run(source, "replayed run")
+    manifest = v.manifest
     inputs: Mapping[str, Any] = manifest["inputs"]
-    if manifest.get("outputs", {}).get("kind") != "aggregation" or "groups" not in inputs:
+    made = manifest.get("outputs", {}).get("kind") == "aggregation"
+    if not made or "groups" not in inputs or "membership" not in inputs:
         raise LoadError(f"{source} holds no run made by run_aggregation; nothing to replay")
     if manifest.get("ir_sha256") != compiled.ir_hash:
         raise LoadError(
             f"{source} was made by a stage with ir_sha256 {manifest.get('ir_sha256')}, but "
             f"{compiled.name} has {compiled.ir_hash}; replay it with the stage that made it"
         )
-    groups = read_copy(source, inputs["groups"], "groups")
-    derived = read_copy(source, inputs["derived_groups"], "derived group fields")
+    groups = v.read(inputs["groups"], "groups")
+    derived = v.read(inputs["derived_groups"], "derived group fields")
+    membership = v.read(inputs["membership"], "membership")
     series = {
-        name: read_series_copy(source, name, entry, GROUP_ID, f"series {name}")
+        name: read_series_copy(source, name, entry, GROUP_ID, f"series {name}", v.read)
         for name, entry in inputs["series"].items()
     }
     scenarios: dict[str, Source] = {
-        name: read_copy(source, e, f"scenario input {name}")
-        for name, e in inputs["scenarios"].items()
+        name: v.read(e, f"scenario input {name}") for name, e in inputs["scenarios"].items()
     }
     tables: dict[str, Source] = {
-        name: read_copy(source, e, f"table {name}") for name, e in inputs["tables"].items()
+        name: v.read(e, f"table {name}") for name, e in inputs["tables"].items()
     }
     blocks = {key: manifest[key] for key in STAGE_BLOCKS if key in manifest}
     blocks["replayed_from"] = {"run_id": manifest["run_id"], "dir": str(source.resolve())}
-    record = StageRecord(groups, table_of(derived), blocks)
+    record = StageRecord(groups, table_of(derived), membership, blocks)
     result = run(
         compiled,
         model_points=with_columns(groups, table_columns(derived)),
@@ -2030,32 +2229,75 @@ def replay_aggregation(
         series=series,
         stage_record=record,
     )
-    _compare_replay(source, manifest, result)
+    _compare_replay(v, result)
     return result
 
 
 RUN_ID_ENVIRONMENT: Final = ("name", "numpy")
-"""The entries of a manifest's ``backend`` block that a run id covers (the backend's name and
-the NumPy version); the output files' bytes depend on every entry (pyarrow writes its version
-into them, and the platform's libm computes the powers)."""
+"""The entries of a manifest's ``backend`` block that a run id covers: the backend's name and
+the NumPy version."""
+
+VALUE_ENVIRONMENT: Final = ("name", "numpy", "platform")
+"""The entries of a manifest's ``backend`` block that can change a run's values: the backend
+and NumPy compute them, and the platform's libm computes the powers. The output files' bytes
+depend on every entry (pyarrow writes its version into them and Python's runs the writer), so
+another pyarrow or Python can change a file's hash but never a value."""
 
 
-def _compare_replay(source: Path, original: Mapping[str, Any], replay: RunResult) -> None:
+def _value_difference(run: RunResult, replay: RunResult) -> str | None:
+    """``None`` when the replay holds the run's group ids and every stored variable's values
+    bit for bit (floats compared as their 64-bit patterns, so ``-0.0`` and ``0.0`` differ and a
+    NaN equals itself); otherwise the first difference, for a message."""
+    if run.ids.tolist() != replay.ids.tolist():
+        return f"groups {replay.ids.tolist()} against {run.ids.tolist()}"
+    for name in sorted(run.arrays):
+        if name not in replay.arrays:
+            return f"no variable {name}, which the run stored"
+        a, b = run.var(name), replay.var(name)
+        if a.shape != b.shape:
+            return f"{name} shaped {b.shape} against {a.shape}"
+        if a.dtype.kind == "f" or b.dtype.kind == "f":
+            x = np.ascontiguousarray(a, dtype=np.float64).view(np.uint64)
+            y = np.ascontiguousarray(b, dtype=np.float64).view(np.uint64)
+        else:
+            x, y = np.asarray(a), np.asarray(b)
+        bad = np.argwhere(x != y)
+        if bad.size:
+            t, g, s = (int(i) for i in bad[0])
+            month = f"t = {t}, " if run.has_time.get(name, False) else ""
+            return (
+                f"{name} at {month}group {run.ids.tolist()[g]}, scenario {s}: "
+                f"{b[t, g, s].item()!r} against {a[t, g, s].item()!r}"
+            )
+    return None
+
+
+def _compare_replay(source: VerifiedRun, replay: RunResult) -> None:
     """Record in the replay's manifest whether it reproduced the run it replays: under
-    ``replayed_from``, ``matches`` (the same run id and the same sha256 of both output files)
-    and, when not, ``differences`` and the ``environment`` that changed (the entries of the
-    manifest's ``backend`` block that differ). A run id that differs while the backend and
-    NumPy are unchanged, or outputs that differ while nothing in the backend block changed, is a
-    RunError (D21): the run is not reproducible from its own directory."""
+    ``replayed_from``, ``matches`` (the same run id, the same values bit for bit, read back from
+    the run's verified outputs, and the same sha256 of both output files) and, when not,
+    ``differences`` and the ``environment`` that changed (the entries of the manifest's
+    ``backend`` block that differ). It is a RunError (D21: the run is not reproducible from its
+    own directory) when the run id differs with the same backend and NumPy
+    (:data:`RUN_ID_ENVIRONMENT`), when a value differs with the same backend, NumPy and platform
+    (:data:`VALUE_ENVIRONMENT`), or when an output file differs with nothing in the backend
+    block changed. A file that differs while the values agree, with another pyarrow or Python,
+    is recorded only."""
+    original = source.manifest
     mine = replay.manifest
     differences: list[str] = []
     id_differs = replay.run_id != original["run_id"]
     if id_differs:
         differences.append(f"run id {replay.run_id} against {original['run_id']}")
+    values = _value_difference(source.result(), replay)
+    if values is not None:
+        differences.append(f"values: {values}")
+    files_differ = False
     for key in ("monthly", "scalars"):
         a = str(mine["outputs"][f"{key}_sha256"])
         b = str(original["outputs"].get(f"{key}_sha256"))
         if a != b:
+            files_differ = True
             differences.append(f"{key} outputs sha256 {a[:12]}... against {b[:12]}...")
     then: Mapping[str, Any] = original.get("backend", {})
     now: Mapping[str, Any] = mine["backend"]
@@ -2069,15 +2311,17 @@ def _compare_replay(source: Path, original: Mapping[str, Any], replay: RunResult
     if differences:
         record["differences"] = differences
         record["environment"] = changed
-    write_manifest(replay.run_dir, mine)
+    replay.manifest_sha256 = write_manifest(replay.run_dir, mine)
     if id_differs and not any(k in changed for k in RUN_ID_ENVIRONMENT):
         same = "the same backend and NumPy, which the run id covers"
-    elif differences and not changed:
+    elif values is not None and not any(k in changed for k in VALUE_ENVIRONMENT):
+        same = "the same backend, NumPy and platform, which compute the values"
+    elif files_differ and not changed:
         same = "the same backend, NumPy, pyarrow, Python and platform"
     else:
         return
     raise RunError(
-        f"the replay of {source} (run {original['run_id']}) in {replay.run_dir} does not "
+        f"the replay of {source.path} (run {original['run_id']}) in {replay.run_dir} does not "
         f"reproduce it with {same}: {'; '.join(differences)}; every run is reproducible from "
         "its own directory (D21)"
     )

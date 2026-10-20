@@ -138,19 +138,32 @@ def verify_copy(run_dir: Path, rel: str, sha256: str, label: str) -> bytes:
     return data
 
 
+def copy_entry(entry: Mapping[str, Any], label: str) -> tuple[str, str]:
+    """The relative path and sha256 a run's manifest entry records for one of its copies."""
+    rel, sha = entry.get("copy"), entry.get("sha256")
+    if not isinstance(rel, str) or not isinstance(sha, str):
+        raise LoadError(f"{label}: its run's manifest records no copy with a sha256")
+    return rel, sha
+
+
+def parse_copy(path: Path, sha256: str, data: bytes, label: str) -> ReadFile:
+    """A run's copy parsed from ``data``, the bytes already verified against ``sha256``: the
+    :class:`ReadFile` holds those bytes, so what is checked, used and copied again is what was
+    hashed."""
+    try:
+        table = pq.read_table(io.BytesIO(data))
+    except (pa.ArrowException, OSError) as exc:
+        raise LoadError(f"{label}: {path} is not a Parquet file: {exc}") from exc
+    return ReadFile(table, sha256, path, data, label, _schema_metadata(table))
+
+
 def read_copy(run_dir: Path, entry: Mapping[str, Any], label: str) -> ReadFile:
     """A run's copy of one of its inputs, as its manifest's entry records it (``copy`` and
     ``sha256``), verified (:func:`verify_copy`) and read. The :class:`ReadFile`'s path is the
     copy's, so a later run that reads it copies those bytes."""
-    rel, sha = entry.get("copy"), entry.get("sha256")
-    if not isinstance(rel, str) or not isinstance(sha, str):
-        raise LoadError(f"{label}: its run's manifest records no copy with a sha256")
+    rel, sha = copy_entry(entry, label)
     data = verify_copy(run_dir, rel, sha, label)
-    try:
-        table = pq.read_table(io.BytesIO(data))
-    except (pa.ArrowException, OSError) as exc:
-        raise LoadError(f"{label}: {run_dir / rel} is not a Parquet file: {exc}") from exc
-    return ReadFile(table, sha, run_dir / rel, data, label, _schema_metadata(table))
+    return parse_copy(run_dir / rel, sha, data, label)
 
 
 def table_columns(f: ReadFile) -> dict[str, NDArray[Any]]:
@@ -755,8 +768,9 @@ basis and the variables summed (which must be what the stage's declaration sums)
 number of scenarios, valuation date and horizon (recorded for a series without a time dimension
 too, so a ``cur`` basis that supplies only scalars still sets the stage's horizon), the source
 runs (``run_id``, ``dir``, ``manifest_sha256``) and the membership the sums used (``[group id,
-member ids ascending]`` per group, groups ascending). :func:`~halley.aggregation.group_series`
-fills it."""
+member ids ascending]`` per group, groups ascending: the members held by the runs of the
+series' own basis, which are the policies its sums ran over).
+:func:`~halley.aggregation.group_series` fills it."""
 
 CUR_BASIS = "cur"
 """The basis whose horizon is the stage's (design section 9, "Horizon")."""
@@ -1017,20 +1031,32 @@ def _check_pathwise(
 
 
 def read_series_copy(
-    run_dir: Path, name: str, entry: Mapping[str, Any], id_field: str, label: str
+    run_dir: Path,
+    name: str,
+    entry: Mapping[str, Any],
+    id_field: str,
+    label: str,
+    read: Callable[[Mapping[str, Any], str], ReadFile] | None = None,
 ) -> LoadedSeries:
     """A group series as a stage's run directory keeps it: ``inputs/series/<name>.parquet`` in
     long form (the group id, ``scenario``, ``t``, ``value``, group-major, then month, then
     scenario) and, for a mean, its ``.pathwise`` sibling, each verified against the sha256 the
     manifest's ``entry`` records and read back to the dense ``(Tn | 1, groups, scenarios)``
     array, with the unit, domain, scenario treatment and provenance the entry records. A
-    LoadError names the file that is missing, changed or laid out otherwise."""
-    f = read_copy(run_dir, entry, label)
+    LoadError names the file that is missing, changed or laid out otherwise. ``read`` reads a
+    copy from its entry (:func:`read_copy` by default; a run verified as a whole passes the
+    reader of the bytes it verified)."""
+
+    def from_disk(e: Mapping[str, Any], what: str) -> ReadFile:
+        return read_copy(run_dir, e, what)
+
+    reader = from_disk if read is None else read
+    f = reader(entry, label)
     values, group_ids = _dense_series(f, id_field)
     pathwise: NDArray[np.float64] | None = None
     sibling = entry.get("pathwise")
     if sibling is not None:
-        pf = read_copy(run_dir, sibling, f"{label} (pathwise)")
+        pf = reader(sibling, f"{label} (pathwise)")
         pathwise, pids = _dense_series(pf, id_field)
         if pids.tolist() != group_ids.tolist():
             raise LoadError(f"{pf.where}: it covers other groups than the series it sits beside")

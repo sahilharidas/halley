@@ -14,6 +14,7 @@ import datetime as dt
 import functools
 import hashlib
 import json
+import platform
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -115,6 +116,30 @@ def _edited(source: Path, dest: Path, edit: Callable[[dict[str, Any]], object]) 
     return dest
 
 
+def _members(r: RunResult) -> list[tuple[str, int]]:
+    """A stage run's membership copy as (basis, policy id) rows, in the file's order."""
+    rows = pq.read_table(r.run_dir / "inputs" / "membership.parquet").to_pylist()
+    return [(row["basis"], row["policy_id"]) for row in rows]
+
+
+def _rehashed(
+    source: Path, dest: Path, rel: str, rewrite: Callable[[Any], Any], **options: Any
+) -> Path:
+    """A copy of a run directory whose file ``rel`` (a Parquet copy or output) ``rewrite``
+    changed, with the manifest's sha256 for it changed too: the edit a hash cannot catch, since
+    no hash covers the manifest itself."""
+    shutil.copytree(source, dest)
+    path = dest / rel
+    old = _sha(path)
+    pq.write_table(rewrite(pq.read_table(path)), path, **options)
+    new = _sha(path)
+    manifest_path = dest / "manifest.json"
+    text = manifest_path.read_text(encoding="utf-8")
+    assert text.count(old) >= 1, rel
+    manifest_path.write_text(text.replace(old, new), encoding="utf-8")
+    return dest
+
+
 def _ascending_sum(runs: list[RunResult], name: str, t: int) -> float:
     """A variable at month ``t`` summed over every policy of the runs in ascending policy id,
     with plain floats."""
@@ -180,6 +205,7 @@ class Chain:
         ra: str = "ra_param",
         horizon: int | None = None,
         points: Any = None,
+        settings: dict[str, Any] | None = None,
         **kw: Any,
     ) -> RunResult:
         """A ``Member`` class run: at ``V_NOW`` on the locked-in curve and CPI path and the
@@ -195,6 +221,7 @@ class Chain:
             ra_param=self.files.get(ra, ra),
             valuation_date=at,
             horizon=h,
+            **(settings or {}),
         )
 
     def rec_basis(self, folder: Path, **kw: Any) -> list[RunResult]:
@@ -317,10 +344,22 @@ def test_an_in_force_stage_runs_on_its_bases_and_its_previous_run(chain: Chain) 
     assert r1.lane("delta", GID)[0] == new - old
     cu_g = [_ascending_sum(chain.cur, "cu", t) for t in range(13)]
     assert r1.lane("units", GID)[12] == cu_g[12]
-    groups = r1.manifest["membership"]["groups"]
-    assert r1.manifest["membership"]["key"] == ["portfolio", "cohort", "profit_bucket"]
-    assert groups == {GID: {"old": [1, 2, 3, 11, 12], "new": [1, 3, 11, 12], "cur": [1, 3, 11, 12]}}
-    assert r0.manifest["membership"]["groups"] == {GID: {"cur": [1, 2, 3, 11, 12]}}
+    # the membership is a hashed copy, not a manifest block: by basis in the declared order,
+    # then policy id ascending
+    entry = r1.manifest["inputs"]["membership"]
+    assert "membership" not in r1.manifest
+    assert entry["copy"] == "inputs/membership.parquet"
+    assert entry["key"] == ["portfolio", "cohort", "profit_bucket"]
+    assert entry["columns"] == ["policy_id", "basis", "group_id"]
+    assert _members(r1) == [
+        *(("old", p) for p in [1, 2, 3, 11, 12]),
+        *(("new", p) for p in [1, 3, 11, 12]),
+        *(("cur", p) for p in [1, 3, 11, 12]),
+    ]
+    assert _members(r0) == [("cur", p) for p in [1, 2, 3, 11, 12]]
+    table = pq.read_table(r1.run_dir / entry["copy"])
+    assert table.schema.field("policy_id").type == pa.int64()
+    assert set(table.column("group_id").to_pylist()) == {GID}
     assert r0.manifest["previous"] is None
 
 
@@ -334,7 +373,7 @@ def test_the_run_directory_copies_what_the_stage_read_d21(chain: Chain) -> None:
     inputs = m["inputs"]
     assert inputs["groups"]["copy"] == "inputs/groups.parquet"
     assert pq.read_table(d / "inputs" / "groups.parquet").equals(chain.groups())
-    for key in ("groups", "derived_groups", "model_points"):
+    for key in ("groups", "derived_groups", "membership", "model_points"):
         assert _sha(d / inputs[key]["copy"]) == inputs[key]["sha256"], key
     assert inputs["derived_groups"]["columns"][0] == "group_id"
     model_points = pq.read_table(d / "inputs" / "model_points.parquet")
@@ -371,6 +410,15 @@ def test_the_run_directory_copies_what_the_stage_read_d21(chain: Chain) -> None:
             }
     assert inputs["series"]["fcf_g"]["start"] == 0
     assert inputs["series"]["cu_g"]["start"] == 1
+    # each series records the members its own basis's runs hold, which its sums ran over:
+    # policy 2 left before the valuation date, so it is in the old basis only
+    in_force = [1, 3, 11, 12]
+    assert {name: e["members"] for name, e in inputs["series"].items()} == {
+        "cu_g": [[GID, in_force]],
+        "fcf_g": [[GID, in_force]],
+        "fcf_old": [[GID, [1, 2, 3, 11, 12]]],
+        "fcf_new": [[GID, in_force]],
+    }
     assert m["previous"] == {
         "run_id": chain.recognised.run_id,
         "dir": "recognised",
@@ -503,10 +551,12 @@ def test_aggregation_replays_from_its_own_directory_d21(chain: Chain, tmp_path: 
     assert "differences" not in m["replayed_from"]
     on_disk = json.loads((replay.run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert on_disk["replayed_from"] == m["replayed_from"]
-    for key in ("previous", "bases", "membership", "locked_in", "provenance", "disclosures"):
+    for key in ("previous", "bases", "locked_in", "provenance", "disclosures"):
         assert m[key] == chain.in_force.manifest[key], key
     assert m["inputs"]["scenarios"]["p_l"]["path"].startswith(str(tree / "in-force"))
-    assert m["inputs"]["groups"]["sha256"] == chain.in_force.manifest["inputs"]["groups"]["sha256"]
+    for key in ("groups", "membership"):
+        assert m["inputs"][key]["sha256"] == chain.in_force.manifest["inputs"][key]["sha256"], key
+    assert _members(replay) == _members(chain.in_force)
     for name, entry in m["inputs"]["series"].items():
         mine = chain.in_force.manifest["inputs"]["series"][name]
         assert entry["values_sha256"] == mine["values_sha256"], name
@@ -912,6 +962,14 @@ def test_the_previous_run_supplies_the_derived_fields(chain: Chain, tmp_path: Pa
         chain.roll(out, groups=chain.groups(csm_prev=csm * (1 + 1e-9)))
     within = chain.roll(tmp_path / "within", groups=chain.groups(csm_prev=csm + csm * 1e-14))
     assert within.lane("months", GID)[0] == 12
+    # the scale is P_g, not csm_prev: P_g is well above csm(0) here, so a margin of 0.9e-12 *
+    # P_g passes, though it is more than 1e-12 * csm_prev, and 1.1e-12 * P_g does not
+    p_g = float(chain.recognised.lane("p_g", GID)[0])
+    assert 0.9 * p_g > 2 * csm > 0
+    scaled = chain.roll(tmp_path / "scaled", groups=chain.groups(csm_prev=csm + 0.9e-12 * p_g))
+    assert scaled.lane("months", GID)[0] == 12
+    with pytest.raises(LoadError, match=r"they agree within 1e-12 \* P_g = "):
+        chain.roll(out, groups=chain.groups(csm_prev=csm + 1.1e-12 * p_g))
 
     root = tmp_path / "root"
     rec = chain.rec_basis(root)
@@ -1008,6 +1066,10 @@ def test_the_locked_in_basis(chain: Chain, tmp_path: Path) -> None:
     assert str(chain.old[0].run_dir / "inputs" / "scenarios" / "cpi.parquet") in str(info.value)
 
 
+REBASE = "test_provenance_is_recomputed_bit_for_bit.<locals>.rebase"
+"""The qualified name of the helper the next test registers."""
+
+
 def test_provenance_is_recomputed_bit_for_bit(
     chain: Chain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1031,19 +1093,38 @@ def test_provenance_is_recomputed_bit_for_bit(
         return curve(0.041, meta=check.file.metadata)
 
     register_provenance("rebased_from", rebase)
+    register_provenance("rebased_from", rebase)  # the same helper again: no change
     verified = chain.roll(tmp_path / "verified", scenarios={"p_l": p_l})
     assert verified.manifest["provenance"] == [
-        {"file": "scenario input p_l", "sha256": _sha(p_l), "key": "rebased_from", "value": source}
+        {
+            "file": "scenario input p_l",
+            "sha256": _sha(p_l),
+            "key": "rebased_from",
+            "value": source,
+            # how the file was verified (D21): the helper's module and qualified name
+            "helper": f"{__name__}.{REBASE}",
+        }
     ]
     # found in the directory of a basis run of the previous run
     assert str(chain.rec[0].run_dir / "inputs" / "scenarios" / "rf_df.parquet") in found[0]
-    register_provenance("rebased_from", lambda check: curve(0.0412, meta=check.file.metadata))
+
+    def drifted(check: ProvenanceCheck) -> Any:
+        return curve(0.0412, meta=check.file.metadata)
+
+    with pytest.raises(ValueError, match="has a provenance helper already") as info:
+        register_provenance("rebased_from", drifted)
+    assert str(info.value) == (
+        f"halley.rebased_from has a provenance helper already, {__name__}.{REBASE}; pass "
+        "replace=True to replace it"
+    )
+    assert stage_module.PROVENANCE_HELPERS["rebased_from"] is rebase
+    register_provenance("rebased_from", drifted, replace=True)
     with pytest.raises(
         LoadError,
         match=r"is not what its source \(halley.rebased_from = .*\) gives: column rf_df, row 1",
     ):
         chain.roll(out, scenarios={"p_l": p_l})
-    register_provenance("rebased_from", lambda check: 1 / 0)
+    register_provenance("rebased_from", lambda check: 1 / 0, replace=True)
     with pytest.raises(LoadError, match="raised ZeroDivisionError"):
         chain.roll(out, scenarios={"p_l": p_l})
     with pytest.raises(ValueError, match="a provenance key is one of"):
@@ -1277,9 +1358,11 @@ def test_the_previous_run_recorded_its_membership_and_the_group(
     chain: Chain, tmp_path: Path
 ) -> None:
     """The previous run was made by run_aggregation, so it recorded its membership: a stage run
-    through run() with group_series did not. It measured the group the groups row names: a
-    membership that names the group over outputs of another (a manifest edited, which no hash
-    covers) is a LoadError naming the row."""
+    through run() with group_series did not. Its membership copy's cur rows name exactly the
+    groups it measured, each with a member: a copy rewritten for another group, or with a group
+    more, or without the cur rows (each with its hash in the manifest, which no hash covers), is
+    a LoadError naming the run, and the copy where a row is extra. With G4 this is what makes
+    the group the row names one the previous run measured."""
     root = tmp_path / "root"
     series = group_series(Recognise, {"cur": chain.rec}, {GID: [1, 2, 3, 11, 12]})
     bare = run(
@@ -1290,7 +1373,7 @@ def test_the_previous_run_recorded_its_membership_and_the_group(
         run_dir=root / "bare",
     )
     assert bare.kind == "aggregation"
-    assert "membership" not in bare.manifest
+    assert "membership" not in bare.manifest["inputs"]
     with pytest.raises(LoadError) as info:
         chain.roll(tmp_path / "stage", groups=chain.groups(previous=bare), runs_root=root)
     assert str(info.value) == (
@@ -1306,18 +1389,49 @@ def test_the_previous_run_recorded_its_membership_and_the_group(
     )
     assert onerous.ids.tolist() == ["IA-2025-ONEROUS"]
 
-    def rename(m: dict[str, Any]) -> None:
-        groups = m["membership"]["groups"]
-        groups[GID] = groups.pop("IA-2025-ONEROUS")
+    def rename(table: Any) -> Any:
+        return table.set_column(2, "group_id", pa.array([GID] * table.num_rows))
 
-    _edited(onerous.run_dir, root / "onerous", rename)
+    membership = "inputs/membership.parquet"
+    _rehashed(onerous.run_dir, root / "onerous", membership, rename)
     with pytest.raises(LoadError) as info:
         chain.roll(
             tmp_path / "stage", groups=chain.groups(prev_run_id=onerous.run_id), runs_root=root
         )
     assert str(info.value) == (
-        f"groups: group {GID} (row 0): the previous run {onerous.run_id} measured no group {GID}; "
-        "a group's key does not change (G4)"
+        f"the previous run {onerous.run_id} records no members of basis cur for group "
+        "IA-2025-ONEROUS"
+    )
+
+    def one_more(table: Any) -> Any:
+        return pa.table(
+            {
+                "policy_id": pa.array([*table.column("policy_id").to_pylist(), 999], pa.int64()),
+                "basis": pa.array(["cur"] * (table.num_rows + 1)),
+                "group_id": pa.array([GID] * table.num_rows + ["IA-2025-ONEROUS"]),
+            }
+        )
+
+    rid = chain.recognised.run_id
+    extra = _rehashed(
+        chain.recognised.run_dir, tmp_path / "extra" / "recognised", membership, one_more
+    )
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=tmp_path / "extra")
+    assert str(info.value) == (
+        f"the previous run {rid}: membership ({extra / membership}): records members of basis cur "
+        f"in group IA-2025-ONEROUS, which the previous run {rid} did not measure"
+    )
+
+    def other_basis(table: Any) -> Any:
+        return table.set_column(1, "basis", pa.array(["old"] * table.num_rows))
+
+    moved = tmp_path / "moved"
+    _rehashed(chain.recognised.run_dir, moved / "recognised", membership, other_basis)
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=moved)
+    assert (
+        str(info.value) == f"the previous run {rid} records no members of basis cur for group {GID}"
     )
 
 
@@ -1633,7 +1747,9 @@ def test_the_fields_the_loader_fills_are_declared_as_it_fills_them_d11(tmp_path:
         "CountedPrev.model_point declares f_prev_0 as int Int, but the loader fills it with the "
         "previous run's fcf_g, an amount: declare it number Money (D11)"
     )
-    with pytest.raises(BuildError, match=r"DerivedTau\.model_point derives tau0, which the"):
+    with pytest.raises(
+        BuildError, match=r"DerivedTau\.model_point derives tau0, but the loader fills it"
+    ):
         build(DerivedTau)
 
 
@@ -1710,44 +1826,74 @@ def test_the_confidence_level_is_disclosed_or_the_run_stops(chain: Chain, tmp_pa
 # --------------------------------------------------------------------- a replay reproduces
 
 
+def _csm_plus_one(table: Any) -> Any:
+    """The monthly outputs with csm at one row moved by 1.0."""
+    csm = table.column("csm").to_pylist()
+    csm[3] += 1.0
+    return table.set_column(table.column_names.index("csm"), "csm", pa.array(csm))
+
+
 def test_a_replay_that_does_not_reproduce_its_run_is_an_error_d21(
     chain: Chain, tmp_path: Path
 ) -> None:
-    """D21: a replay compares itself with the run it replays. Outputs that differ with nothing
-    in the backend block changed, or a run id that differs with the same backend and NumPy, is
-    a RunError; with another environment the difference is recorded, not raised."""
-    source = tmp_path / "run"
-    shutil.copytree(chain.in_force.run_dir, source)
-    monthly = source / "outputs" / "monthly.parquet"
-    table = pq.read_table(monthly)
-    csm = table.column("csm").to_pylist()
-    csm[3] += 1.0
-    index = table.column_names.index("csm")
-    pq.write_table(table.set_column(index, "csm", pa.array(csm)), monthly)
-    rewritten = _edited(
-        source,
-        tmp_path / "rewritten",
-        lambda m: m["outputs"].update(monthly_sha256=_sha(monthly)),
+    """D21: a replay compares itself with the run it replays: its values bit for bit with the
+    run's outputs as read back from their verified bytes, its run id and its output files'
+    hashes. A value that differs with the same backend, NumPy and platform is a RunError,
+    whatever pyarrow or Python did (they write the files, they do not compute the values); with
+    another platform, whose libm computes the powers, it is recorded. A file that differs while
+    the values agree is recorded with another pyarrow and a RunError with nothing changed; a run
+    id that differs with the same backend and NumPy is a RunError."""
+    monthly = "outputs/monthly.parquet"
+    changed = _rehashed(chain.in_force.run_dir, tmp_path / "changed", monthly, _csm_plus_one)
+    csm = float(chain.in_force.lane("csm", GID)[3])
+    value = f"values: csm at t = 3, group {GID}, scenario 0: {csm!r} against {csm + 1.0!r}"
+    with pytest.raises(RunError) as info:
+        replay_aggregation(compiled(Roll), changed, run_dir=tmp_path / "replay")
+    assert str(info.value).startswith(
+        f"the replay of {changed} (run {chain.in_force.run_id}) in {tmp_path / 'replay'} does not "
+        f"reproduce it with the same backend, NumPy and platform, which compute the values: "
+        f"{value}; monthly outputs sha256 "
     )
+    written = json.loads((tmp_path / "replay" / "manifest.json").read_text(encoding="utf-8"))
+    assert written["replayed_from"]["matches"] is False
+    assert written["replayed_from"]["environment"] == {}
+
+    # another pyarrow and Python cannot change a value: still a RunError
+    writers = _edited(
+        changed, tmp_path / "writers", lambda m: m["backend"].update(pyarrow="0.0", python="0.0")
+    )
+    with pytest.raises(RunError, match="NumPy and platform, which compute the values: values: csm"):
+        replay_aggregation(compiled(Roll), writers, run_dir=tmp_path / "replay-2")
+
+    # another platform can: recorded, with the same run id
+    libm = _edited(changed, tmp_path / "libm", lambda m: m["backend"].update(platform="elsewhere"))
+    replay = replay_aggregation(compiled(Roll), libm, run_dir=tmp_path / "replay-3")
+    record = replay.manifest["replayed_from"]
+    assert record["matches"] is False
+    assert record["differences"][0] == value
+    assert record["environment"] == {
+        "platform": {"run": "elsewhere", "replay": platform.platform()}
+    }
+    assert replay.run_id == chain.in_force.run_id
+    assert replay.manifest_sha256 == _sha(replay.run_dir / "manifest.json")
+
+    # the same values in other bytes: a file difference alone
+    rewritten = _rehashed(
+        chain.in_force.run_dir, tmp_path / "rewritten", monthly, lambda t: t, compression="none"
+    )
+    assert _sha(rewritten / monthly) != chain.in_force.manifest["outputs"]["monthly_sha256"]
     with pytest.raises(
         RunError,
         match="does not reproduce it with the same backend, NumPy, pyarrow, Python and platform: "
         "monthly outputs sha256",
     ):
-        replay_aggregation(compiled(Roll), rewritten, run_dir=tmp_path / "replay")
-    written = json.loads((tmp_path / "replay" / "manifest.json").read_text(encoding="utf-8"))
-    assert written["replayed_from"]["matches"] is False
-    assert written["replayed_from"]["environment"] == {}
-
-    elsewhere = _edited(
-        rewritten, tmp_path / "elsewhere", lambda m: m["backend"].update(pyarrow="0.0")
-    )
-    replay = replay_aggregation(compiled(Roll), elsewhere, run_dir=tmp_path / "replay-2")
+        replay_aggregation(compiled(Roll), rewritten, run_dir=tmp_path / "replay-4")
+    newer = _edited(rewritten, tmp_path / "newer", lambda m: m["backend"].update(pyarrow="0.0"))
+    replay = replay_aggregation(compiled(Roll), newer, run_dir=tmp_path / "replay-5")
     record = replay.manifest["replayed_from"]
     assert record["matches"] is False
+    assert [d.split(" sha256")[0] for d in record["differences"]] == ["monthly outputs"]
     assert record["environment"] == {"pyarrow": {"run": "0.0", "replay": pa.__version__}}
-    assert record["differences"][0].startswith("monthly outputs sha256")
-    assert replay.run_id == chain.in_force.run_id
 
     renamed = _edited(
         chain.in_force.run_dir, tmp_path / "renamed", lambda m: m.update(run_id="0" * 16)
@@ -1757,4 +1903,574 @@ def test_a_replay_that_does_not_reproduce_its_run_is_an_error_d21(
         match=f"with the same backend and NumPy, which the run id covers: run id "
         f"{chain.in_force.run_id} against {'0' * 16}",
     ):
-        replay_aggregation(compiled(Roll), renamed, run_dir=tmp_path / "replay-3")
+        replay_aggregation(compiled(Roll), renamed, run_dir=tmp_path / "replay-6")
+
+
+# ---------------------------------------------------------- run() and the previous run (B2 fix)
+
+
+def test_run_refuses_a_stage_that_reads_a_previous_run(chain: Chain, tmp_path: Path) -> None:
+    """Design section 9: the previous run's quantities are derived group fields the loader
+    fills, never retyped. run() takes the model points as given, so a stage whose groups name
+    a previous run or lock in a basis runs only through run_aggregation, which reads that run
+    and verifies the hashes; nothing is written. A stage that sums its bases alone still runs
+    through run() with group_series."""
+    series = group_series(Roll, chain.bases(), {GID: [1, 2, 3, 11, 12]})
+    groups = chain.groups().append_column("group_id", pa.array([GID]))
+    typed = {"f_prev_0": 12345.0, "f_prev_tau": 1.0, "lc_prev_tau": 0.0, "p_g_prev": 99.0}
+    for name, value in typed.items():
+        groups = groups.append_column(name, pa.array([value], pa.float64()))
+    for name, count in {"tau0": 12, "tau": 12, "i_acc": 0, "i_rec": 12}.items():
+        groups = groups.append_column(name, pa.array([count], pa.int64()))
+    with pytest.raises(LoadError) as info:
+        run(
+            compiled(Roll),
+            model_points=groups,
+            scenarios={"p_l": chain.files["p_l"]},
+            series=series,
+            settings=RunSettings(valuation_date=V_NOW),
+            run_dir=tmp_path / "typed",
+        )
+    assert str(info.value) == (
+        "models.Roll reads a previous run (prev_run_id, f_prev_0, f_prev_tau, lc_prev_tau, "
+        "p_g_prev, tau0, tau, i_acc, i_rec) and locks in a basis (discount_rec_sha256, "
+        "ilp_sha256, cpi_rec_sha256); run it with halley.aggregation.stage.run_aggregation, which "
+        "reads the previous run, derives these fields from it and verifies the hashes, not with "
+        "run(), which would take them as typed (design section 9)"
+    )
+    assert not (tmp_path / "typed").exists()
+    locked = group_row(
+        discount_rec_sha256=chain.hashes["rf_rec"],
+        ilp_sha256=chain.hashes["ilp"],
+        cpi_rec_sha256=chain.hashes["cpi_rec"],
+    ).append_column("group_id", pa.array([GID]))
+    with pytest.raises(LoadError, match=r"\.LockedCurve locks in a basis \(discount_rec_sha256"):
+        run(
+            compiled(LockedCurve),
+            model_points=locked,
+            scenarios={"p_l": chain.files["p_l"]},
+            series=group_series(LockedCurve, {"cur": chain.rec}, {GID: [1, 2, 3, 11, 12]}),
+            settings=RunSettings(valuation_date=V_REC),
+            run_dir=tmp_path / "locked",
+        )
+
+
+def test_g4_reads_the_previous_members_from_their_hashed_copy(chain: Chain, tmp_path: Path) -> None:
+    """G4 checks the bases against the cur rows of the previous run's membership copy, which its
+    manifest hashes: a copy edited to admit a policy is a LoadError naming it, and a manifest
+    block that lists the policy (which no hash covers) decides nothing."""
+    root = tmp_path / "root"
+    shutil.copytree(chain.recognised.run_dir, root / "recognised")
+    copy = root / "recognised" / "inputs" / "membership.parquet"
+    table = pq.read_table(copy)
+    joined = pa.table(
+        {
+            "policy_id": pa.array([*table.column("policy_id").to_pylist(), 99], pa.int64()),
+            "basis": pa.array([*table.column("basis").to_pylist(), "cur"]),
+            "group_id": pa.array([*table.column("group_id").to_pylist(), GID]),
+        }
+    )
+    pq.write_table(joined, copy)
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=root)
+    assert str(info.value).startswith(
+        f"previous run {chain.recognised.run_id}: membership: {copy} does not match the sha256 "
+        "its run's manifest records"
+    )
+
+    def claims(m: dict[str, Any]) -> None:
+        m["membership"] = {"groups": {GID: {"cur": [1, 2, 3, 11, 12, 99]}}}
+
+    claimed = tmp_path / "claimed"
+    _edited(chain.recognised.run_dir, claimed / "recognised", claims)
+    joined_new = [chain.member(tmp_path / "new-99", [1, 3, 99]), chain.new[1]]
+    joined_cur = [
+        chain.member(tmp_path / "cur-99", [1, 3, 99], rf="rf_cur", cpi="cpi_cur"),
+        chain.cur[1],
+    ]
+    old = [chain.member(tmp_path / "old-99", [1, 2, 3, 99], expense="expense_v1"), chain.old[1]]
+    with pytest.raises(
+        LoadError, match=r"row 3, policy 99 is not a member of the previous run .*\(G4, para 28\)"
+    ):
+        chain.roll(
+            tmp_path / "stage",
+            bases=chain.bases(old=old, new=joined_new, cur=joined_cur),
+            runs_root=claimed,
+        )
+
+
+def test_a_groups_fixed_attributes_are_the_previous_runs(chain: Chain, tmp_path: Path) -> None:
+    """The previous run read the group's row from its groups file, whose copy its manifest
+    hashes: the group key, the recognition date and every locked-in hash both files carry are
+    this row's (in-force 3.3; B72(b): the locked-in basis is fixed for the life of the group).
+    Otherwise a LoadError names this row and the previous run's."""
+    rid = chain.recognised.run_id
+
+    def recohort(table: Any) -> Any:
+        return table.set_column(
+            table.column_names.index("cohort"), "cohort", pa.array([2024], pa.int16())
+        )
+
+    groups_copy = "inputs/groups.parquet"
+    rekeyed = _rehashed(
+        chain.recognised.run_dir, tmp_path / "rekeyed" / "recognised", groups_copy, recohort
+    )
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=tmp_path / "rekeyed")
+    assert str(info.value) == (
+        f"groups: group {GID} (row 0): the previous run {rid}: groups ({rekeyed / groups_copy}) "
+        "holds no row with its key (portfolio 'IA', cohort 2025, profit_bucket 'OTHER'); a "
+        "group's key does not change (G4)"
+    )
+
+    def redate(table: Any) -> Any:
+        index = table.column_names.index("recognition_date")
+        return table.set_column(
+            index, "recognition_date", pa.array([dt.date(2025, 11, 30)], pa.date32())
+        )
+
+    redated = _rehashed(
+        chain.recognised.run_dir, tmp_path / "redated" / "recognised", groups_copy, redate
+    )
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=tmp_path / "redated")
+    assert str(info.value) == (
+        f"groups: group {GID} (row 0): recognition_date is 2025-12-31, but the previous run "
+        f"{rid}: groups ({redated / groups_copy}): group {GID} (row 0) has recognition_date "
+        "2025-11-30; a group's recognition date does not change (in-force 3.3)"
+    )
+
+    # a recognition run whose groups file carried the locked-in hashes beside its own fields
+    root = tmp_path / "root"
+    hashes = {
+        "discount_rec_sha256": chain.hashes["rf_rec"],
+        "ilp_sha256": chain.hashes["ilp"],
+        "cpi_rec_sha256": chain.hashes["cpi_rec"],
+    }
+    kept = chain.recognise(root / "kept", groups=group_row(**hashes), runs_root=root)
+    assert kept.run_id != rid  # the groups file is in the identity
+    same = chain.roll(tmp_path / "same", groups=chain.groups(previous=kept), runs_root=root)
+    assert np.array_equal(same.arrays["csm"], chain.in_force.arrays["csm"])
+    switched = chain.recognise(
+        root / "switched", groups=group_row(**{**hashes, "ilp_sha256": "0" * 64}), runs_root=root
+    )
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", groups=chain.groups(previous=switched), runs_root=root)
+    copy = switched.run_dir / groups_copy
+    assert str(info.value) == (
+        f"groups: group {GID} (row 0): ilp_sha256 is {chain.hashes['ilp']}, but the previous run "
+        f"{switched.run_id}: groups ({copy}): group {GID} (row 0) locked in {'0' * 64}; the "
+        "locked-in basis is fixed for the life of the group (B72(b))"
+    )
+
+
+def test_the_finder_never_resolves_against_the_working_directory(
+    chain: Chain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous run records its bases' directories relative to its runs_root. With
+    previous= and no runs_root of the stage's own, they resolve under the root the previous run
+    recorded; a directory that resolves under no absolute root is skipped, so whether a source
+    is found never depends on the working directory. A source or run found nowhere is a
+    LoadError."""
+    monkeypatch.setattr(stage_module, "PROVENANCE_HELPERS", {})
+    source = chain.hashes["rf_rec"]
+    meta = {"source_sha256": source, "ilp_sha256": chain.hashes["ilp"], "rebased_from": source}
+    p_l = _write(curve(0.041, meta=meta), tmp_path / "p_l.parquet")
+    found: list[str] = []
+
+    def rebase(check: ProvenanceCheck) -> Any:
+        found.append(check.find_file(check.value).where)
+        return curve(0.041, meta=check.file.metadata)
+
+    register_provenance("rebased_from", rebase)
+    away = tmp_path / "away"
+    away.mkdir()
+    monkeypatch.chdir(away)  # a working directory that holds no run
+    given = {"runs_root": None, "previous": chain.recognised.run_dir, "scenarios": {"p_l": p_l}}
+    chain.roll(tmp_path / "direct", **given)
+    assert str(chain.rec[0].run_dir / "inputs" / "scenarios" / "rf_df.parquet") in found[0]
+
+    missing = f"no file with sha256 {source} in the stage's inputs, the previous run, the runs it "
+    for recorded, cwd, rec_a in ((None, chain.root, "rec-a"), ("runs", chain.base, "runs/rec-a")):
+        # the recorded root is gone or relative, while rec-a resolves under the working directory
+        assert (cwd / rec_a / "manifest.json").is_file()
+        unrooted = _edited(
+            chain.recognised.run_dir,
+            tmp_path / f"unrooted-{recorded}",
+            lambda m, root=recorded: m["settings"].update(runs_root=root),
+        )
+        monkeypatch.chdir(cwd)
+        with pytest.raises(LoadError) as info:
+            chain.roll(tmp_path / "stage", **{**given, "previous": unrooted})
+        assert str(info.value).startswith(missing)
+
+    def by_id(check: ProvenanceCheck) -> Any:
+        check.find_run("0" * 16)
+        return table_of(check.file)
+
+    register_provenance("rebased_from", by_id, replace=True)
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", **given)
+    assert str(info.value) == (
+        f"no run {'0' * 16} among the previous run, the runs it read or the bases"
+    )
+    with pytest.raises(LoadError, match=f"no run under runs_root .* has run_id {'0' * 16}"):
+        chain.roll(tmp_path / "stage", scenarios={"p_l": p_l})
+
+
+# ---------------------------------------------------------------- the group schema at build
+
+
+def _misdeclared(replacement: Any) -> type[Aggregation]:
+    """A stage whose group schema declares ``replacement`` in place of the field of its name."""
+
+    class Misdeclared(Recognise):
+        model_point = _with_field(group_schema(J_FIELD, previous=True, locked_in=True), replacement)
+
+    return Misdeclared
+
+
+@pytest.mark.parametrize(
+    ("replacement", "error", "message"),
+    [
+        (
+            Field("portfolio", "number", "Money"),
+            BuildError,
+            "declares portfolio as number Money, but the loader reads it as a group key, a "
+            "string: declare it string or enum",
+        ),
+        (
+            Field("cohort", "string"),
+            UnitError,
+            "declares cohort as string, but the loader reads it as a group key, an integer year: "
+            "declare it int Int (D11)",
+        ),
+        (
+            int_field("profit_bucket"),
+            BuildError,
+            "declares profit_bucket as int Int, but the loader reads it as a group key, a string: "
+            "declare it string or enum",
+        ),
+        (
+            Field("recognition_date", "string"),
+            UnitError,
+            "declares recognition_date as string, but the loader reads it as a date, every "
+            "member's issue date: declare it date (D11)",
+        ),
+        (
+            int_field("prev_valuation_date"),
+            UnitError,
+            "declares prev_valuation_date as int Int, but the loader reads it as a date, the "
+            "previous run's: declare it date (D11)",
+        ),
+        (
+            int_field("prev_run_id"),
+            BuildError,
+            "declares prev_run_id as int Int, but the loader reads it as the previous run's "
+            "run_id, a string: declare it string",
+        ),
+        (
+            Field("ilp_sha256", "number", "Money"),
+            BuildError,
+            "declares ilp_sha256 as number Money, but the loader reads it as a locked-in file's "
+            "sha256, a string: declare it string",
+        ),
+        (
+            Derived("recognition_date", "Int", lambda ctx: np.zeros(1, dtype=np.int64)),
+            BuildError,
+            "derives recognition_date, but the loader reads it as a date, every member's issue "
+            "date; declare it as a field",
+        ),
+    ],
+)
+def test_the_fields_the_loader_reads_are_declared_as_it_reads_them_d11(
+    replacement: Any, error: type[BuildError], message: str
+) -> None:
+    """D11 at build: the group key, the dates, the run id and the locked-in hashes, which the
+    loader reads from the groups file, are declared as it reads them; a unit or a date declared
+    otherwise is a UnitError, another kind a BuildError, at the stage class."""
+    stage = _misdeclared(replacement)
+    with pytest.raises(BuildError) as info:
+        build(stage)
+    assert type(info.value) is error
+    assert info.value.message == f"{stage.__qualname__}.model_point {message}"
+    assert info.value.loc is not None
+    assert info.value.loc.function == stage.__qualname__
+
+
+class Closing(Recognise):
+    """Declares the closing balances, which the loader compares with the previous run, but no
+    prev_run_id to name it."""
+
+    model_point = group_schema(
+        J_FIELD,
+        Field("csm_prev", "number", "Money", ge=0),
+        Field("lc_prev", "number", "Money", ge=0),
+    )
+
+
+class DatedAsInt(Recognise):
+    """Declares the previous valuation date as a month count."""
+
+    model_point = group_schema(
+        J_FIELD, int_field("prev_valuation_date"), Field("prev_run_id", "string")
+    )
+
+
+def test_the_closing_balances_come_with_the_previous_run_d11() -> None:
+    """csm_prev and lc_prev are compared with the previous run's csm(0) and lc(0), so a schema
+    that declares them declares prev_run_id too: a BuildError at the class, where the run would
+    have accepted any closing balance. A previous valuation date declared as an int is a
+    UnitError at build, not a LoadError when the groups are read (D11)."""
+    with pytest.raises(BuildError) as info:
+        build(Closing)
+    assert info.value.message == (
+        "Closing.model_point declares csm_prev, lc_prev, which the loader compares with the "
+        "previous run's closing csm(0) and lc(0), but no prev_run_id to name that run; build "
+        "the schema with group_schema(previous=True)"
+    )
+    assert info.value.loc is not None
+    assert info.value.loc.function == "Closing"
+    with pytest.raises(UnitError, match="declares prev_valuation_date as int Int, but the loader"):
+        build(DatedAsInt)
+
+
+# ------------------------------------------------------------- the files the loader reads
+
+
+def test_the_columns_the_loader_reads_are_typed(chain: Chain, tmp_path: Path) -> None:
+    """The group key and the dates the loader reads from the groups file and from a basis run's
+    model point copy are of the type it reads; a groups file has a row; a cur run's ra_param
+    holds one row. Each LoadError names the file, and the row where there is one."""
+    out = tmp_path / "stage"
+    cases = [
+        (group_row(portfolio=5), "groups: portfolio and profit_bucket are string columns"),
+        (
+            group_row(cohort=None).append_column("cohort", pa.array([2025.0])),
+            "groups: cohort is an integer column, not float64",
+        ),
+        (
+            group_row(recognition_date="2025-12-31"),
+            f"groups: group {GID} (row 0): recognition_date is a date, not '2025-12-31'",
+        ),
+        (group_row().slice(0, 0), "groups: no rows"),
+    ]
+    for groups, message in cases:
+        with pytest.raises(LoadError) as info:
+            chain.recognise(out, groups=groups)
+        assert str(info.value) == message
+
+    first = chain.rec[0]
+
+    def stringly(table: Any) -> Any:
+        dates = [str(d) for d in table.column("issue_date").to_pylist()]
+        return table.set_column(
+            table.column_names.index("issue_date"), "issue_date", pa.array(dates)
+        )
+
+    points = "inputs/model_points.parquet"
+    edited = _rehashed(first.run_dir, tmp_path / "rec-a", points, stringly)
+    with pytest.raises(LoadError) as info:
+        chain.recognise(out, bases={"cur": [edited, chain.rec[1]]})
+    assert str(info.value) == (
+        f"basis cur run {first.run_id}: model points ({edited / points}): issue_date is a date "
+        "column"
+    )
+
+    ra = "inputs/tables/ra_param.parquet"
+    doubled = _rehashed(first.run_dir, tmp_path / "rec-a-2", ra, lambda t: pa.concat_tables([t, t]))
+    with pytest.raises(LoadError) as info:
+        chain.recognise(out, bases={"cur": [doubled, chain.rec[1]]})
+    assert str(info.value) == (
+        f"basis cur run {first.run_id}: table ra_param ({doubled / ra}): 2 rows, not one; the cur "
+        "basis's ra_param holds the confidence level the run discloses (para 119)"
+    )
+
+
+def test_the_runs_a_stage_reads_are_verified_and_found_d21(chain: Chain, tmp_path: Path) -> None:
+    """A basis run whose manifest records no sha256 for its invariant results or an output
+    predates the hashes a later run verifies; a runs_root that holds something other than a run
+    manifest, or is not a directory, is a LoadError naming it; a base is a RunResult or a run
+    directory."""
+    first, second = chain.cur
+
+    def no_invariants(m: dict[str, Any]) -> None:
+        m.pop("invariants_sha256")
+
+    def no_monthly(m: dict[str, Any]) -> None:
+        m["outputs"].pop("monthly_sha256")
+
+    for name, edit in (("invariant results", no_invariants), ("monthly outputs", no_monthly)):
+        old = _edited(first.run_dir, tmp_path / name.replace(" ", "-"), edit)
+        with pytest.raises(LoadError) as info:
+            chain.roll(tmp_path / "stage", bases=chain.bases(cur=[old, second]))
+        assert str(info.value) == (
+            f"basis cur run {first.run_id}: its manifest records no sha256 for its {name} ({old}); "
+            "it predates the hashes a later run verifies, so rerun it"
+        )
+
+    broken = tmp_path / "broken"
+    (broken / "half").mkdir(parents=True)
+    (broken / "half" / "manifest.json").write_text("{", encoding="utf-8")
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=broken)
+    assert str(info.value).startswith(f"{broken / 'half' / 'manifest.json'} is not a run manifest")
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_text("x", encoding="utf-8")
+    with pytest.raises(LoadError) as info:
+        chain.roll(tmp_path / "stage", runs_root=not_a_dir)
+    assert str(info.value) == f"runs_root {not_a_dir} is not a directory"
+    with pytest.raises(LoadError) as info:
+        chain.recognise(tmp_path / "stage", bases={"cur": [42]})
+    assert str(info.value) == "basis cur: a run is a RunResult or a run directory, not int"
+
+
+def test_a_run_carries_the_hash_of_the_manifest_it_was_read_from(chain: Chain) -> None:
+    """RunResult.manifest_sha256 is the sha256 of the manifest's bytes as run() wrote them and
+    as load_run read (and, with verify, checked) them; a stage records that hash for every run
+    it read, the manifest it verified, under bases and in each series' source runs."""
+    for r in (chain.cur[0], chain.recognised, chain.in_force):
+        assert r.manifest_sha256 == _sha(r.run_dir / "manifest.json")
+        assert load_run(r.run_dir).manifest_sha256 == r.manifest_sha256
+        assert load_run(r.run_dir, verify=True).manifest_sha256 == r.manifest_sha256
+    m = chain.in_force.manifest
+    assert [e["manifest_sha256"] for e in m["bases"]["cur"]] == [
+        r.manifest_sha256 for r in chain.cur
+    ]
+    assert [e["manifest_sha256"] for e in m["inputs"]["series"]["cu_g"]["source_runs"]] == [
+        r.manifest_sha256 for r in chain.cur
+    ]
+    assert m["previous"]["manifest_sha256"] == chain.recognised.manifest_sha256
+
+
+def test_a_replay_reads_series_copies_laid_out_as_written(chain: Chain, tmp_path: Path) -> None:
+    """A series copy's rows are group-major, then month, then scenario; its manifest entry
+    records its unit, time dimension, start and scenario treatment; a mean's pathwise sibling
+    covers its groups. Otherwise the replay stops with a LoadError naming the copy."""
+    d = chain.in_force.run_dir
+    entry = chain.in_force.manifest["inputs"]["series"]["cu_g"]
+
+    def reversed_rows(table: Any) -> Any:
+        return table.take(pa.array(list(range(table.num_rows))[::-1]))
+
+    shuffled = _rehashed(d, tmp_path / "shuffled", entry["copy"], reversed_rows)
+    with pytest.raises(LoadError) as info:
+        replay_aggregation(compiled(Roll), shuffled, run_dir=tmp_path / "replay")
+    assert str(info.value) == (
+        f"series cu_g ({shuffled / entry['copy']}): the rows are not group-major, then month, "
+        "then scenario"
+    )
+
+    def no_unit(m: dict[str, Any]) -> None:
+        m["inputs"]["series"]["cu_g"].pop("unit")
+
+    incomplete = _edited(d, tmp_path / "incomplete", no_unit)
+    with pytest.raises(LoadError) as info:
+        replay_aggregation(compiled(Roll), incomplete, run_dir=tmp_path / "replay")
+    assert str(info.value) == "series cu_g: its manifest entry is incomplete: 'unit'"
+
+    def regroup(table: Any) -> Any:
+        return table.set_column(0, "group_id", pa.array(["IA-2025-ONEROUS"] * table.num_rows))
+
+    pathwise = entry["pathwise"]["copy"]
+    other = _rehashed(d, tmp_path / "other", pathwise, regroup)
+    with pytest.raises(LoadError) as info:
+        replay_aggregation(compiled(Roll), other, run_dir=tmp_path / "replay")
+    assert str(info.value) == (
+        f"series cu_g (pathwise) ({other / pathwise}): it covers other groups than the series it "
+        "sits beside"
+    )
+
+
+def test_a_means_pathwise_values_are_checked(chain: Chain, tmp_path: Path) -> None:
+    """A mean's pathwise values are finite float64 shaped like the mean but for the scenarios;
+    a series that keeps its scenarios has none."""
+    members = {GID: [1, 2, 3, 11, 12]}
+    groups = group_row().append_column("group_id", pa.array([GID]))
+    settings = RunSettings(valuation_date=V_REC)
+    series = group_series(Recognise, {"cur": chain.rec}, members)
+    cu = series["cu_g"]
+    assert cu.pathwise is not None
+    short = {**series, "cu_g": dataclasses.replace(cu, pathwise=cu.pathwise[:5])}
+    with pytest.raises(LoadError) as info:
+        run(
+            compiled(Recognise),
+            model_points=groups,
+            series=short,
+            settings=settings,
+            run_dir=tmp_path / "short",
+        )
+    assert str(info.value) == (
+        "series cu_g: its pathwise values must be finite float64 shaped like the mean, (25, 1), "
+        "with the basis's scenarios"
+    )
+    each = group_series(RecogniseEach, {"cur": chain.rec}, members)
+    kept = {**each, "cu_g": dataclasses.replace(each["cu_g"], pathwise=each["cu_g"].values)}
+    with pytest.raises(LoadError) as info:
+        run(
+            compiled(RecogniseEach),
+            model_points=groups,
+            series=kept,
+            settings=settings,
+            run_dir=tmp_path / "each",
+        )
+    assert str(info.value) == "series cu_g: keeps its scenarios, so it has no pathwise values"
+
+
+def test_the_bases_policy_ids_are_of_one_type(chain: Chain) -> None:
+    """The membership copy holds one type of policy id, since a policy is compared across the
+    bases by its id: ints and strings mixed are a LoadError, not a TypeError while sorting."""
+    run_a = stage_module._basis_run("cur", chain.rec[0])
+    member = run_a.members[0]
+    mixed = dataclasses.replace(
+        run_a, members=(member, dataclasses.replace(member, pid="A-1", row=1))
+    )
+    with pytest.raises(LoadError) as info:
+        stage_module._membership_file({"cur": [mixed]})
+    assert str(info.value) == (
+        "the bases' policy ids are of several types (int, str); a policy is compared across the "
+        "bases by its id, so the runs of a stage key their policies alike"
+    )
+
+
+# ------------------------------------------------------------------------------- D5
+
+
+def test_aggregation_is_independent_of_base_batching_and_workers_d5(
+    chain: Chain, tmp_path: Path
+) -> None:
+    """D5: base runs made at batch_size 1 and 3 (class A in three batches, then in one) and
+    with two workers give a recognition stage and an in-force stage that agree with the default
+    batching within 1e-12 relative."""
+    root = tmp_path / "root"
+    for size in (1, 3):
+        settings = {"batch_size": size, "workers": 2}
+        rec = chain.rec_basis(root / f"batch-{size}", settings=settings)
+        recognised = chain.recognise(
+            root / f"recognised-{size}", bases={"cur": rec}, runs_root=root, workers=2
+        )
+        for name in chain.recognised.variables:
+            np.testing.assert_allclose(
+                recognised.arrays[name], chain.recognised.arrays[name], rtol=1e-12, atol=0
+            )
+    one = {"batch_size": 1, "workers": 2}
+    bases = {
+        "old": [
+            chain.member(root / "old-a", A, expense="expense_v1", settings=one),
+            chain.member(root / "old-b", B, scale=1.5, expense="expense_v1", settings=one),
+        ],
+        "new": [
+            chain.member(root / "new-a", A_NOW, settings=one),
+            chain.member(root / "new-b", B, scale=1.5, settings=one),
+        ],
+        "cur": [
+            chain.member(root / "cur-a", A_NOW, rf="rf_cur", cpi="cpi_cur", settings=one),
+            chain.member(root / "cur-b", B, scale=1.5, rf="rf_cur", cpi="cpi_cur", settings=one),
+        ],
+    }
+    assert bases["cur"][0].manifest["settings"]["batch_size"] == 1
+    in_force = chain.roll(tmp_path / "in-force", bases=bases, workers=2)
+    for name in chain.in_force.variables:
+        np.testing.assert_allclose(
+            in_force.arrays[name], chain.in_force.arrays[name], rtol=1e-12, atol=0
+        )
