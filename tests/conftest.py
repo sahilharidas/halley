@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from halley import CompiledModel, RunResult, RunSettings, build, run
-from halley.aggregation import NewGroup
+from halley.aggregation import InForceGroup, NewGroup
 from halley.products.annuity import (
     CPILinkedAnnuity,
     FixedEscalationAnnuity,
@@ -76,6 +76,21 @@ def compiled_new_group() -> dict[bool, CompiledModel]:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         return {switch: build(NewGroup, discount_coverage_units=switch) for switch in (True, False)}
+
+
+@pytest.fixture(scope="session")
+def compiled_in_force_group() -> CompiledModel:
+    """The in-force stage ``InForceGroup``, built with every build warning an error."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return build(InForceGroup)
+
+
+@pytest.fixture(scope="session")
+def inforce_variants(inforce_oracle: ModuleType) -> dict[str, dict[str, Any]]:
+    """The in-force spec's two variants (``build_variant("P")``, ``build_variant("O")``): every
+    run, policy and figure of its sections 5 to 10 and 14, from the script."""
+    return {k: inforce_oracle.build_variant(k) for k in ("P", "O")}
 
 
 @pytest.fixture(scope="session")

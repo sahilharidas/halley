@@ -101,6 +101,7 @@ _STAGE_NAMES = {
     "reads_to_run_off": "a stage class attribute",
     "recognised_at_valuation": "a stage class attribute",
     "discloses_current_curve": "a stage class attribute",
+    "rebuilds_locked_in": "a stage class attribute",
 }
 """Names a stage's variable may not take, beside the projection's own reserved names."""
 
@@ -493,7 +494,9 @@ class Aggregation(Product):
     * ``recognised_at_valuation``: whether its groups are recognised at the valuation date, so
       that their locked-in curve ``p_l`` is the composed curve of the cur basis's runs;
     * ``discloses_current_curve``: whether its scenario input ``df_cur`` is the composed curve
-      of the cur basis's runs, which the manifest discloses as the para 120 curve.
+      of the cur basis's runs, which the manifest discloses as the para 120 curve;
+    * ``rebuilds_locked_in``: whether every file built from its groups' locked-in basis names
+      its source and the group's ``tau0``, so that the loader rebuilds each from that basis.
 
     The class attribute ``series`` holds the declarations; inside a formula ``self.series`` is
     the accessor that turns them into reads. A series' unit, time dimension, domain and
@@ -541,6 +544,17 @@ class Aggregation(Product):
     ``para_120_curve_verified``. :func:`~halley.runtime.run.run` makes no such check; a stage
     run there discloses nothing (``CsmRollForward``'s M1 still checks the curve's values on
     every run)."""
+    rebuilds_locked_in: ClassVar[bool] = False
+    """True for a stage whose locked-in files are built by the section 10 helpers from the basis
+    its groups lock in by hash (in-force 3.3, B72(b)): the stage's ``p_l`` and ``p_rec`` and the
+    curve and CPI path of its old and new runs. Beside the hashes the loader always checks
+    (:func:`_check_locked_in`), each must then name its source (``halley.rebased_from``), so that
+    the provenance check rebuilds it from the files the group locks in bit for bit, and carry
+    the group's ``tau0``, the months from its recognition date to the valuation date: a curve
+    re-based or a CPI path spliced at another month rebuilds bit for bit from its own metadata,
+    and no invariant sees it (the accretion is on both sides of I11, K1 and M1). The stage's
+    groups declare the locked-in hashes (``group_schema(locked_in=True)``); a BuildError at the
+    class otherwise. ``InForceGroup`` sets it."""
 
     @property
     def group(self) -> ModelPoint:
@@ -645,18 +659,39 @@ def _member_rules(cls: type[Aggregation]) -> tuple[MemberRule, ...]:
     return _tuple_of(cls, "member_rules", MemberRule)
 
 
+_FLAGS: Final = (
+    "reads_to_run_off",
+    "recognised_at_valuation",
+    "discloses_current_curve",
+    "rebuilds_locked_in",
+)
+"""The stage's boolean class attributes, each checked at build (:func:`_check_flags`)."""
+
+
 def _check_flags(cls: type[Aggregation], bases: Mapping[str, Basis]) -> None:
-    """``reads_to_run_off``, ``recognised_at_valuation`` and ``discloses_current_curve`` are
-    True or False (a string there would be true and say nothing); a stage recognised at the
-    valuation date declares the cur basis and the scenario input ``p_l``, and a stage that
-    discloses the current curve the cur basis and ``df_cur``: the curves the loader verifies
-    against that basis's runs (:func:`_check_composed_curve`). A BuildError at the class
-    otherwise."""
-    for name in ("reads_to_run_off", "recognised_at_valuation", "discloses_current_curve"):
+    """``reads_to_run_off``, ``recognised_at_valuation``, ``discloses_current_curve`` and
+    ``rebuilds_locked_in`` are True or False (a string there would be true and say nothing); a
+    stage recognised at the valuation date declares the cur basis and the scenario input
+    ``p_l``, and a stage that discloses the current curve the cur basis and ``df_cur``: the
+    curves the loader verifies against that basis's runs (:func:`_check_composed_curve`); a
+    stage that rebuilds its locked-in files declares the locked-in hashes its files are held to
+    (:func:`_check_locked_in`). A BuildError at the class otherwise."""
+    for name in _FLAGS:
         value: object = getattr(cls, name)
         if not _is_bool(value):
             raise BuildError(
                 f"{cls.__qualname__}.{name} is True or False, not {value!r}", _class_loc(cls)
+            )
+    if cls.rebuilds_locked_in is True:
+        schema = cls.model_point
+        fields = {} if schema is None else schema.decls()
+        missing = [name for name in LOCKED_IN_FIELDS if name not in fields]
+        if missing:
+            raise BuildError(
+                f"{cls.__qualname__} is rebuilds_locked_in, so the loader holds its locked-in "
+                f"files to its groups' locked-in basis, but its groups declare no "
+                f"{', '.join(missing)}; build the schema with group_schema(locked_in=True)",
+                _class_loc(cls),
             )
     scenarios = {getattr(s, "name", None) for s in cls.scenario_inputs}
     for flag, curve, what in (
@@ -1962,11 +1997,16 @@ _LOCKED_IN_SOURCES: Final = {
 """By hash of the groups file, the inputs whose metadata can verify it, for a message."""
 
 
+_CURVE_HELPER: Final = "halley.aggregation.locked_in_curve(<discount_rec>, <ilp>, tau0, H)"
+_CPI_HELPER: Final = "halley.aggregation.locked_in_cpi(<cpi_act>, <cpi_rec>, tau0, H)"
+
+
 def _check_locked_in(
     groups: _Groups,
     row: int,
     stage_files: Mapping[str, ReadFile],
     runs: Mapping[str, Sequence[_BasisRun]],
+    tau0: int | None = None,
 ) -> dict[str, Any]:
     """A group's locked-in basis (design section 9; in-force 3.3, B72(b)): the three hashes of
     the groups file against the metadata of every input built from the locked-in basis: the
@@ -1975,14 +2015,21 @@ def _check_locked_in(
     and their CPI path (``cpi``, the ``locked_in_cpi`` splice: ``rec_sha256``), each read from
     its verified copy. Such an input that lacks one of its metadata, or holds another value, is
     a LoadError naming it; so is a hash that no input the stage reads can verify, since a hash
-    recorded unverified would say the group was measured on a basis nobody checked. Returns the
-    three hashes and, under ``verified_by``, the files that verified each (label, sha256 and
-    metadata key), which the manifest records."""
+    recorded unverified would say the group was measured on a basis nobody checked.
+
+    ``tau0``, given for a stage that rebuilds its locked-in files
+    (:attr:`Aggregation.rebuilds_locked_in`), is the group's months from its recognition date
+    to the valuation date: each of these inputs must then also name its source
+    (``halley.rebased_from``), so that the provenance check rebuilds it bit for bit from the
+    files the hashes name, and carry ``halley.tau0`` equal to it, the month the curve is re-based
+    at and the CPI path spliced at (in-force 5.1, 5.2). Returns the three hashes and, under
+    ``verified_by``, the files that verified each (label, sha256 and metadata key), and the
+    ``tau0`` held, which the manifest records."""
     at = groups.at(row)
     hashes = {name: groups.string(name, row) for name in LOCKED_IN_FIELDS}
     verified: dict[str, list[dict[str, str]]] = {name: [] for name in LOCKED_IN_FIELDS}
 
-    def check(f: ReadFile, pairs: tuple[tuple[str, str], ...], why: str) -> None:
+    def check(f: ReadFile, pairs: tuple[tuple[str, str], ...], why: str, helper: str) -> None:
         for meta, name in pairs:
             got = f.metadata.get(meta)
             if got is None:
@@ -1992,6 +2039,19 @@ def _check_locked_in(
                     f"{f.where}: halley.{meta} is {got}, but {at} locks in {name} {hashes[name]}"
                 )
             verified[name].append({"file": f.label, "sha256": f.sha256, "metadata": meta})
+        if tau0 is None:
+            return
+        rebuilt = (
+            f"the stage rebuilds every file built from the locked-in basis from the files {at} "
+            f"locks in, at its tau0 = {tau0}, the months from its recognition date to the "
+            f"valuation date: build it with {helper}"
+        )
+        if f.metadata.get("rebased_from") is None:
+            raise LoadError(f"{f.where}: carries no metadata halley.rebased_from; {rebuilt}")
+        got = f.metadata.get("tau0")
+        if got != str(tau0):
+            made = "carries no metadata halley.tau0" if got is None else f"halley.tau0 is {got}"
+            raise LoadError(f"{f.where}: {made}; {rebuilt} (in-force 5.1, 5.2)")
 
     for curve in LOCKED_IN_CURVES:
         f = stage_files.get(curve)
@@ -2000,6 +2060,7 @@ def _check_locked_in(
                 f,
                 _CURVE_METADATA,
                 "a locked-in curve names the files it was built from (design section 10)",
+                _CURVE_HELPER,
             )
     for basis in (OLD_BASIS, NEW_BASIS):
         for r in runs.get(basis, ()):
@@ -2011,6 +2072,7 @@ def _check_locked_in(
                     f"the runs of basis {basis} discount at the locked-in rates, with p_l as "
                     f"their {LOCKED_IN_RUN_CURVE}, which names the files it was built from "
                     "(design section 10)",
+                    _CURVE_HELPER,
                 )
             f = r.scenario(LOCKED_IN_CPI)
             if f is not None:
@@ -2018,6 +2080,7 @@ def _check_locked_in(
                     f,
                     _CPI_METADATA,
                     "the locked-in CPI path names the recognition path it splices (in-force 5.2)",
+                    _CPI_HELPER,
                 )
     for name in LOCKED_IN_FIELDS:
         if not verified[name]:
@@ -2026,7 +2089,7 @@ def _check_locked_in(
                 f"verify it ({_LOCKED_IN_SOURCES[name]}); a locked-in hash is verified, not "
                 "only recorded (B72(b))"
             )
-    return {**hashes, "verified_by": verified}
+    return {**hashes, "verified_by": verified, **({} if tau0 is None else {"tau0": tau0})}
 
 
 class _CurveCheck(NamedTuple):
@@ -2502,7 +2565,9 @@ def load_aggregation_inputs(
     and G4 against its members, or, without one, one group key per policy across the bases;
     every member mapped to exactly one group row, issued on its recognition date; the stage's
     member rules on every run of their bases (:func:`_check_member_rules`); the membership as
-    a table (:func:`_membership_file`); the structural hashes; the locked-in hashes, and for
+    a table (:func:`_membership_file`); the structural hashes; the locked-in hashes (for a
+    stage that rebuilds its locked-in files, with their sources and the group's ``tau0``,
+    :func:`_check_locked_in`), and for
     a stage recognised at the valuation date its locked-in curve, and for a stage that
     discloses the current curve its ``df_cur``, against the cur basis's runs
     (:func:`_check_composed_curve`); the provenance of every file that names a source; the
@@ -2552,7 +2617,11 @@ def load_aggregation_inputs(
     locked_in: dict[str, dict[str, Any]] = {}
     if any(name in graph.fields for name in LOCKED_IN_FIELDS):
         for row, gid in enumerate(group_rows.ids):
-            locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs)
+            tau0 = None
+            if stage.rebuilds_locked_in:  # the months from the recognition date to V
+                recognised = group_rows.date("recognition_date", row)
+                tau0 = _month_index(valuation_date) - _month_index(recognised)
+            locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs, tau0)
     if stage.recognised_at_valuation:
         curve = {RECOGNISED_CURVE: _check_composed_curve(RECOGNISED_CHECK, stage_files, runs)}
         for gid in group_rows.ids:

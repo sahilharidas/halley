@@ -312,8 +312,8 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   Method 1, or `NOTE_UNITS_UNDISCOUNTED` for `discount_coverage_units = False`), the confidence
   level and `para_120_curve_sha256`, the `df_cur` file's hash. The approach to discount rates
   no longer says the coverage units are discounted, which a stage built with undiscounted units
-  disclosed. `csm.roll_notes(statics)` gives the notes; the notes of an in-force close (C11,
-  C17) are defined in `halley.aggregation.csm` for its stage.
+  disclosed. `csm.roll_notes(statics)` gives the notes; the in-force stage's are
+  `csm.in_force_notes(statics)` (below).
 - An entry of `Aggregation.disclosures` may be a function of the stage's statics (a read-only
   mapping of its build-time settings, as built) that returns a string or a tuple of strings:
   `run_aggregation` calls it with the compiled stage's, and one that raises or returns
@@ -397,6 +397,46 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   curves, the CPI paths and the files the helpers derive from them; `model_points_table` takes
   the `valuation_date` its metadata records. `docs/spec/in_force_group_inputs.py` writes them to
   `docs/spec/in-force-group/*.parquet`.
+
+### The in-force group (M11)
+
+- `halley.aggregation.InForceGroup` (exported by `halley.aggregation`) is the stage of a group
+  measured before: one reporting period `(V_prev, V]` closed in the in-force spec's order
+  (section 9), then the months after V on the `cur` basis from the closing balances. It reads
+  the bases `old`, `new` and `cur`, the series `fcf_old` and `fcf_new` (`bel` + `ra` of the old
+  and new runs, from month 0) beside the roll-forward's, the scenario inputs `p_l`, `df_cur` and
+  `p_rec` (the composed curve at recognition, value column `rf_df`, rule `p_rec(0) = 1`), and
+  groups built with `group_schema(previous=True, locked_in=True)`, so the loader fills
+  `f_prev_0`, `f_prev_tau`, `lc_prev_tau`, `p_g_prev`, `tau0`, `tau`, `i_acc` and `i_rec` from
+  the previous run and the dates. It computes and stores `p_g` (P_g carried forward),
+  `delta_fcf_l`, the close's `csm_acc` (`(csm_prev x P_rec(i_acc)) / P_rec(i_rec)`), `acc_per`,
+  `lc_alloc_per`, `lca_per`, `rev`, `raw`, `csm_adj`, `lc_adj`, `csm_fs`, `lc_fs`, `n_0`,
+  `u_per`, `r_per`, `csm_0`, `lc_0` and `lrc_0`, and the analysis of change `aoc_a` to `aoc_e`
+  with `aoc_ba`, `aoc_cb`, `aoc_dc` (delta_FCF_L bit for bit) and `aoc_ed`, in the scalars file
+  beside the roll's monthly lines. Its invariants are K1 to K7 (in-force 12.2: K4's
+  inequalities and "at most one positive" exactly; K5 where `cu_act > 0` and `CSM(0) > 0`; K7
+  against the previous run's `lc(tau)`) beside I11 to I13, M1 and M2, every run. Its input rule
+  `the locked-in curve covers [0, tau0 + H]` holds `p_rec` to the months of in-force 12.4.
+- The stage also reads a table `cpi_act`, the actual CPI history at V (key `u` in [-26, 0],
+  column `cpi`, metadata `estimated_rows`), which no formula reads: the loader rebuilds the old
+  and new runs' rebased expense table and locked-in CPI path from it, and as an input of the
+  stage it is copied into the run directory, enters the run id and carries its C9 estimate
+  flag into the manifest. Every `run_aggregation` of the stage passes
+  `tables={"cpi_act": ...}`.
+- Its manifest discloses the analysis of change's labels under `analysis_of_change` and five
+  notes (`csm.in_force_notes`): the period's single release with the monthly step after V
+  (`NOTE_PERIOD_RELEASE`, C12, in place of the monthly-step note, which says a period's release
+  is the sum of its monthly releases), the ignored timing convexity, the coverage-unit approach
+  as built, the C11 period allocation and the C17 locked-in runs.
+- A stage class may set `rebuilds_locked_in` (a bool; `InForceGroup` sets it, and its groups
+  must declare the locked-in hashes, a BuildError at the class otherwise): every input the
+  loader checks against the group's locked-in hashes (the stage's `p_l` and `p_rec`, the old
+  and new runs' `rf_df` and `cpi`) must then also carry `halley.rebased_from`, so the provenance
+  check rebuilds it bit for bit, and `halley.tau0` equal to the group's months from its
+  recognition date to V. A curve re-based or a CPI path spliced at another month, which would
+  rebuild from its own metadata and pass every invariant, and a file that names no source, are
+  LoadErrors naming the file before anything is written. The manifest's `locked_in` block
+  records the `tau0` held. A variable may not be named `rebuilds_locked_in` in a stage.
 
 ### Notes on determinism
 
