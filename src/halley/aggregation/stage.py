@@ -16,9 +16,12 @@ point (design section 9, "Loader and runs"): it reads every basis from run direc
 of the session, through their directories), each verified against the hashes its manifest
 records; takes the membership from each run's model point copy, grouped on (``portfolio``,
 ``cohort``, ``profit_bucket``); resolves the previous aggregation run a group names by its
-``prev_run_id``; checks G1, G4, the ``groups`` rules, the structural and locked-in hashes and
-the provenance of every file that names one; fills the group fields derived from the previous
-run; and writes a run directory that :func:`replay_aggregation` re-runs from its own copies.
+``prev_run_id``; checks G1, G4, the ``groups`` rules, the stage's member rules on every member,
+the structural and locked-in hashes (for a group recognised at the valuation date, its
+locked-in curve against the runs it reads), the provenance of every file that names one and,
+for a stage that reads its series to the run-off, a horizon below its bases'; fills the group
+fields derived from the previous run; and writes a run directory that
+:func:`replay_aggregation` re-runs from its own copies.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ from halley.runtime.loader import (
     read_copy,
     read_series_copy,
     read_source,
+    relatively_read,
     table_columns,
     table_of,
     with_columns,
@@ -93,6 +97,8 @@ _STAGE_NAMES = {
     "bases": "a stage class attribute",
     "disclosures": "a stage class attribute",
     "member_rules": "a stage class attribute",
+    "reads_to_run_off": "a stage class attribute",
+    "recognised_at_valuation": "a stage class attribute",
 }
 """Names a stage's variable may not take, beside the projection's own reserved names."""
 
@@ -451,7 +457,11 @@ class Aggregation(Product):
     * ``disclosures``: the approach strings and notes its run manifest discloses beside the
       confidence level and the para 120 curve (:func:`run_aggregation`);
     * ``member_rules``: the :class:`MemberRule` checks on every member of a basis, which
-      :func:`run_aggregation` evaluates on the bases' runs.
+      :func:`run_aggregation` evaluates on the bases' runs;
+    * ``reads_to_run_off``: whether a month's results read later months of its series, so that
+      the stage runs to its bases' run-off;
+    * ``recognised_at_valuation``: whether its groups are recognised at the valuation date, so
+      that their locked-in curve ``p_l`` is the composed curve of the cur basis's runs.
 
     The class attribute ``series`` holds the declarations; inside a formula ``self.series`` is
     the accessor that turns them into reads. A series' unit, time dimension, domain and
@@ -470,6 +480,22 @@ class Aggregation(Product):
     ``risk_adjustment``) or a tuple of strings (``notes``)."""
     member_rules: ClassVar[tuple[MemberRule, ...]] = ()
     """Rules on every member of a basis (:class:`MemberRule`), checked on the bases' runs."""
+    reads_to_run_off: ClassVar[bool] = False
+    """True for a stage whose results at month t read later months of its series, such as the
+    coverage units still to be provided, a backward recursion from 0 at ``H``: its results then
+    depend on where ``H`` is, so it runs to its bases' run-off. A horizon below the cur basis's
+    (``RunSettings.horizon``) is accepted only where every series the stage reads relatively,
+    which the loader cuts at ``H``, is exactly 0 after it (D5: a run with another T agrees);
+    a LoadError names the basis, the run, the variable and the first month that would be
+    dropped otherwise (:func:`_check_run_off`, and the series loader for a stage run through
+    :func:`~halley.runtime.run.run`)."""
+    recognised_at_valuation: ClassVar[bool] = False
+    """True for a stage of groups recognised at the valuation date (G5): their locked-in curve,
+    the scenario input ``p_l``, is the composed curve of the runs of the cur basis (annuity
+    spec, "Locked-in rates": "P_L = P of the same run"). The loader requires ``p_l`` to say so
+    in its metadata, built by ``locked_in_curve`` from the ``rf_df`` and ``ilp`` files those runs
+    read with ``tau0 = 0``, and recomputes it from them bit for bit
+    (:func:`_check_recognised_curve`)."""
 
     @property
     def group(self) -> ModelPoint:
@@ -506,6 +532,7 @@ class Aggregation(Product):
             if b.name in declared:
                 raise BuildError(f"{cls.__qualname__} declares basis {b.name} twice", b.loc)
             declared[b.name] = b
+        _check_flags(cls, declared)
         for rule in _member_rules(cls):
             if rule.basis not in declared:
                 known = ", ".join(declared) or "none"
@@ -571,6 +598,37 @@ def _sums(cls: type[Aggregation]) -> tuple[GroupSum, ...]:
 
 def _member_rules(cls: type[Aggregation]) -> tuple[MemberRule, ...]:
     return _tuple_of(cls, "member_rules", MemberRule)
+
+
+def _check_flags(cls: type[Aggregation], bases: Mapping[str, Basis]) -> None:
+    """``reads_to_run_off`` and ``recognised_at_valuation`` are True or False (a string there
+    would be true and say nothing); a stage recognised at the valuation date declares the cur
+    basis and the scenario input ``p_l``, the curve the loader verifies against that basis's
+    runs (:func:`_check_recognised_curve`). A BuildError at the class otherwise."""
+    for name in ("reads_to_run_off", "recognised_at_valuation"):
+        value: object = getattr(cls, name)
+        if not _is_bool(value):
+            raise BuildError(
+                f"{cls.__qualname__}.{name} is True or False, not {value!r}", _class_loc(cls)
+            )
+    if not cls.recognised_at_valuation:
+        return
+    scenarios = {getattr(s, "name", None) for s in cls.scenario_inputs}
+    missing = [
+        what
+        for what, ok in (
+            (f"basis {CUR_BASIS}", CUR_BASIS in bases),
+            (f"scenario input {RECOGNISED_CURVE}", RECOGNISED_CURVE in scenarios),
+        )
+        if not ok
+    ]
+    if missing:
+        raise BuildError(
+            f"{cls.__qualname__} is recognised_at_valuation, so its locked-in curve "
+            f"{RECOGNISED_CURVE} is the composed curve of its {CUR_BASIS} basis's runs, but it "
+            f"declares no {' and no '.join(missing)}",
+            _class_loc(cls),
+        )
 
 
 class _Read(NamedTuple):
@@ -971,7 +1029,25 @@ PREVIOUS_TOLERANCE: Final = 1e-12
 """``csm_prev`` and ``lc_prev`` agree with the previous run's ``csm(0)`` and ``lc(0)`` within this
 many times ``P_g`` (design section 9)."""
 
-STAGE_BLOCKS: Final = ("previous", "bases", "locked_in", "provenance", "disclosures")
+RECOGNISED_CURVE: Final = "p_l"
+"""The scenario input of a stage recognised at the valuation date that holds its locked-in curve,
+the composed curve of the cur basis's runs (:attr:`Aggregation.recognised_at_valuation`)."""
+
+RECOGNISED_SOURCES: Final = (
+    ("source_sha256", ("scenario input", LOCKED_IN_RUN_CURVE)),
+    ("ilp_sha256", ("table", "ilp")),
+)
+"""The metadata of :data:`RECOGNISED_CURVE` and the copied input of every cur run whose sha256
+each must be: the discount file and the ILP table the run composed its curve from."""
+
+STAGE_BLOCKS: Final = (
+    "previous",
+    "bases",
+    "member_rules",
+    "locked_in",
+    "provenance",
+    "disclosures",
+)
 """The manifest blocks a run made by :func:`run_aggregation` adds beside every run's, which
 :func:`replay_aggregation` carries over."""
 
@@ -1168,19 +1244,26 @@ def _check_member_rules(
     stage: type[Aggregation],
     runs: Mapping[str, Sequence[_BasisRun]],
     valuation_date: dt.date,
-) -> None:
+) -> list[dict[str, Any]]:
     """Every :class:`MemberRule` of the stage on every run of its basis, in declaration order,
     each on the run's verified model point copy and stored outputs (:class:`MemberView`). The
-    first failure is a LoadError naming the rule, the copy, the row and its policy, and the file
-    the run read its model points from (annuity spec, "Level of aggregation": each failure names
-    the model point file and row)."""
+    first failure is a LoadError naming the rule, the run, the row of its model point copy and
+    the row's policy, and the file the run read its model points from (annuity spec, "Level of
+    aggregation": each failure names the model point file and row); a rule whose own code
+    raises, or that returns no booleans or another shape, is located at its declaration.
+    Returns what the manifest's ``member_rules`` block records (D21): each rule's name, basis
+    and reads, and the runs it held for, with their number of members, so that the run
+    directory says which rules ran on which runs and a replay, which reads no basis, carries
+    the record over."""
+    record: list[dict[str, Any]] = []
     for rule in _member_rules(stage):
+        held: list[dict[str, Any]] = []
         for r in runs.get(rule.basis, ()):
+            who = f"basis {r.basis} run {r.run_id}"
             for name in rule.reads:
                 if name not in r.result.arrays:
                     raise LoadError(
-                        f"member rule {rule.name}: basis {r.basis} run {r.run_id} did not store "
-                        f"{name}; add it to outputs"
+                        f"member rule {rule.name}: {who} did not store {name}; add it to outputs"
                     )
             f = r.inputs[MODEL_POINTS]
             view = MemberView(
@@ -1193,34 +1276,40 @@ def _check_member_rules(
             try:
                 raw = np.asarray(rule.check(view))
             except LoadError as exc:  # a check the rule makes of the run (its J, an output)
+                raise LoadError(f"member rule {rule.name} on {who}: {exc}") from exc
+            except Exception as exc:  # the rule's own failure, at its declaration
                 raise LoadError(
-                    f"member rule {rule.name} on basis {r.basis} run {r.run_id}: {exc}"
-                ) from exc
-            except Exception as exc:  # the rule's own failure
-                raise LoadError(
-                    f"member rule {rule.name} on basis {r.basis} run {r.run_id} raised "
-                    f"{type(exc).__name__}: {exc}"
+                    f"member rule {rule.name} on {who} raised {type(exc).__name__}: {exc}",
+                    rule.loc,
                 ) from exc
             if raw.dtype != np.bool_:
-                raise LoadError(f"member rule {rule.name} must return booleans, not {raw.dtype}")
+                raise LoadError(
+                    f"member rule {rule.name} must return booleans, not {raw.dtype}", rule.loc
+                )
             try:
                 ok = np.broadcast_to(raw, (len(r.members),))
             except ValueError:
                 raise LoadError(
                     f"member rule {rule.name} returned shape {raw.shape}; it gives one value per "
-                    f"row of the model point copy, {len(r.members)} here"
+                    f"row of the model point copy, {len(r.members)} here",
+                    rule.loc,
                 ) from None
-            if ok.all():
-                continue
-            bad = np.flatnonzero(~ok)
-            m = r.members[int(bad[0])]
-            given: object = r.result.manifest["inputs"]["model_points"].get("path")
-            source = "" if given is None else f", which the run read from {given}"
-            doc = f" ({rule.doc})" if rule.doc else ""
-            raise LoadError(
-                f"member rule {rule.name} fails for {bad.size} of {len(r.members)} members of "
-                f"basis {r.basis} run {r.run_id}, first at {r.at(m)}{source}{doc}"
-            )
+            if not ok.all():
+                bad = np.flatnonzero(~ok)
+                m = r.members[int(bad[0])]
+                copy = "model points" if f.path is None else f"model points ({f.path})"
+                given: object = r.result.manifest["inputs"]["model_points"].get("path")
+                source = "" if given is None else f", which the run read from {given}"
+                doc = f" ({rule.doc})" if rule.doc else ""
+                raise LoadError(
+                    f"member rule {rule.name} fails for {bad.size} of {len(r.members)} members of "
+                    f"{who}, first at {copy}: row {m.row}, policy {m.pid}{source}{doc}"
+                )
+            held.append({"run_id": r.run_id, "members": len(r.members)})
+        record.append(
+            {"rule": rule.name, "basis": rule.basis, "reads": list(rule.reads), "runs": held}
+        )
+    return record
 
 
 # ---------------------------------------------------------------------------- the groups
@@ -1875,6 +1964,117 @@ def _check_locked_in(
     return {**hashes, "verified_by": verified}
 
 
+def _check_recognised_curve(
+    stage_files: Mapping[str, ReadFile], runs: Mapping[str, Sequence[_BasisRun]]
+) -> dict[str, Any]:
+    """The locked-in curve of a group recognised at the valuation date is the composed curve of
+    the runs it reads (annuity spec, "Locked-in rates": "For a group new at V (G5), P_L = P of
+    the same run"; :attr:`Aggregation.recognised_at_valuation`). The stage's ``p_l`` must say
+    so in its metadata: ``source_sha256`` and ``ilp_sha256`` are the ``rf_df`` and ``ilp``
+    files every cur run read, from their verified copies, ``tau0`` is 0, and ``rebased_from``
+    names its source, so that the provenance check rebuilds it from those files with the
+    section 10 helper and requires bit equality. A curve without that metadata, such as a bare
+    discount file without its illiquidity premium, or one re-based at another month, is a
+    LoadError naming ``p_l``; so is a cur basis whose runs composed their curves from different
+    files. Comparing the files, not the values with each run's ``df``, keeps the check exact on
+    every platform: the helper composes in Python floats and the run in NumPy, whose ``exp`` need
+    not round alike. Returns what the manifest's ``locked_in`` block records under ``p_l``."""
+    f = stage_files.get(RECOGNISED_CURVE)
+    if f is None:
+        raise LoadError(f"the stage reads scenario input {RECOGNISED_CURVE}, which was not given")
+    why = (
+        "a group recognised at the valuation date locks in the composed curve of the runs it "
+        "reads, P_L = P (annuity spec, 'Locked-in rates'): build it with "
+        "halley.aggregation.locked_in_curve(<their rf_df>, <their ilp>, 0, H)"
+    )
+    sources: dict[str, tuple[str, str]] = {}  # metadata key -> (sha256, the first copy's label)
+    for r in runs.get(CUR_BASIS, ()):
+        for meta, key in RECOGNISED_SOURCES:
+            copy = r.inputs.get(key)
+            if copy is None:
+                raise LoadError(
+                    f"basis {CUR_BASIS} run {r.run_id} read no {key[0]} {key[1]}, which "
+                    f"{RECOGNISED_CURVE} is composed from; {why}"
+                )
+            known = sources.setdefault(meta, (copy.sha256, copy.label))
+            if known[0] != copy.sha256:
+                raise LoadError(
+                    f"{copy.where} is not the file {known[1]} is (sha256 {copy.sha256[:12]}... "
+                    f"and {known[0][:12]}...); the runs of basis {CUR_BASIS} compose one curve, "
+                    f"the group's locked-in curve {RECOGNISED_CURVE} (B72(b))"
+                )
+    for meta in ("source_sha256", "ilp_sha256", "tau0", "rebased_from"):
+        if f.metadata.get(meta) is None:
+            raise LoadError(f"{f.where}: carries no metadata halley.{meta}; {why}")
+    if f.metadata["tau0"] != "0":
+        raise LoadError(
+            f"{f.where}: halley.tau0 is {f.metadata['tau0']}, a curve re-based "
+            f"{f.metadata['tau0']} months after its discount file's first month, not at the "
+            f"valuation date (tau0 = 0); {why}"
+        )
+    for meta, (sha, label) in sources.items():
+        if f.metadata[meta] != sha:
+            raise LoadError(
+                f"{f.where}: halley.{meta} is {f.metadata[meta]}, but {label} is {sha}; {why}"
+            )
+    return {
+        RECOGNISED_CURVE: {
+            "sha256": f.sha256,
+            "tau0": 0,
+            **{meta: sha for meta, (sha, _label) in sources.items()},
+            "composed_from": [label for _sha, label in sources.values()],
+        }
+    }
+
+
+def _check_run_off(
+    stage: type[Aggregation],
+    graph: ir.Graph,
+    runs: Mapping[str, Sequence[_BasisRun]],
+    horizon: int | None,
+) -> None:
+    """A stage that reads its series to the run-off (:attr:`Aggregation.reads_to_run_off`) and
+    runs to a horizon below its bases' (``RunSettings.horizon``): every variable a series read
+    relatively sums, which the loader cuts at ``H``, is exactly 0 after ``H`` in every run of
+    its basis, for every policy and scenario. Otherwise the cut would change the results (the
+    coverage units after ``H`` would leave N(t), so the release at ``H`` would be the whole
+    CSM; D5: a run with another T agrees within 1e-12), and a LoadError names the basis, the
+    run, the variable, the policy and the first month dropped, with the last month that holds a
+    value, which the horizon must reach."""
+    if not stage.reads_to_run_off or horizon is None:
+        return
+    relative = relatively_read(graph)
+    first: str | None = None  # the first value that the cut would drop, for the message
+    last = horizon  # the last month any of them holds a value
+    for s in _sums(stage):
+        if not s.time or s.name not in relative:
+            continue
+        for r in runs.get(s.basis, ()):
+            for name in s.names:
+                if name not in r.result.arrays:
+                    continue  # the series' own check says the run did not store it
+                values = np.asarray(r.result.var(name))
+                late = np.argwhere(values[horizon + 1 :] != 0)
+                if not late.size:
+                    continue
+                last = max(last, int(np.flatnonzero((values != 0).any(axis=(1, 2)))[-1]))
+                if first is None:
+                    t, p, j = (int(i) for i in late[0])
+                    month = horizon + 1 + t
+                    first = (
+                        f"basis {s.basis} run {r.run_id}: {name} of policy "
+                        f"{r.result.ids.tolist()[p]} is {values[month, p, j].item()!r} at "
+                        f"t = {month}, after the stage's horizon H = {horizon} "
+                        f"(RunSettings.horizon); the loader cuts series {s.name} at H, which "
+                        f"would drop it"
+                    )
+    if first is not None:
+        raise LoadError(
+            f"{first}, but {stage.__qualname__} reads its series to the run-off, so its results "
+            f"would change with H (D5): leave RunSettings.horizon out or set it to at least {last}"
+        )
+
+
 # ------------------------------------------------------------------------------ provenance
 
 
@@ -2169,11 +2369,13 @@ def load_aggregation_inputs(
     every member mapped to exactly one group row, issued on its recognition date; the stage's
     member rules on every run of their bases (:func:`_check_member_rules`); the membership as
     a table (:func:`_membership_file`); the structural hashes; the locked-in
-    hashes; the provenance of every file that names a source; the derived group fields, after
-    the group's fixed attributes are held to the previous run's (:func:`_check_fixed`); the
-    group series, summed in ascending policy id across each basis's runs
-    (:func:`group_series`); and the manifest blocks. A LoadError names the file and the row or
-    key of the first failure."""
+    hashes, and for a stage recognised at the valuation date its locked-in curve against the
+    cur basis's runs (:func:`_check_recognised_curve`); the provenance of every file that names
+    a source; the derived group fields, after the group's fixed attributes are held to the
+    previous run's (:func:`_check_fixed`); the group series, summed in ascending policy id
+    across each basis's runs (:func:`group_series`); a horizon below the cur basis's against a
+    stage that reads its series to the run-off (:func:`_check_run_off`); and the manifest
+    blocks. A LoadError names the file and the row or key of the first failure."""
     stage = _stage_of(compiled)
     graph = compiled.graph
     valuation_date = settings.valuation_date
@@ -2207,7 +2409,7 @@ def load_aggregation_inputs(
     else:
         _check_g4(runs, prev)
     members = _members_by_group(runs, group_rows)
-    _check_member_rules(stage, runs, valuation_date)
+    member_rules = _check_member_rules(stage, runs, valuation_date)
     membership = _membership_file(runs)
     _check_structure(runs)
     stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
@@ -2216,6 +2418,10 @@ def load_aggregation_inputs(
     if any(name in graph.fields for name in LOCKED_IN_FIELDS):
         for row, gid in enumerate(group_rows.ids):
             locked_in[gid] = _check_locked_in(group_rows, row, stage_files, runs)
+    if stage.recognised_at_valuation:
+        curve = _check_recognised_curve(stage_files, runs)
+        for gid in group_rows.ids:
+            locked_in[gid] = {**locked_in.get(gid, {}), **curve}
     derived: dict[str, list[Any]] = {GROUP_ID: list(group_rows.ids)}
     # a schema that declares one of these declares prev_run_id (a BuildError otherwise), so the
     # previous run is resolved whenever one is wanted
@@ -2238,6 +2444,7 @@ def load_aggregation_inputs(
         members,
         runs_root=settings.runs_root,
     )
+    _check_run_off(stage, graph, runs, settings.horizon)
     root = settings.runs_root
     blocks: dict[str, Any] = {
         "previous": None
@@ -2259,6 +2466,7 @@ def load_aggregation_inputs(
             ]
             for name, rs in runs.items()
         },
+        "member_rules": member_rules,
         "locked_in": locked_in or None,
         "provenance": provenance,
         "disclosures": _disclosures(stage, runs, stage_files),
@@ -2302,8 +2510,9 @@ def run_aggregation(
     "aggregation"``. Its run directory copies everything the stage read (the groups file,
     ``inputs/derived_groups.parquet``, ``inputs/membership.parquet``, every series with a
     mean's ``.pathwise`` sibling, the scenario and table files), each hashed, and its manifest
-    records the previous run, every run of every basis, the locked-in hashes, the provenance
-    checks and the disclosures, so that :func:`replay_aggregation` re-runs it from the
+    records the previous run, every run of every basis, the member rules and the runs they held
+    for, the locked-in hashes, the provenance checks and the disclosures, so that
+    :func:`replay_aggregation` re-runs it from the
     directory alone and a later stage reads its members from a verified copy. Its run id covers the
     IR, the groups file, every series' values, every scenario and table file, the previous
     run's id and manifest hash, the settings but ``label``, ``runs_root`` and ``workers``, the

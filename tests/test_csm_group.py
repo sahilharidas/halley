@@ -10,16 +10,20 @@ with either value of ``discount_coverage_units``, LC(1) and LC(12) against the s
 ten-significant-figure values and against ``in_force_group_numbers``: the figures of its
 ``annuity_spec_examples`` (policy 1 alone with the premiums of examples 1 and 2, recognised and
 rolled monthly on ``p_rec``) at full precision, and the same functions on the group totals of
-example 3. Then the member rules G3 and G5 at load, I11 to I14 as run-time invariants (and
-failing on broken subclasses), twelve monthly steps against one step with undiscounted units,
-and the aggregation run's directory: keyed on ``group_id``, with its disclosures and notes.
+example 3. Then the M12 lines and M1 and M2, the member rules G3 and G5 at load, I11 to I14, M1
+and M2 as run-time invariants (and failing on broken subclasses), the locked-in curve of a group
+new at V, the horizon against the run-off (D5), twelve monthly steps against one step with
+undiscounted units, and the aggregation run's directory: keyed on ``group_id``, with its
+disclosures, notes and member rules.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import inspect
 import json
+import re
 from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar
@@ -33,6 +37,7 @@ from halley import (
     BuildError,
     CompiledModel,
     CoverageUnits,
+    Factor,
     Int,
     LoadError,
     Money,
@@ -46,14 +51,17 @@ from halley import (
     where,
 )
 from halley.aggregation import (
+    CsmRollForward,
     MemberRule,
     NewGroup,
+    composed_curve,
     group_series,
     locked_in_curve,
     replay_aggregation,
     run_aggregation,
 )
 from halley.aggregation.csm import (
+    DF_CUR,
     DISCOUNT_RATES,
     NOTE_MONTHLY_STEP,
     NOTE_TIMING_CONVEXITY,
@@ -177,19 +185,42 @@ REL = 1e-12
 """The engine against the script: the same formulas in the same order, so they agree far inside
 the spec's 1e-9 between implementations; zeros within REL x P_g."""
 
+M1 = "M1 LRC(t) - LRC(t-1) = IFIE(t) - revenue(t) - LC_svc(t)"
+M2 = "M2 LCA(t) = LC_svc(t) - SAR(t) [IFIE_BEL(t) + RA_fin(t)]"
+I11_ZERO = "I11 CSM(t) = 0 from the last month with CU_g > 0"
+I14 = "I14 G3 for the group: CSM(0) = 0 if ONEROUS, else LC(0) = 0"
 INVARIANTS = (
     "I11 CSM(t) = CSM(t-1) + Acc(t) - R(t)",
     "I11 CSM(t) >= 0",
-    "I11 CSM(t) = 0 from the last month with CU_g > 0",
+    I11_ZERO,
     "I12 R(t) / CU_g(t) = CSM(t) / N(t)",
     "I12 R(t+1) / CU_g(t+1) = [R(t) / CU_g(t)] a_L(t+1) [CU_g(t+1) + d(t+1) N(t+1)] / U(t+1)",
     "I13 LC(t) / F(t) = LC(0) / F(0)",
     "I13 LC(t) = 0 where F(t) = 0",
-    "I14 G3 for the group: CSM(0) = 0 if ONEROUS, else LC(0) = 0",
+    M1,
+    M2,
+    I14,
 )
+EXACT = ("I11 CSM(t) >= 0", I11_ZERO, "I13 LC(t) = 0 where F(t) = 0", I14)
+"""The invariants the spec states exactly, without a tolerance."""
 
 G3_NAME = "G3 a contract is onerous exactly in an ONEROUS group"
 G5_NAME = "G5 every contract is new at V"
+
+M12_LINES = (
+    "ann_out_g",
+    "exp_out_g",
+    "inv_exp_g",
+    "f",
+    "ifie_bel",
+    "ra_fin",
+    "ra_rel",
+    "sar",
+    "svc",
+    "lc_svc",
+    "revenue",
+    "ifie",
+)
 
 
 def _ten(x: float) -> str:
@@ -218,7 +249,9 @@ def _project(compiled: CompiledModel, model_points: Any, run_dir: Path, **kw: An
         model_points=model_points,
         tables=TABLES,
         scenarios=kw.pop("scenarios", SCENARIOS),
-        settings=RunSettings(valuation_date=VALUATION_DATE, horizon=T_EXAMPLE, **kw),
+        settings=RunSettings(
+            valuation_date=VALUATION_DATE, horizon=kw.pop("horizon", T_EXAMPLE), **kw
+        ),
         run_dir=run_dir,
     )
 
@@ -235,16 +268,17 @@ def _one_policy(pid: int, **changes: Any) -> Any:
 def _stage(
     compiled: CompiledModel,
     runs: list[RunResult],
-    p_l: Any,
+    curves: dict[str, Any],
     run_dir: Path,
     groups: Any,
     **settings: Any,
 ) -> RunResult:
+    """The stage on the runs of its cur basis, with its two curves ``p_l`` and ``df_cur``."""
     return run_aggregation(
         compiled,
         groups=groups,
         bases={"cur": runs},
-        scenarios={"p_l": p_l},
+        scenarios=curves,
         settings=RunSettings(valuation_date=VALUATION_DATE, **settings),
         run_dir=run_dir,
     )
@@ -270,20 +304,28 @@ def class_runs(compiled_annuity: dict[str, CompiledModel], runs_dir: Path) -> di
 
 
 @pytest.fixture(scope="module")
-def p_l(runs_dir: Path) -> Path:
-    """The locked-in curve of a group new at V: the composed curve of the runs it reads,
-    re-based to V with tau0 = 0 (P_L = P), written by the section 10 helper."""
-    _p_rec, curve = locked_in_curve(SCENARIOS["rf_df"], TABLES["ilp"], 0, T_EXAMPLE)
-    path = runs_dir / "p_l.parquet"
-    pq.write_table(curve, path)
-    return path
+def curves(runs_dir: Path) -> dict[str, Path]:
+    """The stage's two curves, written by the section 10 helpers from the discount file and the
+    ILP table the example runs read: ``p_l``, the locked-in curve of a group new at V, re-based
+    with tau0 = 0 (P_L = P), and ``df_cur``, the composed current curve (the para 120 curve)."""
+    _p_rec, p_l = locked_in_curve(SCENARIOS["rf_df"], TABLES["ilp"], 0, T_EXAMPLE)
+    df_cur = composed_curve(SCENARIOS["rf_df"], TABLES["ilp"], T_EXAMPLE)
+    out = {"p_l": runs_dir / "p_l.parquet", "df_cur": runs_dir / "df_cur.parquet"}
+    pq.write_table(p_l, out["p_l"])
+    pq.write_table(df_cur, out["df_cur"])
+    return out
+
+
+@pytest.fixture(scope="module")
+def p_l(curves: dict[str, Path]) -> Path:
+    return curves["p_l"]
 
 
 @pytest.fixture(scope="module")
 def stages(
     compiled_new_group: dict[bool, CompiledModel],
     class_runs: dict[int, RunResult],
-    p_l: Path,
+    curves: dict[str, Path],
     runs_dir: Path,
 ) -> dict[tuple[int, bool], RunResult]:
     """Each example's recognition stage with discounted (True) and undiscounted coverage units."""
@@ -293,7 +335,7 @@ def stages(
             out[(example, switch)] = _stage(
                 compiled_new_group[switch],
                 [class_runs[pid] for pid in pids],
-                p_l,
+                curves,
                 runs_dir / f"example-{example}-{'discounted' if switch else 'undiscounted'}",
                 groups_file(BUCKET[example]),
                 runs_root=runs_dir,
@@ -517,18 +559,101 @@ def test_twelve_monthly_steps_equal_one_step_with_undiscounted_units(
         assert not within(one_step(on, gid), float(on.lane("csm", gid)[12]), 0.0, rel=1e-6)
 
 
+# ----------------------------------------------------------------- M12: revenue and IFIE
+
+
+@pytest.mark.parametrize("example", [1, 2, 3])
+def test_m1_and_m2_hold_and_the_m12_lines_are_the_designs(
+    example: int, stages: dict[tuple[int, bool], RunResult]
+) -> None:
+    """Design sections 9 and 11: M1 and M2 hold as run-time invariants on examples 1 to 3 with
+    either switch value, and again recomputed from the stored lines; revenue and IFIE are the
+    sums the design writes, in its grouping; the month's service items less the finance unwind
+    are F(t - 1) - F(t), the para 51 items of an expected run ("Onerous groups and the loss
+    component"); and for a group new at V the current and the locked-in curves are one curve,
+    P_L = P, so f = j_L bit for bit."""
+    gid = GID[example]
+    for switch in (True, False):
+        res = stages[(example, switch)]
+        results = {r.name: r for r in res.invariants}
+        assert results[M1].passed, switch
+        assert results[M2].passed, switch
+        x = {name: res.lane(name, gid) for name in (*M12_LINES, "lrc", "lc_alloc", "release")}
+        x.update({name: res.lane(name, gid) for name in ("acc", "fcf_g", "lc", "j_l")})
+        p_g = float(res.lane("p_g", gid)[0])
+        lrc = x["lrc"]
+        m1 = (x["ifie"][1:] - x["revenue"][1:]) - x["lc_svc"][1:]
+        assert within(lrc[1:] - lrc[:-1], m1, p_g, rel=REL).all()
+        m2 = x["lc_svc"][1:] - x["sar"][1:] * (x["ifie_bel"][1:] + x["ra_fin"][1:])
+        assert within(x["lc_alloc"][1:], m2, p_g, rel=REL).all()
+        np.testing.assert_array_equal(
+            x["revenue"][1:], (x["svc"][1:] - x["lc_svc"][1:]) + x["release"][1:]
+        )
+        np.testing.assert_array_equal(
+            x["ifie"][1:], (x["ifie_bel"][1:] + x["ra_fin"][1:]) + x["acc"][1:]
+        )
+        para_51 = x["svc"][1:] - (x["ifie_bel"][1:] + x["ra_fin"][1:])
+        f = x["fcf_g"]
+        assert within(para_51, f[:-1] - f[1:], p_g, rel=REL).all()
+        np.testing.assert_array_equal(x["f"], x["j_l"])
+        if example == 2:  # onerous: the loss component takes its share, the CSM is nil
+            assert x["lc_svc"][1] > 0.0
+            assert (x["release"] == 0.0).all()
+            ratio = x["lc"][0] / f[0]
+            assert within(x["sar"][1:13], ratio, 0.0, rel=REL).all()
+        else:  # profitable: no loss component, so no share of anything
+            assert (x["sar"] == 0.0).all()
+            assert (x["lc_svc"] == 0.0).all()
+        assert (x["revenue"][1:] > 0.0).all() or example == 2
+
+
+def test_m1_checks_the_current_curve_and_df_cur_is_deterministic(
+    compiled_new_group: dict[bool, CompiledModel],
+    class_runs: dict[int, RunResult],
+    curves: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """M1 holds only on the curve the runs' BEL and RA unwind on: a df_cur at another level
+    (a file that names no source, so nothing recomputes it) fails M1 at month 1. A df_cur of two
+    scenarios beside the stage's mean series is refused by the one J = 1 check (D4)."""
+    stage = compiled_new_group[True]
+    level = data.discount_table(lambda s, t: data.rf_df(t, 0.05))
+    with pytest.raises(RunError, match=rf"invariant {re.escape(M1)} failed: group {GID[1]}, t = 1"):
+        _stage(
+            stage,
+            [class_runs[1]],
+            {**curves, "df_cur": level},
+            tmp_path / "level",
+            groups_file("OTHER"),
+        )
+    two = data.discount_table(n_scenarios=2)
+    with pytest.raises(
+        LoadError,
+        match=r"the stage reads the mean series \w+, so it runs at S = 1; scenario input df_cur "
+        r"has J = 2 scenarios.*require_deterministic",
+    ):
+        _stage(
+            stage,
+            [class_runs[1]],
+            {**curves, "df_cur": two},
+            tmp_path / "two",
+            groups_file("OTHER"),
+        )
+
+
 # ---------------------------------------------------------------------------- invariants
 
 
-def test_i11_to_i14_hold_as_run_time_invariants(stages: dict[tuple[int, bool], RunResult]) -> None:
+def test_i11_to_i14_m1_and_m2_hold_as_run_time_invariants(
+    stages: dict[tuple[int, bool], RunResult],
+) -> None:
     for key, res in stages.items():
         results = {r.name: r for r in res.invariants}
         assert [r.name for r in res.invariants][-len(INVARIANTS) :] == list(INVARIANTS), key
         assert all(r.passed for r in res.invariants), key
         on_disk = json.loads((res.run_dir / "invariants.json").read_text(encoding="utf-8"))
         assert [r["name"] for r in on_disk][-len(INVARIANTS) :] == list(INVARIANTS)
-        # the exact ones are exact
-        for name in INVARIANTS[1:3] + INVARIANTS[6:]:
+        for name in EXACT:  # the exact ones are exact
             assert results[name].worst == 0.0, (key, name)
     # the last month with units releases the whole CSM: CSM(H) = 0 although CSM(H - 1) > 0
     csm = stages[(1, True)].lane("csm", GID[1])
@@ -560,28 +685,127 @@ class Fading(NewGroup):
         return where(f0 > 0, (self.lc(t - 1) * ratio) * 0.999, 0.0)
 
 
+class FastAccretion(NewGroup):
+    """An accretion a ten-thousandth above the locked-in rate: the release per unit no longer
+    steps by a_L, so I12's step form fails; I11 and the equal allocation still hold."""
+
+    @var
+    def acc(self, t: Int) -> Money:
+        return (self.j_l(t) * self.csm(t - 1)) * 1.0001
+
+
+class Leaky(NewGroup):
+    """A closing CSM that keeps a millionth of the release: I11's recursion fails."""
+
+    @var(init=lambda g: g.csm_0())
+    def csm(self, t: Int) -> Money:
+        return self.csm_pre(t) - self.release(t) * 0.999999
+
+
+class KeepsTheTail(NewGroup):
+    """A release a little short of the share of the units: the last month with units leaves a
+    CSM behind, so I11's exact zero fails there, at H; the recursion still holds."""
+
+    @var
+    def release(self, t: Int) -> Money:
+        u = self.units(t)
+        share = self.series.cu_g(t) / where(u > 0, u, 1.0)
+        return where(u > 0, self.csm_pre(t) * share, self.csm_pre(t)) * 0.9999999
+
+
+class LcBlind(NewGroup):
+    """Revenue that keeps the loss component's share of the service items: M1 fails where the
+    loss component takes a share, in an onerous group."""
+
+    @var
+    def revenue(self, t: Int) -> Money:
+        return self.svc(t) + self.release(t)
+
+
+class LateShare(NewGroup):
+    """The loss component's share taken of the closing F: M2 fails; M1, in which the share
+    cancels, does not see it."""
+
+    @var
+    def sar(self, t: Int) -> Factor:
+        f1 = self.series.fcf_g(t)
+        return self.lc(t - 1) / where(f1 > 0, f1, 1.0)
+
+
+BROKEN: list[tuple[type[NewGroup], int, str, str, str]] = [
+    (Unequal, 1, "OTHER", "I12 R(t) / CU_g(t) = CSM(t) / N(t)", "t = 1"),
+    (FastAccretion, 1, "OTHER", INVARIANTS[4], "t = 1"),
+    (Leaky, 1, "OTHER", INVARIANTS[0], "t = 1"),
+    (KeepsTheTail, 1, "OTHER", I11_ZERO, f"t = {T_EXAMPLE}"),
+    (Fading, 4, "ONEROUS", "I13 LC(t) / F(t) = LC(0) / F(0)", "t = 1"),
+    (LcBlind, 4, "ONEROUS", M1, "t = 1"),
+    (LateShare, 4, "ONEROUS", M2, "t = 1"),
+]
+"""Each broken stage, the policy of its group, the bucket, the first invariant that fails and
+where."""
+
+
+@pytest.mark.parametrize(("broken", "pid", "bucket", "name", "month"), BROKEN)
 def test_the_invariants_fail_on_broken_stages(
-    compiled_annuity: dict[str, CompiledModel],
+    broken: type[NewGroup],
+    pid: int,
+    bucket: str,
+    name: str,
+    month: str,
     class_runs: dict[int, RunResult],
-    p_l: Path,
+    curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
-    gid = GID[1]
-    i12 = r"invariant I12 R\(t\) / CU_g\(t\) = CSM\(t\) / N\(t\) failed"
-    with pytest.raises(RunError, match=rf"{i12}: group {gid}, t = 1: lhs = ") as info:
-        _stage(build(Unequal), [class_runs[1]], p_l, tmp_path / "unequal", groups_file("OTHER"))
+    """Each invariant fails on a stage broken where it looks, at the declaration, naming the
+    group and the month; every invariant declared before it passed on the same run."""
+    gid = f"IA-2025-{bucket}"
+    with pytest.raises(
+        RunError, match=rf"^invariant {re.escape(name)} failed: group {gid}, {month}: lhs = "
+    ) as info:
+        _stage(build(broken), [class_runs[pid]], curves, tmp_path / "stage", groups_file(bucket))
     assert info.value.loc is not None
     assert info.value.loc.file.endswith("csm.py")
-    i13 = r"invariant I13 LC\(t\) / F\(t\) = LC\(0\) / F\(0\) failed"
-    with pytest.raises(RunError, match=rf"{i13}: group {GID[2]}, t = 1: lhs = "):
-        _stage(build(Fading), [class_runs[4]], p_l, tmp_path / "fading", groups_file("ONEROUS"))
-    # G3 broken at load: policy 1 at a premium of 175,000 in an OTHER group, checked only by I14
+
+
+def test_i14_fails_when_g3_is_not_checked(
+    compiled_annuity: dict[str, CompiledModel],
+    curves: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """G3 broken at load: policy 1 at a premium of 175,000 in an OTHER group, checked only by
+    I14 when the member rules are dropped."""
     onerous = _project(
         compiled_annuity["level"], _one_policy(1, single_premium=175_000.0), tmp_path / "level"
     )
-    i14 = r"invariant I14 G3 for the group: CSM\(0\) = 0 if ONEROUS, else LC\(0\) = 0 failed"
-    with pytest.raises(RunError, match=rf"{i14}: group {gid}: lhs = 6840\.39757"):
-        _stage(build(Unchecked), [onerous], p_l, tmp_path / "unchecked", groups_file("OTHER"))
+    with pytest.raises(
+        RunError, match=rf"invariant {re.escape(I14)} failed: group {GID[1]}: lhs = 6840\.39757"
+    ):
+        _stage(build(Unchecked), [onerous], curves, tmp_path / "unchecked", groups_file("OTHER"))
+
+
+class NoPremium(CsmRollForward):
+    """A roll-forward that defines its opening balances but not P_g."""
+
+    @var
+    def csm_0(self) -> Money:
+        return self.series.fcf_g.at(0) * 0.0
+
+    @var
+    def lc_0(self) -> Money:
+        return self.series.fcf_g.at(0) * 0.0
+
+
+def test_a_hook_left_undefined_is_a_build_error_at_the_subclass() -> None:
+    """Errors point at the model source: the class being built, not the hook's line in csm.py."""
+    with pytest.raises(
+        BuildError, match="NoPremium does not define p_g, a hook of CsmRollForward"
+    ) as info:
+        build(NoPremium)
+    loc = info.value.loc
+    assert loc is not None
+    assert (loc.file, loc.line) == (__file__, inspect.getsourcelines(NoPremium)[1])
+    with pytest.raises(BuildError, match="CsmRollForward is abstract"):
+        build(CsmRollForward)
 
 
 # -------------------------------------------------------------------------- member rules
@@ -590,7 +814,7 @@ def test_the_invariants_fail_on_broken_stages(
 def test_g3_names_the_contract_on_the_wrong_side_of_its_group(
     compiled_annuity: dict[str, CompiledModel],
     compiled_new_group: dict[bool, CompiledModel],
-    p_l: Path,
+    curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
     """Annuity spec, example 2's data-contract test: example 1 with policy 1's premium at
@@ -602,14 +826,16 @@ def test_g3_names_the_contract_on_the_wrong_side_of_its_group(
     assert level.lane("onerous", 1)[0]
     stage = compiled_new_group[True]
     with pytest.raises(LoadError) as info:
-        _stage(stage, [level], p_l, tmp_path / "stage", groups_file("OTHER"))
+        _stage(stage, [level], curves, tmp_path / "stage", groups_file("OTHER"))
     message = str(info.value)
+    copy = level.run_dir / "inputs" / "model_points.parquet"
     assert message.startswith(
         f"member rule {G3_NAME} fails for 1 of 1 members of basis cur run {level.run_id}, first "
-        f"at basis cur run {level.run_id}: model points ("
+        f"at model points ({copy}): row 0, policy 1, which the run read from {path}"
     )
-    assert f": row 0, policy 1, which the run read from {path}" in message
+    assert message.count(level.run_id) == 1
     assert "an onerous contract outside an ONEROUS group" in message
+    assert info.value.loc is None  # the data's failure, not the rule's
     assert not (tmp_path / "stage").exists()
 
     path = tmp_path / "mp_level_onerous.parquet"
@@ -617,13 +843,13 @@ def test_g3_names_the_contract_on_the_wrong_side_of_its_group(
     profitable = _project(compiled_annuity["level"], path, tmp_path / "level-2")
     assert not profitable.lane("onerous", 1)[0]
     with pytest.raises(LoadError, match=f"member rule {G3_NAME} fails for 1 of 1 members"):
-        _stage(stage, [profitable], p_l, tmp_path / "stage-2", groups_file("ONEROUS"))
+        _stage(stage, [profitable], curves, tmp_path / "stage-2", groups_file("ONEROUS"))
 
 
 def test_g5_rejects_a_contract_in_force_before_v(
     compiled_annuity: dict[str, CompiledModel],
     compiled_new_group: dict[bool, CompiledModel],
-    p_l: Path,
+    curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
     """A contract issued a year before V, in payment since, in a group recognised then: G5
@@ -636,13 +862,14 @@ def test_g5_rejects_a_contract_in_force_before_v(
         _stage(
             compiled_new_group[True],
             [in_force],
-            p_l,
+            curves,
             tmp_path / "stage",
             groups_file("OTHER", recognition=issued, cohort=2024),
         )
     message = str(info.value)
     assert message.startswith(
-        f"member rule {G5_NAME} fails for 1 of 1 members of basis cur run {in_force.run_id}"
+        f"member rule {G5_NAME} fails for 1 of 1 members of basis cur run {in_force.run_id}, "
+        "first at model points ("
     )
     assert ": row 0, policy 1 (issue_date = V" in message
 
@@ -650,7 +877,7 @@ def test_g5_rejects_a_contract_in_force_before_v(
 def test_g3_reads_a_deterministic_run(
     compiled_annuity: dict[str, CompiledModel],
     compiled_new_group: dict[bool, CompiledModel],
-    p_l: Path,
+    curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
     """D4: a basis of two scenarios reaches the stage through a mean, but G3 reads each
@@ -666,7 +893,7 @@ def test_g3_reads_a_deterministic_run(
         match=rf"G3 reads each contract's para 47 test, onerous, at one scenario; basis cur run "
         rf"{level.run_id} has J = 2 scenarios.*require_deterministic",
     ):
-        _stage(compiled_new_group[True], [level], p_l, tmp_path / "stage", groups_file("OTHER"))
+        _stage(compiled_new_group[True], [level], curves, tmp_path / "stage", groups_file("OTHER"))
 
 
 def _always(view: Any) -> Any:
@@ -674,7 +901,7 @@ def _always(view: Any) -> Any:
 
 
 def test_member_rules_are_checked_at_build_and_at_load(
-    class_runs: dict[int, RunResult], p_l: Path, tmp_path: Path
+    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
 ) -> None:
     line = 0
 
@@ -716,6 +943,7 @@ def test_member_rules_are_checked_at_build_and_at_load(
 
         return build(WithRule)
 
+    # the rule's own faults are located at its declaration; the data's are not
     cases = {
         "floats": (MemberRule("floats", lambda v: np.ones(1)), "must return booleans, not float64"),
         "unstored": (
@@ -733,8 +961,14 @@ def test_member_rules_are_checked_at_build_and_at_load(
         ),
     }
     for name, (rule, message) in cases.items():
-        with pytest.raises(LoadError, match=f"^member rule {name}.*{message}"):
-            _stage(stage_with(rule), [class_runs[1]], p_l, tmp_path / name, groups_file("OTHER"))
+        with pytest.raises(LoadError, match=f"^member rule {name}.*{message}") as info:
+            _stage(stage_with(rule), [class_runs[1]], curves, tmp_path / name, groups_file("OTHER"))
+        if name in ("floats", "raises", "shape"):
+            assert info.value.loc == rule.loc, name
+            assert info.value.loc is not None
+            assert info.value.loc.file == __file__
+        else:
+            assert info.value.loc is None, name
 
 
 def test_run_refuses_a_stage_with_member_rules(
@@ -758,34 +992,209 @@ def test_run_refuses_a_stage_with_member_rules(
     assert not (tmp_path / "stage").exists()
 
 
-def test_the_locked_in_curve_starts_at_one(
+# --------------------------------------------------------------- the locked-in curve
+
+
+def test_a_new_group_locks_in_the_composed_curve_of_its_runs(
     compiled_new_group: dict[bool, CompiledModel],
     class_runs: dict[int, RunResult],
-    p_l: Path,
+    curves: dict[str, Path],
     tmp_path: Path,
 ) -> None:
-    """The stage's p_l is re-based to V: p_l(0) = 1 is a rule of the input. A curve that names
-    no source is not recomputed, and is checked by the rule alone."""
-    table = pq.read_table(p_l)
-    values = table.column("rf_df").to_pylist()
+    """Annuity spec, "Locked-in rates": for a group new at V, P_L = P of the same run. The
+    stage's p_l must name, in its metadata, the discount file and the ILP table its cur runs
+    read, with tau0 = 0, so the provenance check rebuilds it from them: a curve naming no source
+    (the bare discount file, without its illiquidity premium, or a curve scaled by hand), one
+    re-based 24 months on, or one composed with another ILP or discount file is a LoadError
+    naming scenario input p_l."""
+    stage = compiled_new_group[True]
+    level = class_runs[1]
+    why = "a group recognised at the valuation date locks in the composed curve of the runs"
+    bare = pq.read_table(SCENARIOS["rf_df"])
+    table = pq.read_table(curves["p_l"])
+    scaled = pa.table(
+        {
+            "scenario": table.column("scenario"),
+            "t": table.column("t"),
+            "rf_df": pa.array([0.999 * x for x in table.column("rf_df").to_pylist()], pa.float64()),
+        }
+    )
+    _p_rec, later = locked_in_curve(SCENARIOS["rf_df"], TABLES["ilp"], 24, T_EXAMPLE - 24)
+    _p_rec, no_ilp = locked_in_curve(SCENARIOS["rf_df"], data.ilp_table(0.0), 0, T_EXAMPLE)
+    other_file = data.discount_table(lambda s, t: data.rf_df(t, 0.05))
+    _p_rec, other = locked_in_curve(other_file, TABLES["ilp"], 0, T_EXAMPLE)
+    rf_sha, ilp_sha = _sha(SCENARIOS["rf_df"]), _sha(TABLES["ilp"])
+    cases = {
+        "bare": (bare, r"carries no metadata halley\.source_sha256"),
+        "scaled": (scaled, r"carries no metadata halley\.source_sha256"),
+        "later": (later, r"halley\.tau0 is 24, a curve re-based 24 months after"),
+        "no-ilp": (
+            no_ilp,
+            rf"halley\.ilp_sha256 is \w+, but basis cur run {level.run_id}: table ilp is "
+            rf"{ilp_sha}",
+        ),
+        "other": (
+            other,
+            rf"halley\.source_sha256 is \w+, but basis cur run {level.run_id}: scenario input "
+            rf"rf_df is {rf_sha}",
+        ),
+    }
+    for name, (curve, message) in cases.items():
+        with pytest.raises(LoadError, match=rf"^scenario input p_l: {message}") as info:
+            _stage(stage, [level], {**curves, "p_l": curve}, tmp_path / name, groups_file("OTHER"))
+        assert why in str(info.value), name
+        assert not (tmp_path / name).exists()
+
+
+def test_the_stage_flags_are_checked_at_build() -> None:
+    """``reads_to_run_off`` and ``recognised_at_valuation`` are bools, and a stage recognised
+    at the valuation date declares the curve the loader verifies against its cur runs."""
+
+    class Stringly(NewGroup):
+        reads_to_run_off: Any = "yes"
+
+    with pytest.raises(BuildError, match=r"Stringly\.reads_to_run_off is True or False, not 'yes'"):
+        build(Stringly)
+
+    class NoCurve(NewGroup):
+        scenario_inputs = (DF_CUR,)
+
+    with pytest.raises(
+        BuildError,
+        match="NoCurve is recognised_at_valuation, so its locked-in curve p_l is the composed "
+        "curve of its cur basis's runs, but it declares no scenario input p_l",
+    ):
+        build(NoCurve)
+
+
+class Unlocked(NewGroup):
+    """``NewGroup`` without its member rules and without the check of its locked-in curve, so
+    that run() runs it on ``group_series`` and its p_l is checked by the scenario rule alone."""
+
+    member_rules: ClassVar[tuple[MemberRule, ...]] = ()
+    recognised_at_valuation: ClassVar[bool] = False
+
+
+def _run_unlocked(
+    class_runs: dict[int, RunResult], curves: dict[str, Any], run_dir: Path, **settings: Any
+) -> RunResult:
+    series = group_series(Unlocked, {"cur": [class_runs[1]]}, {GID[1]: [1]})
+    groups = groups_file("OTHER").append_column("group_id", pa.array([GID[1]]))
+    return run(
+        build(Unlocked),
+        model_points=groups,
+        scenarios=curves,
+        series=series,
+        settings=RunSettings(valuation_date=VALUATION_DATE, **settings),
+        run_dir=run_dir,
+    )
+
+
+def test_the_locked_in_curve_starts_at_one(
+    class_runs: dict[int, RunResult], curves: dict[str, Path], tmp_path: Path
+) -> None:
+    """The stage's p_l is re-based to V: p_l(0) = 1 is a rule of the input, which a stage whose
+    curve is not the cur runs' (a stage of no ``recognised_at_valuation``) is held to alone."""
+    table = pq.read_table(curves["p_l"])
     shifted = pa.table(
         {
             "scenario": table.column("scenario"),
             "t": table.column("t"),
-            "rf_df": pa.array([0.999 * x for x in values], pa.float64()),
+            "rf_df": pa.array([0.999 * x for x in table.column("rf_df").to_pylist()], pa.float64()),
         }
     )
     with pytest.raises(LoadError, match=r"scenario input p_l.*: rule p_l\(0\) = 1 fails"):
+        _run_unlocked(class_runs, {**curves, "p_l": shifted}, tmp_path / "s")
+    assert _run_unlocked(class_runs, dict(curves), tmp_path / "ok").H == T_EXAMPLE
+
+
+# ---------------------------------------------------------------- the horizon and the run-off
+
+
+def test_a_horizon_that_cuts_the_run_off_is_refused(
+    compiled_new_group: dict[bool, CompiledModel],
+    class_runs: dict[int, RunResult],
+    curves: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """N(t) needs every later month of the units, so a stage horizon below the run-off would
+    release the whole CSM at H (D5: a run with a different T agrees). Example 1 at H = 12 is a
+    LoadError naming the basis, the run, the variable and the first month dropped, from
+    run_aggregation; and from the series loader for a stage run through run()."""
+    level = class_runs[1]
+    with pytest.raises(LoadError) as info:
         _stage(
-            compiled_new_group[True], [class_runs[1]], shifted, tmp_path / "s", groups_file("OTHER")
+            compiled_new_group[True],
+            [level],
+            curves,
+            tmp_path / "h12",
+            groups_file("OTHER"),
+            horizon=12,
         )
+    message = str(info.value)
+    cu_13 = float(level.lane("cu", 1)[13])
+    assert message.startswith(
+        f"basis cur run {level.run_id}: cu of policy 1 is {cu_13!r} at t = 13, after the stage's "
+        "horizon H = 12 (RunSettings.horizon); the loader cuts series cu_g at H"
+    )
+    assert message.endswith(
+        "NewGroup reads its series to the run-off, so its results would change with H (D5): "
+        "leave RunSettings.horizon out or set it to at least 655"
+    )
+    assert not (tmp_path / "h12").exists()
+    with pytest.raises(
+        LoadError,
+        match=rf"^series cu_g: basis cur \(run {level.run_id}\) holds {re.escape(repr(cu_13))} "
+        rf"for group {GID[1]} at t = 13, after the stage's horizon H = 12, where the loader cuts "
+        r"it; .* at least 655$",
+    ):
+        _run_unlocked(class_runs, dict(curves), tmp_path / "run-h12", horizon=12)
+
+
+def test_stage_results_do_not_depend_on_t(
+    compiled_annuity: dict[str, CompiledModel],
+    compiled_new_group: dict[bool, CompiledModel],
+    class_runs: dict[int, RunResult],
+    curves: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """D5 and design section 11: policy 2 (fixed escalation) runs off at month 623. Its stage on
+    the runs at T = 655, the same stage cut at H = 623 and the stage on a run at T = 623 agree
+    on every line within 1e-12 x P_g over months 0..623, and after them the run at T = 655
+    holds exact zeros; H = 622 would cut the run-off and is refused."""
+    long = class_runs[2]
+    assert long.lane("run_off_month", 2)[0] == 623
+    short = _project(compiled_annuity["fixed"], _one_policy(2), tmp_path / "short", horizon=623)
+    stage = compiled_new_group[True]
+    gid = GID[3]
+    full = _stage(stage, [long], curves, tmp_path / "full", groups_file("OTHER"))
+    cut = _stage(stage, [long], curves, tmp_path / "cut", groups_file("OTHER"), horizon=623)
+    own = _stage(stage, [short], curves, tmp_path / "own", groups_file("OTHER"))
+    assert (full.H, cut.H, own.H) == (T_EXAMPLE, 623, 623)
+    p_g = float(full.lane("p_g", gid)[0])
+    lines = ("csm", "lc", "release", "cu_next", "acc", "lrc", "revenue", "ifie", "svc")
+    for name in lines:
+        whole = full.lane(name, gid)
+        for other in (cut, own):
+            _agree(other.lane(name, gid), whole[:624], p_g)
+        assert (whole[624:] == 0.0).all(), name
+    for name in ("csm_0", "lc_0", "p_g"):
+        for other in (cut, own):
+            _agree(other.lane(name, gid), full.lane(name, gid), p_g)
+    assert all(r.passed for r in (*cut.invariants, *own.invariants))
+    with pytest.raises(
+        LoadError, match=r"leave RunSettings\.horizon out or set it to at least 623"
+    ):
+        _stage(stage, [long], curves, tmp_path / "h622", groups_file("OTHER"), horizon=622)
 
 
 # ------------------------------------------------------------------ the run directory
 
 
 def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
-    stages: dict[tuple[int, bool], RunResult], class_runs: dict[int, RunResult], p_l: Path
+    stages: dict[tuple[int, bool], RunResult],
+    class_runs: dict[int, RunResult],
+    curves: dict[str, Path],
 ) -> None:
     res = stages[(3, True)]
     gid, d, m = GID[3], res.run_dir, res.manifest
@@ -798,7 +1207,7 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
     assert scalars.column_names[:2] == ["group_id", "scenario"]
     assert set(monthly.column("group_id").to_pylist()) == {gid}
     assert monthly.num_rows == T_EXAMPLE + 1
-    for name in ("csm", "lc", "release", "cu_next", "cu_g", "fcf_g", "lrc"):
+    for name in ("csm", "lc", "release", "cu_next", "cu_g", "fcf_g", "lrc", *M12_LINES):
         assert name in monthly.column_names, name
     for name in ("p_g", "csm_0", "lc_0", "lrc_0"):
         assert name in scalars.column_names, name
@@ -807,35 +1216,72 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
     assert variables["release"] == {"time": True, "unit": "Money", "start": 1, "role": None}
     assert variables["cu_g"]["unit"] == "CoverageUnits"
     assert variables["j_l"]["unit"] == "Rate[Monthly]"
+    assert variables["f"]["unit"] == "Rate[Monthly]"
+    assert variables["sar"]["unit"] == "Factor"
+    assert variables["revenue"] == {"time": True, "unit": "Money", "start": 1, "role": None}
     assert variables["p_g"] == {"time": False, "unit": "Money", "start": 0, "role": None}
-    # the disclosures: alpha of the cur basis, the stage's approach strings and its notes
+    # the disclosures: alpha of the cur basis, the para 120 curve df_cur, the stage's approach
+    # strings and its notes
     assert m["disclosures"] == {
         "discount_rates": DISCOUNT_RATES,
         "risk_adjustment": RISK_ADJUSTMENT,
         "notes": [NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY],
         "confidence_level": 0.75,
-        "para_120_curve_sha256": None,
+        "para_120_curve_sha256": _sha(curves["df_cur"]),
     }
-    # p_l names its source, so the loader recomputed it with the registered helper (design 10)
+    # both curves name their source, so the loader recomputed them with the registered helper
+    rf_sha = _sha(SCENARIOS["rf_df"])
     assert m["provenance"] == [
         {
-            "file": "scenario input p_l",
-            "sha256": _sha(p_l),
+            "file": f"scenario input {name}",
+            "sha256": _sha(curves[name]),
             "key": "rebased_from",
-            "value": _sha(SCENARIOS["rf_df"]),
+            "value": rf_sha,
             "helper": "halley.aggregation.inforce.recompute_rebased",
         }
+        for name in ("p_l", "df_cur")
     ]
-    assert [e["run_id"] for e in m["bases"]["cur"]] == [class_runs[p].run_id for p in (1, 2, 3)]
+    # P_L = P: the locked-in curve was verified against the files the cur runs read
+    run_ids = [class_runs[p].run_id for p in (1, 2, 3)]
+    assert m["locked_in"] == {
+        gid: {
+            "p_l": {
+                "sha256": _sha(curves["p_l"]),
+                "tau0": 0,
+                "source_sha256": rf_sha,
+                "ilp_sha256": _sha(TABLES["ilp"]),
+                "composed_from": [
+                    f"basis cur run {run_ids[0]}: scenario input rf_df",
+                    f"basis cur run {run_ids[0]}: table ilp",
+                ],
+            }
+        }
+    }
+    # the member rules that ran, on which runs (D21: a replay cannot run them again)
+    held = [{"run_id": rid, "members": 1} for rid in run_ids]
+    assert m["member_rules"] == [
+        {"rule": G5_NAME, "basis": "cur", "reads": [], "runs": held},
+        {"rule": G3_NAME, "basis": "cur", "reads": ["onerous"], "runs": held},
+    ]
+    assert [e["run_id"] for e in m["bases"]["cur"]] == run_ids
     assert m["previous"] is None
     series = m["inputs"]["series"]
-    assert set(series) == {"cu_g", "fcf_g", "bel_g", "ra_g", "premium_total"}
+    assert set(series) == {
+        "cu_g",
+        "fcf_g",
+        "bel_g",
+        "ra_g",
+        "ann_out_g",
+        "exp_out_g",
+        "inv_exp_g",
+        "premium_total",
+    }
     assert series["fcf_g"]["variables"] == ["bel", "ra"]
     assert series["premium_total"]["members"] == [[gid, [1, 2, 3]]]
     # D21: the run reads back bit for bit from its verified directory
     loaded = load_run(d, verify=True)
     assert loaded.ids.tolist() == [gid]
-    for name in ("csm", "lc", "cu_next", "p_g"):
+    for name in ("csm", "lc", "cu_next", "p_g", "revenue", "ifie"):
         np.testing.assert_array_equal(loaded.var(name), res.var(name))
     assert loaded.run_id == res.run_id
 
@@ -859,17 +1305,18 @@ def test_the_stage_reruns_and_replays_bit_for_bit_d19_d21(
     compiled_new_group: dict[bool, CompiledModel],
     stages: dict[tuple[int, bool], RunResult],
     class_runs: dict[int, RunResult],
-    p_l: Path,
+    curves: dict[str, Path],
     runs_dir: Path,
     tmp_path: Path,
 ) -> None:
     """D19: the same inputs give the same run id and the same bits; D21: the run replays from
-    its own directory alone (its copies of the groups, the series and p_l)."""
+    its own directory alone (its copies of the groups, the series and both curves), carrying
+    over the record of the member rules and of the locked-in curve it cannot check again."""
     res = stages[(3, True)]
     again = _stage(
         compiled_new_group[True],
         [class_runs[p] for p in EXAMPLES[3]],
-        p_l,
+        curves,
         tmp_path / "again",
         groups_file("OTHER"),
         runs_root=runs_dir,
@@ -878,6 +1325,8 @@ def test_the_stage_reruns_and_replays_bit_for_bit_d19_d21(
     replay = replay_aggregation(compiled_new_group[True], res.run_dir, run_dir=tmp_path / "replay")
     assert replay.run_id == res.run_id
     assert replay.manifest["replayed_from"]["matches"] is True
+    for block in ("member_rules", "locked_in", "disclosures"):
+        assert replay.manifest[block] == res.manifest[block], block
     for other in (again, replay):
         for name in res.arrays:
             assert _bits_equal(other.var(name), res.var(name)), name

@@ -446,14 +446,16 @@ def test_the_recognition_stage_of_the_in_force_example(
 ) -> None:
     """Section 7.3 and 14.2: NewGroup on the two class runs of each variant gives the script's
     P_g, CSM(0) and LC(0), F_prev(0) and F_prev(12), and its monthly roll to month 12; the
-    groups file at V takes prev_run_id, csm_prev and lc_prev from that run."""
+    groups file at V takes prev_run_id, csm_prev and lc_prev from that run. At recognition the
+    locked-in and the current curves are both the composed recognition curve (P_L = P)."""
     _p_rec, p_l = locked_in_curve(_file("discount_rec"), _file("ilp"), 0, data.IF_T_REC)
+    df_cur = composed_curve(_file("discount_rec"), _file("ilp"), data.IF_T_REC)
     for k, v in variants.items():
         stage = run_aggregation(
             compiled_new_group[True],
             groups=_file(f"groups_{k}_rec"),
             bases={"cur": [rec_runs[(k, "level")], rec_runs[(k, "cpi")]]},
-            scenarios={"p_l": p_l},
+            scenarios={"p_l": p_l, "df_cur": df_cur},
             settings=RunSettings(valuation_date=V_REC),
             run_dir=tmp_path / f"recognised-{k}",
         )
@@ -642,3 +644,16 @@ def test_the_expected_in_force_is_recomputed_from_the_run_it_names(
         recompute_derived(dataclasses.replace(check, bases={}))
     wrong = dataclasses.replace(check, value=other.run_id)
     assert file_difference(old, recompute_derived(wrong)) is not None
+    # the file's own halley.tau is held to the period: a file built at month 11 of a 12-month
+    # period would rebuild bit for bit from its own metadata, and is refused
+    early = read_source(expected_in_force(rec, TAU - 1, _file("mp_level_P_v")), "early")
+    assert early.metadata["tau"] == str(TAU - 1)
+    with pytest.raises(
+        LoadError,
+        match=rf"early: halley\.tau is {TAU - 1}, but the run it is derived from, {rec.run_id}, "
+        rf"values at {V_REC.isoformat()} and the stage at {V.isoformat()}, {TAU} months later",
+    ):
+        recompute_derived(dataclasses.replace(check, file=early))
+    later = dataclasses.replace(check, valuation_date=dt.date(2027, 1, 31))
+    with pytest.raises(LoadError, match=rf"halley\.tau is {TAU}, .* 13 months later"):
+        recompute_derived(later)

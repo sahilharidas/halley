@@ -10,18 +10,26 @@ of the 2022 agenda decision, or undiscounted by the build-time switch), the accr
 release in proportion to the month's units, and the loss component by the ratio of
 IFRS 17 Illustrative Example 8. Every division sits inside a ``where`` whose divisor is guarded,
 because both branches are evaluated. The opening balances are hooks: ``csm_0`` and ``lc_0`` (the
-inits of ``csm`` and ``lc``) and ``p_g``, which a subclass defines.
+inits of ``csm`` and ``lc``) and ``p_g``, which a subclass defines. Beside them it computes the
+lines of milestone M12 for the months on the ``cur`` basis (design section 9): the insurance
+revenue of an expected run and the insurance finance expense, at the current forward rates of
+the composed current curve ``df_cur``, with the invariants M1 (the LRC moves by IFIE less
+revenue and the loss component's share of the service items) and M2 (the loss component's
+allocation is that share less its share of the finance unwind). Its N(t) needs every later
+month of the units, so it runs to its bases' run-off (``reads_to_run_off``).
 
 :class:`NewGroup` is the stage of milestone M7: a group recognised at the valuation date, whose
 ``P_g`` is the sum of its members' premiums and whose opening CSM or loss component is
 ``max(0, P_g - FCF_g(0))`` or ``max(0, FCF_g(0) - P_g)``, with ``FCF_g = BEL_g + RA_g`` formed
-first (paras 38 and 47). Its member rules G5 and G3 check every contract on the runs the
-stage reads; its invariants I11 to I14 are checked on every run.
+first (paras 38 and 47), and whose locked-in curve is the composed curve of the runs it reads
+(``recognised_at_valuation``: P_L = P). Its member rules G5 and G3 check every contract on the
+runs the stage reads; its invariants I11 to I14, M1 and M2 are checked on every run.
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, cast
+import inspect
+from typing import Any, ClassVar, NoReturn, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -44,7 +52,7 @@ from halley.authoring import (
     where,
 )
 from halley.authoring.contracts import group_schema
-from halley.errors import LoadError
+from halley.errors import BuildError, LoadError, Loc
 
 EPS = 1e-12
 """The annuity spec's tolerance for its invariants within a backend."""
@@ -72,7 +80,31 @@ P_L = ScenarioInput(
 )
 """The locked-in curve, built by :func:`halley.aggregation.inforce.locked_in_curve` (its value
 column is ``rf_df``, as a discount file's is): for a group new at V, the composed curve of the
-runs it reads (annuity spec, "Locked-in rates")."""
+runs it reads (annuity spec, "Locked-in rates"), which the loader verifies for
+:class:`NewGroup` (``recognised_at_valuation``)."""
+
+DF_CUR = ScenarioInput(
+    "df_cur",
+    "Factor",
+    doc="The composed current curve P(t) of the cur basis's runs, one scenario: the para 120 curve",
+    gt=0,
+    le=2,
+    column="rf_df",
+    covers=(0, "H"),
+    rules=(
+        ScenarioRule(
+            "df_cur(0) = 1",
+            lambda v: v.at(0) == 1.0,
+            "the current curve discounts to the valuation date",
+        ),
+    ),
+)
+"""The composed current curve, built by :func:`halley.aggregation.inforce.composed_curve` from
+the discount file and the ILP table the cur basis's runs read (value column ``rf_df``): the
+curve their BEL and RA unwind on, whose forward rates the M12 lines read (design section 9) and
+whose file the manifest discloses as the para 120 curve. One scenario: the stage reads mean
+series, so the loader holds every scenario input of the stage to ``require_deterministic`` (the
+one J = 1 check, D4)."""
 
 ROLL_OUTPUTS = (
     "cu_g",
@@ -91,9 +123,21 @@ ROLL_OUTPUTS = (
     "lc",
     "lc_alloc",
     "lrc",
+    "ann_out_g",
+    "exp_out_g",
+    "inv_exp_g",
+    "f",
+    "ifie_bel",
+    "ra_fin",
+    "ra_rel",
+    "sar",
+    "svc",
+    "lc_svc",
+    "revenue",
+    "ifie",
 )
-"""What :class:`CsmRollForward` stores: the group series it reads and every line of the
-roll-forward tables of the annuity spec, by month."""
+"""What :class:`CsmRollForward` stores: the group series it reads, every line of the
+roll-forward tables of the annuity spec and the M12 lines (revenue and IFIE), by month."""
 
 DISCOUNT_RATES = (
     "Bottom-up (B80): a liquid risk-free curve plus an illiquidity premium, continuously "
@@ -219,6 +263,28 @@ def _i13_where(a: BatchView) -> NDArray[np.bool_]:
     return np.asarray((a.var("fcf_g") > 0) & (a.at("fcf_g", 0) > 0) & (a.at("lc", 0) > 0))
 
 
+def _p_g(a: BatchView, lhs: NDArray[Any], rhs: NDArray[Any]) -> NDArray[Any]:
+    """P_g, the group's scale (the annuity spec's "Quantities")."""
+    return a.var("p_g")
+
+
+def _m1_lhs(a: BatchView) -> NDArray[Any]:
+    """LRC(t) - LRC(t - 1), months 1..H."""
+    lrc = a.var("lrc")
+    return lrc[1:] - lrc[:-1]
+
+
+def _m1_rhs(a: BatchView) -> NDArray[Any]:
+    """IFIE(t) - revenue(t) - LC_svc(t), left to right, months 1..H."""
+    return (a.var("ifie")[1:] - a.var("revenue")[1:]) - a.var("lc_svc")[1:]
+
+
+def _m2_rhs(a: BatchView) -> NDArray[Any]:
+    """LC_svc(t) - SAR(t) x [IFIE_BEL(t) + RA_fin(t)], months 1..H."""
+    finance = a.var("ifie_bel")[1:] + a.var("ra_fin")[1:]
+    return a.var("lc_svc")[1:] - a.var("sar")[1:] * finance
+
+
 ROLL_INVARIANTS = (
     Invariant(
         "I11 CSM(t) = CSM(t-1) + Acc(t) - R(t)",
@@ -281,11 +347,35 @@ ROLL_INVARIANTS = (
         where=lambda a: np.asarray(a.var("fcf_g") == 0),
         reads=("lc", "fcf_g"),
     ),
+    Invariant(
+        "M1 LRC(t) - LRC(t-1) = IFIE(t) - revenue(t) - LC_svc(t)",
+        _m1_lhs,
+        _m1_rhs,
+        tol=EPS,
+        scale=_p_g,
+        months=(1, "H"),
+        reads=("lrc", "ifie", "revenue", "lc_svc", "p_g"),
+        doc="the LRC moves by the finance expense less the revenue and the loss component's "
+        "share of the service items (B121, B124, para 87), on the current curve df_cur",
+    ),
+    Invariant(
+        "M2 LCA(t) = LC_svc(t) - SAR(t) [IFIE_BEL(t) + RA_fin(t)]",
+        lambda a: a.var("lc_alloc")[1:],
+        _m2_rhs,
+        tol=EPS,
+        scale=_p_g,
+        months=(1, "H"),
+        reads=("lc_alloc", "lc_svc", "sar", "ifie_bel", "ra_fin", "p_g"),
+        doc="the loss component's allocation is its share of the service items less its share "
+        "of the finance unwind, which stays in IFIE (paras 50(a), 51)",
+    ),
 )
-"""The annuity spec's I11, I12 and I13 ("Built-in invariants"), each part an Invariant; I11's
-exact zero covers the last month with units itself (where N is exactly 0, so the release is the
-whole CSM), which the literal "after" leaves vacuous when that month is H (in-force open
-question 17)."""
+"""The annuity spec's I11, I12 and I13 ("Built-in invariants"), each part an Invariant, and the
+design's M1 and M2 (section 9, M12; scale P_g, 1e-12). I11's exact zero covers the last month
+with units itself (where N is exactly 0, so the release is the whole CSM), which the literal
+"after" leaves vacuous when that month is H (in-force open question 17). M1 and M2 hold only
+when ``df_cur`` is the curve the cur runs' BEL and RA unwind on, so they also check that
+curve."""
 
 
 def _i14_lhs(a: BatchView) -> NDArray[Any]:
@@ -348,12 +438,34 @@ G5 = MemberRule(
 # ------------------------------------------------------------------------------------ classes
 
 
+def _defined_at(cls: type) -> Loc | None:
+    """Where a class is defined, for an error about the class rather than one of its lines."""
+    try:
+        file = inspect.getsourcefile(cls)
+        _lines, line = inspect.getsourcelines(cls)
+    except (OSError, TypeError):
+        return None
+    return None if file is None else Loc(file, line, cls.__qualname__)
+
+
+def _undefined_hook(stage: object, name: str) -> NoReturn:
+    """The BuildError of a hook the class being built does not define: located at that class,
+    the user's subclass, not at the hook's line here (errors point at the model source)."""
+    cls = type(stage)
+    raise BuildError(
+        f"{cls.__qualname__} does not define {name}, a hook of CsmRollForward: a subclass "
+        "defines csm_0 and lc_0 (the opening balances) and p_g (the group's premiums)",
+        _defined_at(cls),
+    )
+
+
 class CsmRollForward(Aggregation):
     """The monthly CSM and loss-component roll-forward of one group on the ``cur`` basis
     (annuity spec, "Accretion and release", "Onerous groups and the loss component"), in the
-    spec's evaluation order and grouping. A subclass defines the hooks ``csm_0``, ``lc_0`` (the
-    opening balances, the inits of ``csm`` and ``lc``) and ``p_g`` (the premiums of the group,
-    the K scale of the in-force close)."""
+    spec's evaluation order and grouping, and the M12 lines of its months, revenue and IFIE
+    (design section 9). A subclass defines the hooks ``csm_0``, ``lc_0`` (the opening balances,
+    the inits of ``csm`` and ``lc``) and ``p_g`` (the premiums of the group, the scale of M1,
+    M2 and of the in-force close)."""
 
     abstract = True
 
@@ -366,8 +478,11 @@ class CsmRollForward(Aggregation):
         GroupSum("fcf_g", "cur", ("bel", "ra"), "Money", start=0, doc="FCF_g = BEL_g + RA_g"),
         GroupSum("bel_g", "cur", "bel", "Money", start=0, doc="BEL_g(t), t = 0..H"),
         GroupSum("ra_g", "cur", "ra", "Money", start=0, doc="RA_g(t), t = 0..H"),
+        GroupSum("ann_out_g", "cur", "ann_out", "Money", doc="expected payments of month t"),
+        GroupSum("exp_out_g", "cur", "exp_out", "Money", doc="expected expenses of month t"),
+        GroupSum("inv_exp_g", "cur", "inv_exp", "Money", doc="investment expenses of month t"),
     )
-    scenario_inputs = (P_L,)
+    scenario_inputs = (P_L, DF_CUR)
     outputs: ClassVar[tuple[str, ...] | None] = ROLL_OUTPUTS
     invariants = ROLL_INVARIANTS
     disclosures: ClassVar[dict[str, str | tuple[str, ...]]] = {
@@ -375,22 +490,23 @@ class CsmRollForward(Aggregation):
         "risk_adjustment": RISK_ADJUSTMENT,
         "notes": (NOTE_MONTHLY_STEP, NOTE_TIMING_CONVEXITY),
     }
+    reads_to_run_off: ClassVar[bool] = True  # N(t) sums the units of every month after t
 
     # ---- hooks: the opening balances and the premiums --------------------------------
     @var
     def csm_0(self) -> Money:
         """CSM(0), the init of ``csm``: a subclass defines it."""
-        raise NotImplementedError("csm_0 is a hook of CsmRollForward; a subclass defines it")
+        _undefined_hook(self, "csm_0")
 
     @var
     def lc_0(self) -> Money:
         """LC(0), the init of ``lc``: a subclass defines it."""
-        raise NotImplementedError("lc_0 is a hook of CsmRollForward; a subclass defines it")
+        _undefined_hook(self, "lc_0")
 
     @var
     def p_g(self) -> Money:
         """P_g, the group's premiums: a subclass defines it."""
-        raise NotImplementedError("p_g is a hook of CsmRollForward; a subclass defines it")
+        _undefined_hook(self, "p_g")
 
     # ---- the group series, stored ------------------------------------------------------
     @var
@@ -483,13 +599,84 @@ class CsmRollForward(Aggregation):
     def lrc_0(self) -> Money:
         return self.series.fcf_g.at(0) + self.csm_0()
 
+    # ---- M12: insurance revenue and IFIE of the months on the cur basis (design 9) -------
+    @var
+    def ann_out_g(self, t: Int) -> Money:
+        return self.series.ann_out_g(t)
+
+    @var
+    def exp_out_g(self, t: Int) -> Money:
+        return self.series.exp_out_g(t)
+
+    @var
+    def inv_exp_g(self, t: Int) -> Money:
+        return self.series.inv_exp_g(t)
+
+    @var
+    def f(self, t: Int) -> Rate[Monthly]:
+        """The current one-month forward rate f(t) = P(t - 1) / P(t) - 1 of ``df_cur``."""
+        return fwd_rate(self.scen.df_cur(t - 1), self.scen.df_cur(t))
+
+    @var
+    def ifie_bel(self, t: Int) -> Money:
+        """The BEL's unwind at the current forward rate, on the opening BEL less the month's
+        payments and expenses, which are made at its start (para 87)."""
+        opening = (self.series.bel_g(t - 1) - self.series.ann_out_g(t)) - self.series.exp_out_g(t)
+        return self.f(t) * opening
+
+    @var
+    def ra_fin(self, t: Int) -> Money:
+        """The RA's finance part: its unwind at the current forward rate (para 81)."""
+        return self.f(t) * self.series.ra_g(t - 1)
+
+    @var
+    def ra_rel(self, t: Int) -> Money:
+        """The RA released for the month's service: the opening RA and its unwind, less the
+        closing RA (para 81, B124(b)(ii))."""
+        return (self.series.ra_g(t - 1) + self.ra_fin(t)) - self.series.ra_g(t)
+
+    @var
+    def sar(self, t: Int) -> Factor:
+        """SAR(t) = LC(t - 1) / F(t - 1), the loss component's share of the opening outflows
+        and RA (paras 50(a), 51)."""
+        f0 = self.series.fcf_g(t - 1)
+        return self.lc(t - 1) / where(f0 > 0, f0, 1.0)
+
+    @var
+    def svc(self, t: Int) -> Money:
+        """The month's service items: the expected payments, expenses and investment expenses,
+        and the RA released (B124)."""
+        cash = (self.series.ann_out_g(t) + self.series.exp_out_g(t)) + self.series.inv_exp_g(t)
+        return cash + self.ra_rel(t)
+
+    @var
+    def lc_svc(self, t: Int) -> Money:
+        """The loss component's share of the service items, which revenue excludes (B124)."""
+        return self.sar(t) * self.svc(t)
+
+    @var
+    def revenue(self, t: Int) -> Money:
+        """Insurance revenue of an expected run (B121, B124): the service items less the loss
+        component's share, and the CSM release."""
+        return (self.svc(t) - self.lc_svc(t)) + self.release(t)
+
+    @var
+    def ifie(self, t: Int) -> Money:
+        """Insurance finance expense (para 87): the BEL and RA unwind at the current rates and
+        the CSM accretion at the locked-in rates. The loss component's share of the unwind
+        stays in it."""
+        return (self.ifie_bel(t) + self.ra_fin(t)) + self.acc(t)
+
 
 class NewGroup(CsmRollForward):
     """A group recognised at the valuation date (milestone M7; annuity spec, "Initial
     recognition"): every member was issued on it (G5), the premiums P_g are the members' and
     the opening CSM or loss component is the gap between P_g and FCF_g(0), with the FCF formed
-    first. G3 holds for every contract (the member rule at load, I14 on the group's figures)."""
+    first. G3 holds for every contract (the member rule at load, I14 on the group's figures).
+    Its locked-in curve is the composed curve of the runs it reads, P_L = P, which the loader
+    verifies from ``p_l``'s metadata (``recognised_at_valuation``)."""
 
+    recognised_at_valuation: ClassVar[bool] = True  # P_L = P (annuity spec, "Locked-in rates")
     series = (
         *CsmRollForward.series,
         GroupSum(
@@ -527,6 +714,7 @@ class NewGroup(CsmRollForward):
 
 
 __all__ = [
+    "DF_CUR",
     "DISCOUNT_RATES",
     "G3",
     "G5",

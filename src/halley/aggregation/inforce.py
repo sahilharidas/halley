@@ -29,6 +29,7 @@ pyright's basic mode.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -488,11 +489,19 @@ def _members_at_v(check: ProvenanceCheck, ids: set[Any]) -> Any:
     )
 
 
+def _month_of(d: dt.date) -> int:
+    """``mi(d) = 12 * year(d) + month(d) - 1``."""
+    return 12 * d.year + d.month - 1
+
+
 def recompute_derived(check: ProvenanceCheck) -> Any:
     """The recomputation registered for ``halley.derived_from``: an ``OLD`` model point file is
     made again by :func:`expected_in_force` from the run its ``derived_from`` names (found by
     ``check.find_run``), its ``halley.tau`` and the actual instalments of the ``cur`` basis's
-    model points at V."""
+    model points at V. The file's own ``halley.tau`` is not taken on trust: it must be the
+    period's length, ``mi(V) - mi(V_prev)`` with V the stage's valuation date and V_prev the
+    named run's (in-force 3.4: the expected in-force at V), or a file built at another month
+    would rebuild bit for bit and pass."""
     f = check.file
     made_by = f.metadata.get(HELPER)
     if made_by != "expected_in_force":
@@ -502,6 +511,15 @@ def recompute_derived(check: ProvenanceCheck) -> Any:
         )
     prev = check.find_run(check.value)
     tau = int(_meta(f, "tau"))
+    then = dt.date.fromisoformat(str(prev.manifest["settings"]["valuation_date"]))
+    period = _month_of(check.valuation_date) - _month_of(then)
+    if tau != period:
+        raise LoadError(
+            f"{f.where}: halley.tau is {tau}, but the run it is derived from, {prev.run_id}, "
+            f"values at {then.isoformat()} and the stage at {check.valuation_date.isoformat()}, "
+            f"{period} months later; the expected in-force at V is that run's pols_if at month "
+            "tau of the period (in-force 3.4)"
+        )
     return expected_in_force(prev, tau, _members_at_v(check, set(prev.ids.tolist())))
 
 

@@ -39,7 +39,16 @@ class UnitError(BuildError):
 
 
 class LoadError(HalleyError):
-    """Input data breaks its contract: schema, ranges, table coverage or scenario coverage."""
+    """Input data breaks its contract: schema, ranges, table coverage or scenario coverage.
+
+    ``loc`` is set when the failure is the model source's rather than the data's (a rule of
+    the model that raises, or returns something other than its booleans): it points at the
+    rule's declaration."""
+
+    def __init__(self, message: str, loc: Loc | None = None) -> None:
+        self.message = message
+        self.loc = loc
+        super().__init__(f"{message}\n  at {loc}" if loc is not None else message)
 
 
 class RunError(HalleyError):

@@ -517,6 +517,7 @@ def run(
         series=series,
         lanes=lanes,
         model_points_label="model points" if stage_record is None else stage_record.groups.where,
+        run_off=getattr(model, "reads_to_run_off", False) is True,  # Aggregation's (D5)
     )
     horizon = inputs.H
     n_pol = len(inputs.ids)

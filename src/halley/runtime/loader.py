@@ -781,7 +781,7 @@ def _read(graph: ir.Graph) -> set[str]:
     return {node.name for _v, node in graph.series_reads()}
 
 
-def _relatively_read(graph: ir.Graph) -> set[str]:
+def relatively_read(graph: ir.Graph) -> set[str]:
     """The series some formula reads at a relative month, ``series.x(t + k)`` (a series without
     a time dimension, ``series.x()``, has no month to be relative to)."""
     return {
@@ -879,7 +879,7 @@ def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int |
     if cur:
         return next(iter(cur.values()))
     timed = [n for n, d in graph.series.items() if d.has_time]
-    relative = _relatively_read(graph)
+    relative = relatively_read(graph)
     chosen = [n for n in timed if n in relative] or timed
     horizons = sorted({series[n].horizon for n in chosen})
     if len(horizons) > 1:
@@ -894,12 +894,38 @@ def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int |
     return horizons[0] if horizons else None
 
 
+def _require_zero_after(label: str, s: LoadedSeries, horizon: int) -> None:
+    """A series of a stage that reads its series to the run-off holds exactly 0 after ``H``,
+    where the loader cuts it (:func:`load_series`); a LoadError names the series, its basis and
+    source runs, the group, the first month dropped and the last month with a value."""
+    late = np.argwhere(s.values[horizon + 1 :] != 0)
+    if not late.size:
+        return
+    t, g, _j = (int(i) for i in late[0])
+    month = horizon + 1 + t
+    held = np.flatnonzero((s.values != 0).any(axis=(1, 2)))
+    runs = [str(e.get("run_id")) for e in s.provenance.get("source_runs", ())]
+    source = f"run {runs[0]}" if len(runs) == 1 else f"runs {_listing(runs)}"
+    raise LoadError(
+        f"{label}: basis {s.basis} ({source}) holds {s.values[month, g, 0].item()!r} for group "
+        f"{s.group_ids[g]} at t = {month}, after the stage's horizon H = {horizon}, where the "
+        "loader cuts it; the stage reads its series to the run-off, so its results would change "
+        f"with H (D5): leave RunSettings.horizon out or set it to at least {int(held[-1])}"
+    )
+
+
+def _listing(values: Sequence[str], limit: int = 5) -> str:
+    shown = ", ".join(values[:limit])
+    return shown + (f" and {len(values) - limit} more" if len(values) > limit else "")
+
+
 def load_series(
     graph: ir.Graph,
     series: Mapping[str, LoadedSeries],
     ids: NDArray[Any],
     horizon: int,
     valuation_date: dt.date,
+    run_off: bool = False,
 ) -> dict[str, LoadedSeries]:
     """Check every group series the stage declares against what was supplied: one per
     declaration and no other, with float64 values and its provenance, summed from the declared
@@ -907,11 +933,15 @@ def load_series(
     the declared unit (D11 across runs), time dimension, domain and scenario treatment, the
     stage's groups in its order, finite values. A series read relatively is then cut to months
     ``0..H``, which its basis must cover; the ``cur`` basis's horizon, as every series of it
-    records, bounds ``H`` whatever the series' time dimension. A series read only at fixed
-    months keeps every month of its basis, and each constant ``at(k)`` must be one of the
-    months the series then covers (a per-group month is checked when the batch runs)."""
+    records, bounds ``H`` whatever the series' time dimension. With ``run_off`` (a stage that
+    reads its series to the run-off, ``Aggregation.reads_to_run_off``) every month the cut
+    drops must hold exactly 0, or the results would depend on ``H`` (D5); a LoadError names the
+    series, its basis and source runs, the group and the first month dropped otherwise. A
+    series read only at fixed months keeps every month of its basis, and each constant
+    ``at(k)`` must be one of the months the series then covers (a per-group month is checked
+    when the batch runs)."""
     _check_given(graph, series)
-    relative = _relatively_read(graph)
+    relative = relatively_read(graph)
     fixed = _fixed_months(graph)
     out: dict[str, LoadedSeries] = {}
     for name, decl in graph.series.items():
@@ -981,6 +1011,8 @@ def load_series(
         if pathwise is not None:
             _check_pathwise(label, decl, values, pathwise)
         if decl.has_time and name in relative:
+            if run_off:
+                _require_zero_after(label, s, horizon)
             values = values[: horizon + 1]
             pathwise = None if pathwise is None else pathwise[: horizon + 1]
         last = int(values.shape[0]) - 1
@@ -1222,13 +1254,15 @@ def load_inputs(
     series: Mapping[str, LoadedSeries] | None = None,
     lanes: str = "policies",
     model_points_label: str = "model points",
+    run_off: bool = False,
 ) -> Inputs:
     """Load every input the model reads, in order: model points, tables, the horizon, an
     aggregation stage's group series, scenario files, then the product's input rules over all of
     them. The contracts, when given, add the tables' required metadata and rules, the scenario
     inputs' column names, bounds, coverage and rules. A stage's horizon defaults to its cur
-    basis's (:func:`_stage_horizon`) when its schema names no horizon field. A failure names the
-    model points by their ids under ``lanes``, ``"groups"`` for a stage, and their file by
+    basis's (:func:`_stage_horizon`) when its schema names no horizon field; ``run_off`` says
+    the stage reads its series to the run-off (:func:`load_series`). A failure names the model
+    points by their ids under ``lanes``, ``"groups"`` for a stage, and their file by
     ``model_points_label``."""
     table_contracts = table_contracts or {}
     scenario_contracts = scenario_contracts or {}
@@ -1252,7 +1286,7 @@ def load_inputs(
                 raise LoadError("the run needs a horizon: the schema names no horizon field")
     if horizon < 1:
         raise LoadError(f"the horizon must be at least 1 month, not {horizon}")
-    loaded_series = load_series(graph, series, mp.ids, horizon, valuation_date)
+    loaded_series = load_series(graph, series, mp.ids, horizon, valuation_date, run_off)
     scenarios = scenarios or {}
     req = scenario_requirements(graph, horizon)
     loaded_scen: dict[str, LoadedScenario] = {}

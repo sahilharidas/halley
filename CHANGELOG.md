@@ -274,25 +274,64 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   `lc` (from the hook `lc_0`, by the ratio of Illustrative Example 8), `lc_alloc`, `lrc` and
   `lrc_0`, every division guarded inside its `where`, and stores them with the series by
   month. `NewGroup` adds the series `premium_total` and the hooks `p_g`, `csm_0 = max(0, P_g -
-  FCF_g(0))` and `lc_0 = max(0, FCF_g(0) - P_g)`, which it stores. Both check the annuity
-  spec's I11 (with the exact zero of the CSM from the last month with coverage units on, the
-  last month included), I12 (both forms), I13 and, on `NewGroup`, I14 (CSM(0) = 0 in an
-  `ONEROUS` group, LC(0) = 0 in any other) on every run. Their manifests disclose the
-  approaches to discount rates and to the risk adjustment and two notes (the monthly CSM
-  allocation step, the ignored timing convexity) beside the confidence level; the notes of an
-  in-force close (C11, C17) are defined in `halley.aggregation.csm` for its stage.
+  FCF_g(0))` and `lc_0 = max(0, FCF_g(0) - P_g)`, which it stores. A subclass that leaves a
+  hook undefined is a BuildError located at the subclass, not at the hook's line in
+  `halley.aggregation.csm`.
+- The M12 lines of the months on the `cur` basis (design section 9), on `CsmRollForward`: the
+  group series `ann_out_g`, `exp_out_g` and `inv_exp_g` and the scenario input `df_cur`, the
+  composed current curve (value column `rf_df`, months 0..H, rule `df_cur(0) = 1`, one
+  scenario through `require_deterministic`), from which it computes and stores `f` (the
+  current one-month forward rate), `ifie_bel`, `ra_fin`, `ra_rel`, `sar`, `svc`, `lc_svc`,
+  `revenue = (svc - lc_svc) + release` and `ifie = (ifie_bel + ra_fin) + acc`. Every run of a
+  `CsmRollForward` stage therefore takes `df_cur` beside `p_l`; build it with
+  `composed_curve(<the cur runs' rf_df>, <their ilp>, H)`.
+- Both stages check the annuity spec's I11 (with the exact zero of the CSM from the last month
+  with coverage units on, the last month included), I12 (both forms), I13, the design's M1
+  (`LRC(t) - LRC(t-1) = IFIE(t) - revenue(t) - LC_svc(t)`) and M2 (`LCA(t) = LC_svc(t) - SAR(t)
+  [IFIE_BEL(t) + RA_fin(t)]`), both at 1e-12 x P_g, and, on `NewGroup`, I14 (CSM(0) = 0 in an
+  `ONEROUS` group, LC(0) = 0 in any other) on every run. M1 and M2 hold only on the curve the
+  cur runs' BEL and RA unwind on, so a `df_cur` at another level fails M1. Their manifests
+  disclose the approaches to discount rates and to the risk adjustment, two notes (the monthly
+  CSM allocation step, the ignored timing convexity), the confidence level and
+  `para_120_curve_sha256`, the `df_cur` file's hash; the notes of an in-force close (C11, C17)
+  are defined in `halley.aggregation.csm` for its stage.
+- A stage class may set `reads_to_run_off` (a bool; `CsmRollForward` sets it, since N(t) sums
+  every later month of the units): a `RunSettings.horizon` below the cur basis's is then
+  accepted only where every series the stage reads relatively is exactly 0 after it, and is a
+  LoadError otherwise, from `run_aggregation` naming the basis, the run, the variable, the
+  policy, the first month dropped and the last month with a value (`basis cur run ...: cu of
+  policy 1 is 993.85... at t = 13, after the stage's horizon H = 12 ...: leave
+  RunSettings.horizon out or set it to at least 655`), and from the series loader for a stage
+  run through `run()`. A stage cut before the run-off would release the whole CSM at H.
+- A stage class may set `recognised_at_valuation` (a bool; `NewGroup` sets it, and must
+  declare the `cur` basis and the scenario input `p_l`, a BuildError otherwise): P_L = P, so
+  the loader requires `p_l`'s metadata to name the `rf_df` and `ilp` files every cur run read
+  (`source_sha256`, `ilp_sha256`), `tau0 = 0` and `rebased_from`, and the provenance check then
+  rebuilds `p_l` from them bit for bit. A `p_l` without that metadata (a bare discount file, a
+  curve made by hand), re-based at another month or composed with another ILP or discount file
+  is a LoadError naming scenario input `p_l`; so is a cur basis whose runs read different
+  `rf_df` or `ilp` files. The manifest's `locked_in` block records the verified curve under
+  `p_l` (`sha256`, `tau0`, `source_sha256`, `ilp_sha256`, `composed_from`). A variable may not
+  be named `reads_to_run_off` or `recognised_at_valuation` in a stage.
 - Member rules: `halley.aggregation.MemberRule(name, check, basis="cur", *, reads=(), doc="")`
   is a rule on every member of a basis, declared in the new stage attribute
   `Aggregation.member_rules`. `run_aggregation` evaluates each on every run of its basis with
   a `MemberView` (the run's verified model point copy as `mp`, its stored outputs through
-  `output(name)`, the valuation date, J): a failure is a LoadError naming the rule, the copy,
-  the first failing row and its policy, and the file the run read its model points from; a
-  check that returns no booleans, or another shape, a rule whose `reads` the run did not store
-  and a basis the stage does not declare (a BuildError at the rule's line) are errors too.
-  `NewGroup` declares G5 (every contract issued on the valuation date) and G3 (a contract is
-  onerous, by its run's `onerous` output, exactly in an `ONEROUS` group; at one scenario,
-  `require_deterministic`). `run()` refuses a stage that declares member rules, as it refuses
-  one that reads a previous run: it sees only the group series.
+  `output(name)`, the valuation date, J): a failure is a LoadError naming the rule, the run,
+  the first failing row of its model point copy and the row's policy, and the file the run read
+  its model points from (`member rule G3 ... fails for 1 of 1 members of basis cur run ...,
+  first at model points (<copy>): row 0, policy 1, which the run read from <file>`); a check
+  that returns no booleans, or another shape, a rule whose `reads` the run did not store and a
+  basis the stage does not declare (a BuildError at the rule's line) are errors too. A rule
+  whose own code raises, or returns no booleans or another shape, is a LoadError located at the
+  rule's declaration: `LoadError` gains an optional `loc`, as `BuildError` and `RunError` have,
+  and its message ends with the location when one is set. The manifest gains a `member_rules`
+  block (each rule's `rule`, `basis`, `reads` and the `runs` it held for, with their number of
+  `members`), which `replay_aggregation` carries over: a replay reads no basis, so it cannot
+  run the rules again. `NewGroup` declares G5 (every contract issued on the valuation date) and
+  G3 (a contract is onerous, by its run's `onerous` output, exactly in an `ONEROUS` group; at
+  one scenario, `require_deterministic`). `run()` refuses a stage that declares member rules,
+  as it refuses one that reads a previous run: it sees only the group series.
 - `halley.aggregation.inforce` (exported by `halley.aggregation`) builds the inputs of an
   in-force group's runs at V as files that name their sources: `expected_in_force(prev, tau,
   cur_mps)` (the OLD run's model points: the previous projection run's `pols_if(tau)` at full
@@ -308,7 +347,13 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   that made it, and the curves and the CPI splice `halley.rebased_from`. Importing the package
   registers the recomputations `recompute_rebased` and `recompute_derived` for the two
   provenance keys, so the stage loader recomputes every one of these files a stage or its bases
-  read, from the sources it names, and requires bit equality.
+  read, from the sources it names, and requires bit equality. `recompute_derived` also holds
+  the `OLD` file's `halley.tau` to the period, `mi(V) - mi(V_prev)` with V_prev the valuation
+  date of the run it names, so a file built at another month is a LoadError rather than a file
+  that rebuilds bit for bit from its own metadata.
+- `halley.runtime.loader.relatively_read(graph)` (the series some formula reads at a relative
+  month) is public; `load_inputs` and `load_series` take `run_off`, which `run()` sets from the
+  stage's `reads_to_run_off`.
 - `halley.aggregation` also exports `run_aggregation` and `replay_aggregation`.
 - `halley.products.annuity_data` builds the in-force group's reference inputs (in-force spec
   sections 3, 5 and 13): the model points of each variant and class at recognition and at V,
