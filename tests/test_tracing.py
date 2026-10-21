@@ -96,7 +96,7 @@ def test_a_build_time_parameter_holds_its_declared_type() -> None:
     for model, name, value, wanted in cases:
         kind = "bool" if wanted == "True or False" else "int"
         with pytest.raises(BuildError) as info:
-            build(model, **{name: value})
+            build(model, **cast(dict[str, Any], {name: value}))  # Any: build() also takes backend
         assert info.value.message == (
             f"build({model.__qualname__}, {name}=...): {name} is a build-time parameter declared "
             f"Static[{kind}], so its value is {wanted}, not {value!r} ({type(value).__name__})"

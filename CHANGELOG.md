@@ -529,6 +529,37 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   previous run's and the stage's bases: in a later period the files a group locks in at
   recognition are read only by the recognition run's bases.
 
+### The Numba backend (M6)
+
+- `build(model, *, backend="numpy", **statics)`: `backend="numba"` generates the Numba backend
+  from the same IR and schedule (`pip install halley[numba]`; without numba the build is a
+  BuildError saying so). A name outside the registry, `halley.codegen.BACKENDS`
+  (`"numpy"`, `"numba"`), is a BuildError listing it. `CompiledModel.backend` names the
+  backend, and `halley.codegen.Backend` is the protocol a backend implements (`name`,
+  `artefact`, `generate`, `compile`, `run_batch`, `versions`).
+- `backend` is now build()'s own argument, so a build-time parameter (`Static[...]`) named
+  `backend` is a BuildError at the class that declares it.
+- The generated module calls one compiled kernel per component in schedule order, with the
+  NumPy backend's arrays in and out (the same shapes, month quantities exactly 0 at t = 0, Int
+  and Bool arrays int64 and bool) and its run-time checks: a probability outside [0, 1], a
+  lookup key outside its table, an `at()`, `scen.<name>.at()` or `series.<name>.at()` month
+  outside its domain, and a non-finite result are RunErrors with the NumPy backend's text, its
+  model line and the same policies (or groups) named.
+- A run directory of the Numba backend holds its generated module as
+  `generated/numba_backend.py` (a NumPy run's stays `generated/numpy_backend.py`).
+- The manifest's `backend` block of a Numba run records `numba`, `llvmlite`, `numpy`,
+  `using_svml` (whether Numba uses Intel's SVML) and `processor` beside `pyarrow`, `python`
+  and `platform`. A NumPy run's block is unchanged.
+- The run id of a NumPy run is unchanged (its identity's backend entry is still the name and
+  the NumPy version); a Numba run's identity adds the Numba and llvmlite versions, so the same
+  inputs on the two backends are two runs. `replay_aggregation` treats a change of `numba` or
+  `llvmlite` as one that moves the run id, and of `using_svml` or `processor` as one that can
+  move a value.
+- The generated module is written to `<temp>/halley-numba/<ir_hash>.py`, or under the directory
+  named by `HALLEY_NUMBA_CACHE`, and imported from there; Numba caches the compiled kernels
+  beside it, so the first build of a product compiles every kernel (tens of seconds) and later
+  builds, in any process, load them.
+
 ### Known limitations
 
 - `recompute` and `explain` evaluate a power with a non-literal array exponent (a model point
@@ -611,6 +642,29 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - A model point with no survivors at V keeps its previous `instalment_pm` in the old basis (the
   specification is silent; in-force open question 23 asks its author), so with an anniversary
   inside the period its expected escalation is reported in C - B rather than in delta_FCF_L.
+- The Numba backend reproduces the NumPy backend's run-time checks, not the exceptions its
+  Python and NumPy arithmetic raises outside them: in a recursive component a division or
+  modulo by zero between plain Python numbers (literals, `t`, `self.run.*`) is a
+  ZeroDivisionError on the NumPy backend and inf, nan or 0 on the Numba backend (the
+  finiteness check then fails for a float), and an integer literal raised to a negative Int is
+  a ValueError on the NumPy backend and a float power on the Numba backend.
+- A model point field of kind `number` with unit `Int`, used as a table key, is an IndexError
+  on the NumPy backend and truncated to an integer on the Numba backend.
+- The Numba kernels run on one core: the policy loop can run in parallel (`numba.prange` over
+  blocks of 64 policies, `halley.codegen.numba_backend.PARALLEL`), but that is off, since it
+  more than doubles the compile time for little gain on memory-bound kernels; spreading
+  batches over processes (`RunSettings.workers`, design section 12) is the way to use several
+  cores.
+- The first build of a model on the Numba backend compiles every kernel, about half a second
+  to a second per component on the development machine (the in-force stage, 60 components,
+  about half a minute). The module's text names the model's source lines for the messages, so
+  a change to it for the same IR hash (another Halley, the model's lines or file moved, two
+  checkouts of one model) rewrites the module and recompiles its kernels.
+- On the Numba backend the probability and finiteness checks still run in NumPy over every
+  stored array after the kernels, as the NumPy backend's do, which is a large share of a
+  batch's time.
+- `recompute` and `explain` interpret the NumPy backend's semantics; for a Numba run they agree
+  with the stored values within 1e-9 relative, not bit for bit.
 
 ### Notes on determinism
 
@@ -632,3 +686,13 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   exponent (a keyless table's value) against a scalar base, as in
   `self.tables.rates.f["a"] ** self.tables.power.e`, so they agree with the stored value bit for
   bit there.
+- On the Numba backend reruns with the same inputs, settings and batching are bit-identical
+  (the same run id and output files): the kernels compile with fast-math off, so there is no
+  contraction to FMA and no reassociation, and `sum_t` adds in ascending t. Across backends
+  every value agrees within 1e-9 relative under the product's scales, with exact zeros in the
+  same places and Int and Bool values equal, but not bit for bit: a power is LLVM's pow with a
+  float exponent, where NumPy may take its fast path, and `exp`, `log`, `expm1`, `log1p` and
+  `sqrt` are the C library's, where NumPy has its own vectorised versions. A kernel evaluates
+  each lane with the same scalar code whatever the batch, so a non-literal exponent gives the
+  same bits in a batch of one policy as in a batch of three (tested without SVML, whose
+  vectorised maths the manifest's `using_svml` records).

@@ -689,6 +689,33 @@ def run_batch(
         ) from exc
 
 
+class NumpyBackend:
+    """The NumPy reference backend as a :class:`~halley.codegen.Backend`."""
+
+    name = "numpy"
+    artefact = "numpy_backend.py"
+
+    def generate(self, graph: ir.Graph, schedule: Schedule) -> str:
+        return generate(graph, schedule)
+
+    def compile(self, source: str, model: str) -> BatchFn:
+        return compile_source(source, model)
+
+    def run_batch(
+        self,
+        fn: BatchFn,
+        graph: ir.Graph,
+        inp: dict[str, Any],
+        horizon: int,
+        lanes: str = "policies",
+    ) -> dict[str, NDArray[Any]]:
+        return run_batch(fn, graph, inp, horizon, lanes)
+
+    def versions(self) -> dict[str, str]:
+        """NumPy computes the values (the manifest's ``backend.numpy``, in the run id)."""
+        return {"numpy": np.__version__}
+
+
 def _lane_ids(lanes: NDArray[np.bool_], inp: dict[str, Any], noun: str) -> str:
     ids = inp.get("policy_ids")
     if ids is not None and lanes.ndim == 1 and lanes.shape[0] == 1 and len(ids) > 1:

@@ -3301,15 +3301,25 @@ def replay_aggregation(
     return result
 
 
-RUN_ID_ENVIRONMENT: Final = ("name", "numpy")
-"""The entries of a manifest's ``backend`` block that a run id covers: the backend's name and
-the NumPy version."""
+RUN_ID_ENVIRONMENT: Final = ("name", "numpy", "numba", "llvmlite")
+"""The entries of a manifest's ``backend`` block that a run id covers: the backend's name, the
+NumPy version and, for the Numba backend, the Numba and llvmlite versions
+(:data:`~halley.runtime.run.IDENTITY_VERSIONS`)."""
 
-VALUE_ENVIRONMENT: Final = ("name", "numpy", "platform")
+VALUE_ENVIRONMENT: Final = (
+    "name",
+    "numpy",
+    "platform",
+    "numba",
+    "llvmlite",
+    "using_svml",
+    "processor",
+)
 """The entries of a manifest's ``backend`` block that can change a run's values: the backend
-and NumPy compute them, and the platform's libm computes the powers. The output files' bytes
-depend on every entry (pyarrow writes its version into them and Python's runs the writer), so
-another pyarrow or Python can change a file's hash but never a value."""
+and NumPy compute them, the platform's libm computes the powers, and for the Numba backend
+Numba and llvmlite compile the kernels for the processor, with or without Intel's SVML. The
+output files' bytes depend on every entry (pyarrow writes its version into them and Python's
+runs the writer), so another pyarrow or Python can change a file's hash but never a value."""
 
 
 def _value_difference(run: RunResult, replay: RunResult) -> str | None:

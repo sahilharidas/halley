@@ -69,12 +69,15 @@ from halley.tracing.tracer import trace
 __version__ = "0.1.0"
 
 
-def build(model: type[_Product], **statics: object) -> CompiledModel:
-    """Trace, check, schedule and compile a model with the given build-time settings. A class
-    that sets ``abstract = True`` is refused; build one of its subclasses."""
+def build(model: type[_Product], *, backend: str = "numpy", **statics: object) -> CompiledModel:
+    """Trace, check, schedule and compile a model with the given build-time settings for the
+    named backend: ``"numpy"``, the reference (D16), or ``"numba"`` (``pip install
+    halley[numba]``). A class that sets ``abstract = True`` is refused; build one of its
+    subclasses. ``backend`` is build()'s own argument, so no build-time parameter may take its
+    name."""
     graph = trace(model, statics)
     check(graph)
-    return compile_model(graph, model)
+    return compile_model(graph, model, backend)
 
 
 __all__ = [

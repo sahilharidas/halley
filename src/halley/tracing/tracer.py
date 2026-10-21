@@ -156,6 +156,12 @@ def _resolve_statics(model: type[Product], overrides: dict[str, object]) -> dict
             ) from exc
         for name, hint in hints.items():
             if getattr(hint, "__origin__", None) is Static:
+                if name in _RESERVED_STATICS:
+                    raise BuildError(
+                        f"{klass.__qualname__}.{name} is a build-time parameter, but {name} is "
+                        f"{_RESERVED_STATICS[name]}; rename the parameter",
+                        _class_loc(klass),
+                    )
                 declared[name] = getattr(model, name, _MISSING)
                 args: tuple[object, ...] = getattr(hint, "__args__", ())
                 kinds[name] = args[0] if len(args) == 1 else None
@@ -229,6 +235,12 @@ _RESERVED_NAMES = {
 }
 """Names a variable may not take: the tracer sets the accessors on the instance, where they would
 shadow a ``@var`` of the same name, and ``Product`` reads its class attributes by name."""
+
+_RESERVED_STATICS = {
+    "backend": "build()'s own argument, the backend's name (build(model, backend='numba'))",
+}
+"""Names a build-time parameter may not take: ``build()`` takes them itself, so a parameter of
+that name could never be set."""
 
 
 def _collect_vars(model: type[Product]) -> dict[str, VarDef]:

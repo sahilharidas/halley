@@ -43,8 +43,7 @@ from numpy.typing import NDArray
 
 from halley import ir
 from halley.authoring.contracts import FROM_PREVIOUS, GROUP_KEY, LOCKED_IN_FIELDS
-from halley.codegen import CompiledModel
-from halley.codegen.numpy_backend import run_batch
+from halley.codegen import CompiledModel, backend_named
 from halley.errors import LoadError
 from halley.runtime.invariants import (
     BatchView,
@@ -74,6 +73,19 @@ def _halley_version() -> str:
         return importlib.metadata.version("halley")
     except importlib.metadata.PackageNotFoundError:  # pragma: no cover - not installed
         return "0"
+
+
+IDENTITY_VERSIONS = ("numpy", "numba", "llvmlite")
+"""The entries of a backend's versions (``Backend.versions``) a run id covers beside its name:
+NumPy for every backend, as before backends were chosen, so a NumPy run's id does not move, and
+Numba and llvmlite for the Numba backend, which compile its kernels. The manifest's ``backend``
+block records every entry."""
+
+
+def backend_identity(name: str, versions: Mapping[str, str]) -> dict[str, str]:
+    """The ``backend`` entry of a run identity: the backend's name and the versions of
+    :data:`IDENTITY_VERSIONS` it reports (``{"name": "numpy", "numpy": ...}`` for NumPy)."""
+    return {"name": name, **{k: versions[k] for k in IDENTITY_VERSIONS if k in versions}}
 
 
 NOT_IN_IDENTITY = ("label", "runs_root", "workers")
@@ -445,7 +457,7 @@ def _stage_identity(
         else {"run_id": previous["run_id"], "manifest_sha256": previous["manifest_sha256"]},
         "disclosures": _json_safe(disclosures),
         "settings": settings.identity(),
-        "backend": {"name": compiled.backend, "numpy": np.__version__},
+        "backend": backend_identity(compiled.backend, manifest["backend"]),
         "horizon": horizon,
     }
 
@@ -591,11 +603,12 @@ def run(
     needed = sorted(compiled.schedule.needed)
     parts: dict[str, list[NDArray[Any]]] = {name: [] for name in needed}
     batches: list[list[InvariantResult]] = []
+    backend = backend_named(compiled.backend)
     bs = max(1, settings.batch_size)
     for lo in range(0, n_pol, bs):
         hi = min(lo + bs, n_pol)
         inp = inputs.batch(graph, lo, hi)
-        out = run_batch(compiled.fn, graph, inp, horizon, lanes)
+        out = backend.run_batch(compiled.fn, graph, inp, horizon, lanes)
         batch_scales = {u: s[lo:hi] for u, s in scales.items()}
         results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales, lanes)
         view = BatchView(graph, out, inputs, lo, hi, batch_scales, lanes)
@@ -622,7 +635,7 @@ def run(
     # ------------------------------------------------------------------ run directory
     run_path.mkdir(parents=True, exist_ok=True)
     (run_path / "generated").mkdir(exist_ok=True)
-    (run_path / "generated" / "numpy_backend.py").write_text(compiled.source, encoding="utf-8")
+    (run_path / "generated" / backend.artefact).write_text(compiled.source, encoding="utf-8")
     _copy_input(inputs.model_points.file, run_path / "inputs" / "model_points.parquet")
     for name, t in inputs.tables.items():
         _copy_input(t.file, run_path / "inputs" / "tables" / f"{name}.parquet")
@@ -693,7 +706,7 @@ def run(
         "ir_sha256": compiled.ir_hash,
         "backend": {
             "name": compiled.backend,
-            "numpy": np.__version__,
+            **backend.versions(),
             "pyarrow": pa.__version__,
             "python": sys.version.split()[0],
             "platform": platform.platform(),
@@ -750,7 +763,7 @@ def run(
             "ir_sha256": manifest["ir_sha256"],
             "inputs": _without_paths(manifest["inputs"]),
             "settings": settings.identity(),
-            "backend": {"name": compiled.backend, "numpy": np.__version__},
+            "backend": backend_identity(compiled.backend, manifest["backend"]),
             "horizon": horizon,
         }
 

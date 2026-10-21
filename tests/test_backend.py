@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from halley import (
+    BuildError,
     Column,
     Count,
     Factor,
@@ -25,7 +27,9 @@ from halley import (
     Prob,
     Product,
     RunError,
+    RunResult,
     RunSettings,
+    Static,
     Table,
     at,
     build,
@@ -35,6 +39,7 @@ from halley import (
 )
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
 from halley.runtime import recompute, within
+from halley.runtime.run import backend_identity
 from models import (
     POWER_DEN,
     SIMPLE_SCHEMA,
@@ -519,3 +524,59 @@ def test_an_at_that_fails_for_every_lane_names_every_lane(tmp_path: Path) -> Non
                 settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
                 run_dir=tmp_path / f"ahead-{batch_size}",
             )
+
+
+# ------------------------------------------------------------------------------ backends
+
+PINNED_RUN_ID = "e3424e4c0b6f252f"
+"""The reference case's run id (the ``term_run`` fixture) on NumPy 2.5.4, recorded before
+backends could be chosen (M6 D1)."""
+
+
+def test_the_numpy_backends_run_ids_do_not_move(term_run: RunResult) -> None:
+    """A NumPy run's identity names the backend and the NumPy version, as before the Numba
+    backend existed, so run ids made before it stay valid; the reference case's id is pinned
+    at the NumPy version it was recorded with."""
+    backend = term_run.manifest["backend"]
+    assert backend["name"] == "numpy"
+    assert backend_identity("numpy", backend) == {"name": "numpy", "numpy": np.__version__}
+    if np.__version__ != "2.5.4":
+        pytest.skip(f"the pinned run id was recorded with NumPy 2.5.4, not {np.__version__}")
+    assert term_run.run_id == PINNED_RUN_ID
+
+
+def test_an_unknown_backend_is_a_build_error() -> None:
+    with pytest.raises(
+        BuildError, match=r"^there is no backend 'jax'; the backends are: numba, numpy$"
+    ):
+        build(Growth, backend="jax")
+
+
+def test_the_numba_backend_without_numba_says_how_to_install_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "numba", None)  # import numba now raises ImportError
+    with pytest.raises(
+        BuildError,
+        match=r"^the Numba backend needs numba, which is not installed: "
+        r"pip install halley\[numba\]$",
+    ):
+        build(Growth, backend="numba")
+
+
+def test_a_build_time_parameter_may_not_be_named_backend() -> None:
+    """``backend`` is build()'s own argument, so a ``Static`` of that name could never be set:
+    a BuildError at the class, as a variable named like an accessor is."""
+
+    class Switched(Growth):
+        backend: Static[str] = "fast"
+
+    with pytest.raises(
+        BuildError,
+        match=r"Switched\.backend is a build-time parameter, but backend is build\(\)'s own "
+        r"argument",
+    ) as info:
+        build(Switched)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Switched")
+    assert Path(info.value.loc.file) == Path(__file__)

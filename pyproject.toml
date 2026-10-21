@@ -112,4 +112,9 @@ typeCheckingMode = "strict"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # --strict-markers: an unregistered marker is an error. -rs: every skip prints its reason.
-addopts = "--strict-markers -rs"
+# -m "not numba": the Numba backend's tests compile every product's kernels, over five minutes
+# on a cold cache, so they run on request: uv run pytest -m numba (README, Development).
+addopts = "--strict-markers -rs -m \"not numba\""
+markers = [
+    "numba: the Numba backend against the NumPy reference (D16); a first run compiles every kernel",
+]

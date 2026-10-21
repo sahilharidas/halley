@@ -47,6 +47,12 @@ source, the outputs keyed on `policy_id` with a versioned schema, and the invari
 `halley.explain` shows any policy's value at any month with its formula and inputs; `halley.diff`
 compares two runs; `halley.load_run` reads a run back without the model.
 
+`build(TermAssurance, backend="numba")` generates the Numba backend instead (`pip install
+halley[numba]`): compiled loops from the same IR, held to the NumPy reference within 1e-9 relative
+and bit-identical between its own reruns. Its first build compiles every kernel, which takes a
+while for a product; Numba caches them beside the generated module (under `halley-numba` in the
+system's temporary directory, or `HALLEY_NUMBA_CACHE`), so later builds load them.
+
 A model is written like this (an excerpt of `TermAssurance`):
 
 ```python
@@ -82,9 +88,16 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-ver
 ```bash
 uv sync
 uv run pytest
+uv run pytest -m numba
 uv run ruff check .
 uv run pyright
 ```
+
+The Numba backend's tests (`tests/test_numba.py`, marked `numba`) are deselected by default:
+on a cold kernel cache they take over five minutes, nearly all of it compiling every product's
+kernels (under two minutes once Numba's cache holds them). Run them with `-m numba` before
+committing a change to code generation or the runtime, and in CI as a second job beside the
+default one, keeping Numba's cache directory (`HALLEY_NUMBA_CACHE`) between runs if it can.
 
 `docs/spec/term_assurance_inputs.py` regenerates the reference Parquet inputs from the spec's
 formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spec prints.
@@ -98,7 +111,7 @@ formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spe
 | `src/halley/ir` | typed graph: variables, time offsets, dimensions, source locations; the unit rule table |
 | `src/halley/checker` | units, time references and domains, recursion direction, cycles |
 | `src/halley/scheduler` | orders strongly connected components, assigns time direction |
-| `src/halley/codegen` | NumPy reference backend by code generation, then Numba |
+| `src/halley/codegen` | the backends, generated from the IR: the NumPy reference and Numba |
 | `src/halley/runtime` | data contracts at load, batches, outputs, run manifest, invariants, explain and diff |
 | `src/halley/aggregation` | aggregation stages over group series: portfolio totals and the IFRS 17 CSM roll-forward (NewGroup, InForceGroup) |
 | `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib), the annuities `LevelAnnuity`, `FixedEscalationAnnuity` and `CPILinkedAnnuity` (the annuity spec) and their reference inputs |
