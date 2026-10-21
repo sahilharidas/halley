@@ -13,13 +13,14 @@ locked-in fulfilment cash flows, N, the period close and the months after it, th
 change, and the headline figures section 14 prints, the close also bit for bit against a
 recomputation from the run's own copied inputs (D19); K1 to K7, I11 to I13, M1 and M2 as run-time
 invariants, and K1 and K7 failing on broken stages; the six remeasurement cases of 14.5 and the
-edge cases of 9.7; the shifted world Z1 and Z2 on constructed inputs (12.3, 14.8); G6 and the
-load-time checks of 12.4; the locked-in files held to the group's tau0 and to the curve each is
-read as, the locked-in runs' ILP of 0.0 and actual CPI history, the old basis held to the
-previous run and the new basis to the cur basis's model points; a chain of two periods, whose
-second has tau0 = 12 and tau = 6; batch and horizon independence (D5); reruns, replays and the
-run directory (D19, D21); and the committed reference workbooks, read through their cached
-values.
+edge cases of 9.7, a model point with no survivors at V among them; the shifted world Z1 and Z2
+on constructed inputs (12.3, 14.8); G6 and the load-time checks of 12.4; the locked-in files
+held to the group's tau0 and to the curve each is read as, the locked-in runs' ILP of 0.0, the
+runs' actual CPI history, the old basis held to the previous run and the new basis to the cur
+basis's model points, and the three bases to one build of each class; a chain of two periods,
+whose second has tau0 = 12 and tau = 6; batch and horizon independence (D5); reruns, replays
+and the run directory (D19, D21); and the committed reference workbooks, read through their
+cached values.
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ from halley.aggregation.csm import (
 )
 from halley.authoring.contracts import group_schema
 from halley.products import annuity_data as data
+from halley.products.annuity import CPILinkedAnnuity, LevelAnnuity
 from halley.runtime import within
 
 IF_DIR = Path(__file__).resolve().parent.parent / "docs" / "spec" / "in-force-group"
@@ -252,12 +254,15 @@ class Chain:
         return _file(f"mp_{c}_{self.k}_v")
 
     def at_v(self, name: str, c: str, run_dir: Path, **kw: Any) -> RunResult:
+        """Run ``name`` of class ``c`` at V on its inputs of in-force 5.5, ``kw`` replacing
+        any of them, its model points (``points``) or the class's build (``compiled``)."""
         tables, rf_df, cpi = RUN_INPUTS[name]
         args: dict[str, Any] = {"tables": tables, "rf_df": rf_df, "cpi": cpi, "horizon": T}
         args.update(kw)
         points = args.pop("points", None)
+        compiled = args.pop("compiled", None)
         return _project(
-            self.compiled[c],
+            self.compiled[c] if compiled is None else compiled,
             self.points(name, c) if points is None else points,
             run_dir,
             at=V,
@@ -1242,6 +1247,59 @@ def test_the_edge_cases_of_the_close(
     assert all(r.passed for r in res.invariants)
 
 
+def test_a_model_point_with_no_survivors_at_v_stays_in_the_old_basis(
+    chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """In-force 9.7's last row (3.2, 5.5; C16) through the stage: a model point with no
+    survivors at V is absent from the files at V and present in OLD with its expected
+    in-force. Variant P with the CPI life (policy 12) dead at V: OLD's CPI run projects
+    expected_in_force(REC's CPI run, tau, an empty CPI file at V), and the new and cur bases
+    hold the level run only. So G4's ids(new) == ids(cur), a proper subset of ids(previous), a
+    basis with fewer class runs than OLD, and the provenance of an old run whose class has no
+    file at V (its instalment the previous file's, design section 10) run end to end.
+    FCF_old(0) is the old runs' bel + ra at t = 0 summed with policy 12, FCF_new(0) the level
+    run's alone, delta_FCF_L their difference bit for bit; the provenance records both old
+    runs' derived_from, the membership holds policy 12 in the old basis only, and every
+    invariant holds. cu_act stays the reference period's (payments made before the deaths)."""
+    chain = chains["P"]
+    rec = chain.rec["cpi"]
+    (pid,) = rec.ids.tolist()
+    dead = pq.read_table(_file("mp_cpi_P_v")).slice(0, 0)
+    old_cpi = chain.at_v(
+        "OLD", "cpi", tmp_path / "old-cpi-dead", points=expected_in_force(rec, TAU, dead)
+    )
+    assert old_cpi.ids.tolist() == [pid]
+    n_exp = float(old_cpi.lane("pols_if", pid)[0])
+    assert n_exp == float(rec.lane("pols_if", pid)[TAU]) > 0.0
+    old = [chain.old["level"], old_cpi]
+    new = [chain.new["level"]]
+    res = chain.in_force(
+        tmp_path / "dead", bases={"old": old, "new": new, "cur": [chain.cur["level"]]}
+    )
+    gid = chain.gid
+
+    def one(name: str) -> float:
+        return float(res.lane(name, gid)[0])
+
+    def fcf(runs: list[RunResult]) -> float:  # the series' grouping: totals, then bel + ra
+        return float(_sum_lanes(runs, "bel")[0] + _sum_lanes(runs, "ra")[0])
+
+    assert one("aoc_c") == fcf(old) > fcf([chain.old["level"]])  # policy 12 counted
+    assert one("aoc_d") == fcf(new)
+    assert one("delta_fcf_l") == one("aoc_d") - one("aoc_c")
+    assert one("delta_fcf_l") != chain.lane("delta_fcf_l", 0)
+    derived = [e for e in res.manifest["provenance"] if e["key"] == "derived_from"]
+    assert sorted(e["value"] for e in derived) == sorted((chain.rec["level"].run_id, rec.run_id))
+    assert {e["file"].split(":")[0] for e in derived} == {f"basis old run {r.run_id}" for r in old}
+    membership = pq.read_table(res.run_dir / "inputs" / "membership.parquet").to_pylist()
+    level = chain.old["level"].ids.tolist()[0]
+    assert sorted((m["basis"], m["policy_id"]) for m in membership) == sorted(
+        [("old", level), ("old", pid), ("new", level), ("cur", level)]
+    )
+    failed = [r.name for r in res.invariants if not r.passed]
+    assert not failed, failed
+
+
 # ---------------------------------------------------------- the shifted world (12.3, 14.8)
 
 
@@ -1752,8 +1810,34 @@ def test_the_runs_files_name_the_stages_actual_cpi_history(
     locked-in CPI path by halley.act_sha256; both must be the stage's table cpi_act, the history
     its run directory copies and flags (C9), not one the provenance check finds elsewhere. And
     the history holds exactly the months -26..0, a limit of this version: a longer one is
-    refused by the table's key, naming its range."""
+    refused by the table's key, naming its range.
+
+    The second review's minor: the cur runs' CPI path is a plain file that names no history, so
+    only its rows can hold it to cpi_act (5.3: I_cur(u) = I_act(u) for u <= 0; 3.6). Cur runs on
+    a path whose rows u <= 0 are the recognition path's history were accepted with CSM(0)
+    257512.97 (257517.17), every invariant passing, while the manifest flagged cpi_act as the
+    history the period was measured on. Now a LoadError names the copy and the first month that
+    differs: u = -12, December 2025, published at 100.1 where the recognition path estimated
+    100.0 (the months before agree bit for bit, 5.2)."""
     chain = chains["P"]
+    recognition_history = data.cpi_table(
+        lambda s, u: data.cpi_path(TAU + u) if u <= 0 else data.cpi_current(u),
+        u_lo=data.IF_CPI_U_LO,
+        u_hi=T,
+    )
+    cur = [
+        chain.at_v("CUR", c, tmp_path / f"cur-history-{c}", cpi=recognition_history)
+        for c in CLASSES
+    ]
+    _refused(
+        chain,
+        tmp_path / "cur-history",
+        rf"basis cur run {cur[0].run_id}: scenario input cpi .*holds "
+        rf"{re.escape(repr(data.cpi_path(0)))} for scenario 0, u = -12, but the stage's table "
+        rf"cpi_act .*holds {re.escape(repr(data.cpi_actual(-12)))}; the current CPI path is the "
+        r"actual history at V up to u = 0, I_cur\(u\) = I_act\(u\) \(in-force 5\.3\)",
+        bases=chain.bases(cur=cur),
+    )
     shifted = _shifted_cpi_act()
     _refused(
         chain,
@@ -1804,7 +1888,15 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
     actual in-force CUR has. The old runs on the actual in-force at V (delta_FCF_L was the
     spec's 14.4 'basis change only' 279198.15), derived from a run that is not the previous
     run's, on the expense table typed at V prices without its rebase, or on the version 2 base
-    table, and the new runs on the expected in-force, are each a LoadError naming the copy."""
+    table, and the new runs on the expected in-force, are each a LoadError naming the copy.
+
+    And the second review's major: every run is an ordinary projection of one model (5.5, C17),
+    but only the runs' inputs were compared. The old runs built with include_inv_exp=False
+    (delta_FCF_L was 673068.25 and CSM(0) 83727.68), the old CPI run with cpi_lag_m=2 (CSM(0)
+    251035.53) and the new and cur runs without investment expenses (delta_FCF_L 283837.60) each
+    passed every invariant. Each is now a LoadError naming both runs and their builds; so are a
+    renamed subclass projecting policy 11 in the old basis and all three bases on a build other
+    than the previous run's."""
     chain = chains["P"]
     previous = chain.recognised.run_id
     rec_level = chain.rec["level"].run_id
@@ -1870,6 +1962,86 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
         rf"basis cur run {chain.cur['level'].run_id}, which holds policy 11",
         bases=chain.bases(new=expected),
     )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        no_inv = {
+            "level": build(LevelAnnuity, include_inv_exp=False),
+            "cpi": build(CPILinkedAnnuity, include_inv_exp=False),
+        }
+        lag_2 = build(CPILinkedAnnuity, cpi_lag_m=2)
+        renamed = build(Renamed, include_inv_exp=False)
+
+    def ir(compiled: CompiledModel) -> str:
+        return compiled.ir_hash[:12]
+
+    level, cpi = chain.compiled["level"], chain.compiled["cpi"]
+    at_v = {
+        name: [
+            chain.at_v(name, c, tmp_path / f"{name}-no-inv-{c}", compiled=no_inv[c])
+            for c in CLASSES
+        ]
+        for name in ("OLD", "NEW", "CUR")
+    }
+    _refused(
+        chain,
+        tmp_path / "old-no-inv",
+        rf"basis old run {at_v['OLD'][0].run_id} \(halley\.products\.annuity\.LevelAnnuity, "
+        rf"ir_sha256 {ir(no_inv['level'])}\.\.\., backend numpy\) and basis new run "
+        rf"{chain.new['level'].run_id} \(halley\.products\.annuity\.LevelAnnuity, ir_sha256 "
+        rf"{ir(level)}\.\.\., backend numpy\) project class "
+        r"halley\.products\.annuity\.LevelAnnuity on different builds; the runs of bases old, "
+        r"new and cur are ordinary projections of one model .*\(in-force 5\.5, C17\)",
+        bases=chain.bases(old=at_v["OLD"]),
+    )
+    old_lag = [
+        chain.old["level"],
+        chain.at_v("OLD", "cpi", tmp_path / "old-lag-2-cpi", compiled=lag_2),
+    ]
+    _refused(
+        chain,
+        tmp_path / "old-lag-2",
+        rf"basis old run {old_lag[1].run_id} \(.*CPILinkedAnnuity, ir_sha256 {ir(lag_2)}\.\.\., "
+        rf"backend numpy\) and basis new run {chain.new['cpi'].run_id} \(.*CPILinkedAnnuity, "
+        rf"ir_sha256 {ir(cpi)}\.\.\., backend numpy\) project class .*CPILinkedAnnuity on "
+        r"different builds",
+        bases=chain.bases(old=old_lag),
+    )
+    _refused(
+        chain,
+        tmp_path / "new-and-cur-no-inv",
+        rf"basis old run {chain.old['level'].run_id} \(.*LevelAnnuity, ir_sha256 "
+        rf"{ir(level)}\.\.\., backend numpy\) and basis new run {at_v['NEW'][0].run_id} "
+        rf"\(.*LevelAnnuity, ir_sha256 {ir(no_inv['level'])}\.\.\., backend numpy\) project "
+        r"class .*LevelAnnuity on different builds",
+        bases=chain.bases(new=at_v["NEW"], cur=at_v["CUR"]),
+    )
+    old_renamed = [
+        chain.at_v("OLD", "level", tmp_path / "old-renamed-level", compiled=renamed),
+        chain.old["cpi"],
+    ]
+    _refused(
+        chain,
+        tmp_path / "renamed",
+        rf"basis old run {old_renamed[0].run_id} projects policy 11 on .*Renamed, ir_sha256 "
+        rf"{ir(renamed)}\.\.\., backend numpy, but basis new run {chain.new['level'].run_id} on "
+        rf".*LevelAnnuity, ir_sha256 {ir(level)}\.\.\., backend numpy; the runs of bases old",
+        bases=chain.bases(old=old_renamed),
+    )
+    _refused(
+        chain,
+        tmp_path / "all-no-inv",
+        rf"basis old run {at_v['OLD'][0].run_id} projects on .*LevelAnnuity, ir_sha256 "
+        rf"{ir(no_inv['level'])}\.\.\., backend numpy, but basis cur run {rec_level} of the "
+        rf"previous run {previous}, which its model points are derived from, on .*LevelAnnuity, "
+        rf"ir_sha256 {ir(level)}\.\.\., backend numpy; basis old projects the previous run's "
+        r"members on the previous run's model as well as its tables",
+        bases={name.lower(): runs for name, runs in at_v.items()},
+    )
+
+
+class Renamed(LevelAnnuity):
+    """The level annuity under another name, as a variant subclass would be (D9): a basis run
+    of it is made by another build than one of ``LevelAnnuity``."""
 
 
 class Unlocked(InForceGroup):
@@ -1888,17 +2060,45 @@ class Unprevious(InForceGroup):
     model_point = group_schema(locked_in=True)
 
 
+class Historyless(InForceGroup):
+    """An in-force stage that reads no actual CPI history, so its runs' files would be refused
+    only at load, by the first whose metadata names the history."""
+
+    assumption_tables = ()
+
+
+class Unrecognised(InForceGroup):
+    """An in-force stage that declares no composed curve at recognition, so the loader would
+    hold no p_rec to the group's locked-in basis."""
+
+    scenario_inputs = tuple(s for s in InForceGroup.scenario_inputs if s.name != "p_rec")
+
+
 def test_the_stage_is_checked_at_build_and_refused_by_run(
     chains: dict[str, Chain], compiled_in_force_group: CompiledModel, tmp_path: Path
 ) -> None:
-    """``rebuilds_locked_in`` is a bool, and a stage that sets it declares the locked-in basis
-    and, reading the old basis, the previous run it is held to (a BuildError at the class, the
-    user's model source, otherwise); ``run()``, which reads no previous run and checks no hash,
-    refuses the in-force stage before anything is written."""
+    """``rebuilds_locked_in`` is a bool, and a stage that sets it declares the locked-in basis,
+    the scenario inputs p_l and p_rec and the table cpi_act the loader holds its files to, and,
+    reading the old basis, the previous run it is held to (a BuildError at the class, the
+    user's model source, otherwise; the second review's nit for cpi_act and the curves);
+    ``run()``, which reads no previous run and checks no hash, refuses the in-force stage
+    before anything is written."""
     for broken, match in (
         (Unlocked, r"Unlocked is rebuilds_locked_in.*discount_rec_sha256"),
         (Stringly, r"Stringly\.rebuilds_locked_in is True or False, not 'yes'"),
         (Unprevious, r"Unprevious is rebuilds_locked_in and reads basis old.*no prev_run_id"),
+        (
+            Historyless,
+            r"Historyless is rebuilds_locked_in, so the loader holds the locked-in curves p_l "
+            r"and p_rec to its groups' locked-in basis and its runs' CPI history to the actual "
+            r"history cpi_act \(in-force 3\.6, 5\.1, 5\.2, 5\.3\), but it declares no table "
+            r"cpi_act\n  at Historyless",
+        ),
+        (
+            Unrecognised,
+            r"Unrecognised is rebuilds_locked_in, .*but it declares no scenario input p_rec\n  "
+            r"at Unrecognised",
+        ),
     ):
         with pytest.raises(BuildError, match=match) as info:
             build(broken)

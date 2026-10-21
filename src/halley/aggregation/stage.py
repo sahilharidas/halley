@@ -562,15 +562,20 @@ class Aggregation(Product):
       the stage's ``p_rec``), the runs discount on the stage's own ``p_l`` file and read an
       ``ilp`` table of 0.0 (in-force C17);
     * every file of a basis run built from the actual CPI history names the stage's table
-      ``cpi_act`` (:func:`_check_actual_cpi`);
+      ``cpi_act``, and the cur runs' CPI path holds its rows for u <= 0 bit for bit
+      (:func:`_check_actual_cpi`);
+    * the old, new and cur runs are made by one build of each class, its ``ir_sha256``, on one
+      backend, every policy by the same build in each basis (in-force 5.5, C17;
+      :func:`_check_one_build`);
     * the old basis is the previous run's: each old run's model points are the expected
-      in-force derived from a cur-basis run of the previous aggregation run, and its
-      non-financial tables are that run's, or their rebase to V prices; the new runs project
-      the cur runs' model point files (:func:`_check_previous_basis`).
+      in-force derived from a cur-basis run of the previous aggregation run, its build is that
+      run's, and its non-financial tables are that run's, or their rebase to V prices; the new
+      runs project the cur runs' model point files (:func:`_check_previous_basis`).
 
     The stage's groups declare the locked-in hashes (``group_schema(locked_in=True)``) and, with
-    an old basis, ``prev_run_id``; a BuildError at the class otherwise. ``InForceGroup`` sets
-    it."""
+    an old basis, ``prev_run_id``, and the stage declares the scenario inputs ``p_l`` and
+    ``p_rec`` and the table ``cpi_act``; a BuildError at the class otherwise. ``InForceGroup``
+    sets it."""
 
     @property
     def group(self) -> ModelPoint:
@@ -691,15 +696,20 @@ def _check_flags(cls: type[Aggregation], bases: Mapping[str, Basis]) -> None:
     ``p_l``, and a stage that discloses the current curve the cur basis and ``df_cur``: the
     curves the loader verifies against that basis's runs (:func:`_check_composed_curve`); a
     stage that rebuilds its locked-in files declares the locked-in hashes its files are held to
-    (:func:`_check_locked_in`) and, when it reads the old basis, the previous run that basis is
-    held to (``prev_run_id``, :func:`_check_previous_basis`). A BuildError at the class
-    otherwise."""
+    (:func:`_check_locked_in`), the locked-in curves ``p_l`` and ``p_rec`` it reads as scenario
+    inputs, which the loader holds to those hashes, the table ``cpi_act``, the actual CPI
+    history its runs' files are held to (:func:`_check_actual_cpi`), and, when it reads the old
+    basis, the previous run that basis is held to (``prev_run_id``,
+    :func:`_check_previous_basis`). A BuildError at the class otherwise: without ``cpi_act`` the
+    class would be refused only at load, by the first run whose files name their history, and
+    without a curve never, since the loader has no file of it to check."""
     for name in _FLAGS:
         value: object = getattr(cls, name)
         if not _is_bool(value):
             raise BuildError(
                 f"{cls.__qualname__}.{name} is True or False, not {value!r}", _class_loc(cls)
             )
+    scenarios = {getattr(s, "name", None) for s in cls.scenario_inputs}
     if cls.rebuilds_locked_in is True:
         schema = cls.model_point
         fields = {} if schema is None else schema.decls()
@@ -718,7 +728,19 @@ def _check_flags(cls: type[Aggregation], bases: Mapping[str, Basis]) -> None:
                 "declare no prev_run_id; build the schema with group_schema(previous=True)",
                 _class_loc(cls),
             )
-    scenarios = {getattr(s, "name", None) for s in cls.scenario_inputs}
+        tables = {getattr(t, "name", None) for t in cls.assumption_tables}
+        missing = [
+            *(f"scenario input {curve}" for curve in LOCKED_IN_CURVES if curve not in scenarios),
+            *([] if ACTUAL_CPI in tables else [f"table {ACTUAL_CPI}"]),
+        ]
+        if missing:
+            raise BuildError(
+                f"{cls.__qualname__} is rebuilds_locked_in, so the loader holds the locked-in "
+                f"curves {' and '.join(LOCKED_IN_CURVES)} to its groups' locked-in basis and "
+                f"its runs' CPI history to the actual history {ACTUAL_CPI} (in-force 3.6, 5.1, "
+                f"5.2, 5.3), but it declares no {' and no '.join(missing)}",
+                _class_loc(cls),
+            )
     for flag, curve, what in (
         ("recognised_at_valuation", RECOGNISED_CURVE, "its locked-in curve"),
         ("discloses_current_curve", PARA_120_CURVE, "the current curve it discloses"),
@@ -1134,6 +1156,11 @@ the group's too."""
 LOCKED_IN_CPI: Final = "cpi"
 """The scenario input through which the locked-in runs (bases old and new) read the spliced CPI
 path (``locked_in_cpi``): its metadata ``rec_sha256`` must be the group's ``cpi_rec_sha256``."""
+
+CURRENT_CPI: Final = "cpi"
+"""The scenario input through which the cur runs read the current CPI path (in-force 5.3), a
+plain file built outside the engine: its rows u <= 0 are the stage's table ``cpi_act``, bit for
+bit (:func:`_check_current_history`)."""
 
 ILP_TABLE: Final = ("table", "ilp")
 """A projection run's illiquidity premium table, by (kind, name) among its copied inputs: the
@@ -2024,6 +2051,71 @@ def _check_structure(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
         )
 
 
+class _Build(NamedTuple):
+    """The model a projection run was made by, from its verified manifest: the model's name,
+    its ``ir_sha256`` (the class with its build-time settings, which ``build`` hashes into the
+    IR) and the backend's name."""
+
+    model: str
+    ir_sha256: str
+    backend: str
+
+    def __str__(self) -> str:
+        return f"{self.model}, ir_sha256 {self.ir_sha256[:12]}..., backend {self.backend}"
+
+
+def _build_of(result: RunResult) -> _Build:
+    manifest = result.manifest
+    model: object = manifest.get("model")
+    backend: object = manifest.get("backend")
+    return _Build(
+        str(model.get("name")) if _is_mapping(model) else "?",
+        str(manifest.get("ir_sha256")),
+        str(backend.get("name")) if _is_mapping(backend) else "?",
+    )
+
+
+_ONE_MODEL: Final = (
+    f"the runs of bases {OLD_BASIS}, {NEW_BASIS} and {CUR_BASIS} are ordinary projections of "
+    "one model that differ only in their inputs (in-force 5.5, C17), so that delta_FCF_L "
+    "measures the change in the tables and the in-force, and the cur runs the change in the "
+    "financial inputs: build each class once and project every basis on it"
+)
+
+
+def _check_one_build(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
+    """The old, new and cur runs project on one model, for a stage that rebuilds its locked-in
+    files (in-force 5.5: "Every run is an ordinary projection of section 6 ... They differ only
+    in the inputs below"; C17: the engine reuses the annuity model unchanged). Every run of a
+    class (the manifest's model name) across the three bases carries one build, its
+    ``ir_sha256``, on one backend, and every policy is projected by one build in every basis
+    that holds it, which also catches a subclass under another name. A build-time setting that
+    differs (``include_inv_exp=False`` in the old runs, ``cpi_lag_m=2`` in one of them, the new
+    and cur runs on another build than the old) moves delta_FCF_L, N(0) or the months after V
+    by a model change the group did not make, with every hash the stage checks and every
+    invariant intact. The old runs' build is held to the previous run's in
+    :func:`_check_previous_basis`. A LoadError names both runs and their builds."""
+    by_class: dict[str, tuple[_BasisRun, _Build]] = {}
+    by_policy: dict[Any, tuple[_BasisRun, _Build]] = {}
+    for basis in (OLD_BASIS, NEW_BASIS, CUR_BASIS):
+        for r in runs.get(basis, ()):
+            build = _build_of(r.result)
+            first, known = by_class.setdefault(build.model, (r, build))
+            if known != build:
+                raise LoadError(
+                    f"basis {first.basis} run {first.run_id} ({known}) and basis {r.basis} run "
+                    f"{r.run_id} ({build}) project class {build.model} on different builds; "
+                    f"{_ONE_MODEL}"
+                )
+            for m in r.members:
+                first, known = by_policy.setdefault(m.pid, (r, build))
+                if known != build:
+                    raise LoadError(
+                        f"basis {first.basis} run {first.run_id} projects policy {m.pid} on "
+                        f"{known}, but basis {r.basis} run {r.run_id} on {build}; {_ONE_MODEL}"
+                    )
+
+
 _CURVE_METADATA: Final = (("source_sha256", "discount_rec_sha256"), ("ilp_sha256", "ilp_sha256"))
 """The metadata of a locked-in curve (``locked_in_curve``, design section 10) and the group's
 hash each must equal."""
@@ -2202,8 +2294,9 @@ def _check_actual_cpi(
     stage's own table :data:`ACTUAL_CPI`, the history the run directory copies with its estimate
     flag (in-force 3.6, 5.2, 5.4; C9). Otherwise a path spliced, or a table rebased, on another
     history (a previous period's, say) rebuilds bit for bit from a file the provenance check
-    finds elsewhere, while the stage records a history nothing was built from. A LoadError
-    names the input."""
+    finds elsewhere, while the stage records a history nothing was built from. The cur runs'
+    CPI path, which names no history, is held to the table by its rows
+    (:func:`_check_current_history`). A LoadError names the input."""
     act = table_files.get(ACTUAL_CPI)
     for rs in runs.values():
         for r in rs:
@@ -2226,6 +2319,79 @@ def _check_actual_cpi(
                             "built from the actual CPI history the stage reads, copies and "
                             "flags (in-force 5.2, 5.4, C9)"
                         )
+    _check_current_history(act, runs)
+
+
+_CURRENT_HISTORY: Final = (
+    "the current CPI path is the actual history at V up to u = 0, I_cur(u) = I_act(u) (in-force "
+    "5.3), the history the stage reads, copies and flags as the one the period was measured on "
+    "(3.6, C9)"
+)
+
+_CPI_COLUMN: Final = "cpi"
+"""The value column of a CPI file: the table ``cpi_act``'s and that of the runs' scenario input
+``cpi``, whose column is its name."""
+
+
+def _history_of(f: ReadFile) -> tuple[list[int], dict[tuple[int, int], float]]:
+    """A CPI file's rows by (scenario, u), scenario 0 for a file without a scenario column (the
+    table ``cpi_act``), and its scenarios; a missing column or a repeated row is a LoadError
+    naming the file."""
+    cols = table_columns(f)
+    for name in ("u", _CPI_COLUMN):
+        if name not in cols:
+            raise LoadError(f"{f.where}: column {name} is missing")
+    months: list[int] = [int(u) for u in cols["u"].tolist()]
+    scenarios: list[int] = (
+        [int(s) for s in cols["scenario"].tolist()] if "scenario" in cols else [0] * len(months)
+    )
+    values: list[float] = [float(x) for x in cols[_CPI_COLUMN].tolist()]
+    rows: dict[tuple[int, int], float] = {}
+    for s, u, x in zip(scenarios, months, values, strict=True):
+        if (s, u) in rows:
+            raise LoadError(f"{f.where}: holds two rows for scenario {s}, u = {u}")
+        rows[s, u] = x
+    return sorted(set(scenarios)), rows
+
+
+def _check_current_history(act: ReadFile | None, runs: Mapping[str, Sequence[_BasisRun]]) -> None:
+    """Each cur run's CPI path holds the actual history at V for u <= 0 (in-force 5.3: I_cur(u)
+    = I_act(u) for u <= 0; 3.6: ``cpi_act`` is used by the current path): every month the
+    stage's table :data:`ACTUAL_CPI` holds from the path's first month to 0 equals the table's
+    row bit for bit, in every scenario. The current path is a plain file, built outside the
+    engine with no metadata naming its history, so its rows are compared: a path whose rows
+    u <= 0 are another history (the recognition path's, say) moves the escalation of month 1
+    and the expense inflation, and with them N(0), FCF_g(0) and the months after V, while the
+    stage records and flags ``cpi_act`` as the history the period was measured on. A LoadError
+    names the copy, the scenario and the first month that differs."""
+    history: list[tuple[int, float]] | None = None
+    for r in runs.get(CUR_BASIS, ()):
+        f = r.scenario(CURRENT_CPI)
+        if f is None:
+            continue
+        if act is None:
+            raise LoadError(
+                f"{f.where}: its rows u <= 0 are the actual CPI history at V, but the stage "
+                f"reads no table {ACTUAL_CPI}; {_CURRENT_HISTORY}"
+            )
+        if history is None:  # one path, no scenario column: its rows by u, ascending
+            history = sorted((u, x) for (_s, u), x in _history_of(act)[1].items())
+        scenarios, path = _history_of(f)
+        first = min((u for _s, u in path), default=0)
+        for s in scenarios:
+            for u, want in history:
+                if u < first or u > 0:
+                    continue
+                got = path.get((s, u))
+                if got is None:
+                    raise LoadError(
+                        f"{f.where}: holds no row for scenario {s}, u = {u}; {_CURRENT_HISTORY}"
+                    )
+                if got.hex() != want.hex():
+                    raise LoadError(
+                        f"{f.where}: holds {got!r} for scenario {s}, u = {u}, but the stage's "
+                        f"table {ACTUAL_CPI} ({act.where}) holds {want!r}; {_CURRENT_HISTORY}"
+                    )
 
 
 def _check_previous_basis(
@@ -2238,6 +2404,10 @@ def _check_previous_basis(
     * each old run's model point copy names, by ``halley.derived_from``, a run of the previous
       aggregation run's cur basis, whose expected in-force at V it is (the provenance check
       rebuilds it with ``expected_in_force``), never the actual in-force retyped;
+    * each old run is made by that run's build, the same ``ir_sha256`` (C17: one model, reused
+      unchanged; the backend may differ between periods, within D16's tolerance), which with
+      :func:`_check_one_build` holds the new and cur runs to it too: a model change between
+      periods is not a change this stage measures;
     * each old run's non-financial tables (every table but :data:`FINANCIAL_INPUTS`) are that
       run's tables of the same names, by sha256, or a rebase of one (``halley.rebased_from``
       naming it, which the provenance check rebuilds), the expense table in V prices (5.4);
@@ -2245,7 +2415,7 @@ def _check_previous_basis(
       actual in-force and instalments at V).
 
     Otherwise delta_FCF_L measures a basis change the group did not make, or none it did, and
-    every invariant still holds. A LoadError names the copy."""
+    every invariant still holds. A LoadError names the copy, or the run and both builds."""
     recorded: object = prev.result.manifest.get("bases")
     entries: object = recorded.get(CUR_BASIS) if _is_mapping(recorded) else None
     previous_cur = (
@@ -2277,6 +2447,16 @@ def _check_previous_basis(
                 f"projects the previous run's members from that run (in-force 3.4): {build}"
             )
         then = finder.run(source)
+        who = f"basis {CUR_BASIS} run {source} of {prev.who}"
+        built, was = _build_of(r.result), _build_of(then)
+        if built.ir_sha256 != was.ir_sha256:
+            raise LoadError(
+                f"basis {OLD_BASIS} run {r.run_id} projects on {built}, but {who}, which its "
+                f"model points are derived from, on {was}; basis {OLD_BASIS} projects the "
+                "previous run's members on the previous run's model as well as its tables, so "
+                "that delta_FCF_L is a change the group made, never a model change (in-force "
+                "3.4, 5.5, C17)"
+            )
         tables: Mapping[str, Any] = then.manifest["inputs"]["tables"]
         before = {n: str(e["sha256"]) for n, e in tables.items() if n not in FINANCIAL_INPUTS}
         now = {
@@ -2284,7 +2464,6 @@ def _check_previous_basis(
             for (kind, n), copy in r.inputs.items()
             if kind == "table" and n not in FINANCIAL_INPUTS
         }
-        who = f"basis {CUR_BASIS} run {source} of {prev.who}"
         if set(before) != set(now):
             raise LoadError(
                 f"basis {OLD_BASIS} run {r.run_id} reads the non-financial tables "
@@ -2825,16 +3004,19 @@ def load_aggregation_inputs(
     and G4 against its members, or, without one, one group key per policy across the bases;
     every member mapped to exactly one group row, issued on its recognition date; the stage's
     member rules on every run of their bases (:func:`_check_member_rules`); the membership as
-    a table (:func:`_membership_file`); the structural hashes; the locked-in hashes (for a
-    stage that rebuilds its locked-in files, with their sources, curves and the group's
-    ``tau0``, :func:`_check_locked_in`, and the actual CPI history they name,
-    :func:`_check_actual_cpi`), and for
-    a stage recognised at the valuation date its locked-in curve, and for a stage that
+    a table (:func:`_membership_file`); the structural hashes; for a stage that rebuilds its
+    locked-in files, one build of each class across the old, new and cur bases
+    (:func:`_check_one_build`); the locked-in hashes (for a stage that rebuilds its locked-in
+    files, with their sources, curves and the group's ``tau0``, :func:`_check_locked_in`, and
+    the actual CPI history they name and the cur runs' CPI path holds,
+    :func:`_check_actual_cpi`), and for a stage recognised at the valuation date its locked-in
+    curve, and for a stage that
     discloses the current curve its ``df_cur``, against the cur basis's runs
     (:func:`_check_composed_curve`); the derived group fields, after the group's fixed
     attributes are held to the previous run's (:func:`_check_fixed`); for a stage that rebuilds
     its locked-in files, the old basis against the previous run and the new basis's model
-    points against the cur basis's (:func:`_check_previous_basis`); the provenance of every
+    points against the cur basis's, and the old runs' build against the previous run's
+    (:func:`_check_previous_basis`); the provenance of every
     file that names a source; the group series, summed in ascending policy id
     across each basis's runs (:func:`group_series`); a horizon below the cur basis's against a
     stage that reads its series to the run-off (:func:`_check_run_off`); and the manifest
@@ -2875,6 +3057,8 @@ def load_aggregation_inputs(
     member_rules = _check_member_rules(stage, runs, valuation_date)
     membership = _membership_file(runs)
     _check_structure(runs)
+    if stage.rebuilds_locked_in:
+        _check_one_build(runs)
     stage_files = {n: read_source(s, f"scenario input {n}") for n, s in (scenarios or {}).items()}
     table_files = {n: read_source(s, f"table {n}") for n, s in (tables or {}).items()}
     locked_in: dict[str, dict[str, Any]] = {}

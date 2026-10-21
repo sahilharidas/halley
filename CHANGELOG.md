@@ -437,9 +437,11 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   is the sum of its monthly releases), the ignored timing convexity, the coverage-unit approach
   as built, the C11 period allocation and the C17 locked-in runs.
 - A stage class may set `rebuilds_locked_in` (a bool; `InForceGroup` sets it, and its groups
-  must declare the locked-in hashes and, when it reads the basis `old`, `prev_run_id`, a
-  BuildError at the class otherwise). The loader then holds its locked-in runs and files to
-  what they were built from, each a LoadError naming the file before anything is written, since
+  must declare the locked-in hashes and, when it reads the basis `old`, `prev_run_id`, and the
+  stage itself the scenario inputs `p_l` and `p_rec` and the table `cpi_act`, a BuildError at
+  the class otherwise: without them the loader would check those files only when a run's
+  metadata named them, or never). The loader then holds its locked-in runs and files to what
+  they were built from, each a LoadError naming the file before anything is written, since
   each of these rebuilds bit for bit from its own metadata and passes every invariant:
   - every input checked against the group's locked-in hashes (the stage's `p_l` and `p_rec`,
     the old and new runs' `rf_df` and `cpi`) carries `halley.rebased_from`, so the provenance
@@ -452,12 +454,20 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
     (C17: P_L holds the premium already, so another would count it twice);
   - every file of a basis run that names the actual CPI history it was built from
     (`halley.act_sha256` of the locked-in CPI path, `halley.cpi_act_sha256` of a rebased expense
-    table) names the stage's table `cpi_act`;
+    table) names the stage's table `cpi_act`; the cur runs' CPI path, a plain file that names
+    no history, holds the table's rows bit for bit from its first month to `u = 0`, in every
+    scenario (in-force 5.3: `I_cur(u) = I_act(u)` for `u <= 0`), and a LoadError names the copy,
+    the scenario and the first month that differs;
+  - the runs of the bases `old`, `new` and `cur` are ordinary projections of one model (in-force
+    5.5, C17): every run of a class carries one `ir_sha256` (the class with its build-time
+    settings, such as `include_inv_exp` or `cpi_lag_m`) on one backend, and each policy is
+    projected by one build in every basis that holds it, so a subclass under another name is
+    caught too; a LoadError names both runs and their builds;
   - each old run's model point copy carries `halley.derived_from` naming a run of the previous
-    aggregation run's cur basis (the expected in-force at V, never retyped), and its
-    non-financial tables are that run's by sha256, or a rebase of one (`halley.rebased_from`,
-    the expense table in V prices); each new run reads the model point file of the cur run that
-    holds its policies.
+    aggregation run's cur basis (the expected in-force at V, never retyped), its `ir_sha256` is
+    that run's (the backend may differ between periods), and its non-financial tables are that
+    run's by sha256, or a rebase of one (`halley.rebased_from`, the expense table in V prices);
+    each new run reads the model point file of the cur run that holds its policies.
 
   A variable may not be named `rebuilds_locked_in` in a stage.
 - The provenance check finds a source in the previous runs back to the group's recognition (each
