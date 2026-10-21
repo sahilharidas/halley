@@ -246,9 +246,12 @@ class BatchView:
         self.H = inputs.H
         self.P = hi - lo
         self.S = inputs.n_scenarios
-        self.ids = inputs.ids[lo:hi]
+        # read-only like every array the view returns: the ids are the loaded inputs' own (a
+        # write would rename the policies of the run's result), and t is shared by every
+        # invariant of the batch
+        self.ids = _read_only(inputs.ids[lo:hi])
         self.lanes = lanes
-        self.t = np.arange(self.H + 1, dtype=np.int64).reshape(-1, 1, 1)
+        self.t = _read_only(np.arange(self.H + 1, dtype=np.int64).reshape(-1, 1, 1))
         self.mp = _Fields(inputs.model_points.columns, lo, hi)
         self.run = _Run(inputs.run)
 
@@ -289,7 +292,9 @@ class BatchView:
             )
         if (idx < 0).any() or (idx > self.H).any():
             raise RunError(f"a.at({name!r}, index): a month is outside 0..{self.H}")
-        return np.take_along_axis(values, np.broadcast_to(idx, (1, self.P, self.S)), axis=0)
+        return _read_only(
+            np.take_along_axis(values, np.broadcast_to(idx, (1, self.P, self.S)), axis=0)
+        )
 
     def _scenario(self, name: str, lo: int, hi: int) -> NDArray[np.float64]:
         sc = self._inputs.scenarios.get(name)

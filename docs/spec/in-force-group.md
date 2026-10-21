@@ -162,6 +162,8 @@ One row per group in the `groups` file. These are the inputs the annuity spec's 
 | `prev_run_id` | string | | names a run directory whose manifest the loader reads | the recognition run of the variant |
 | locked-in basis | three hashes | | the discount file at recognition, the ILP table and the locked-in CPI file of section 5.2, fixed for the life of the group (B72(b)) | assigned by the loader to the files of 3.6 |
 
+*Engine note (added by the engine author on 2026-10-21; not part of this specification, and nothing above was changed to match the engine).* The engine's third locked-in hash is the recognition CPI path `cpi_rec` of 3.6 (the groups file's field `cpi_rec_sha256`), which is fixed for the group's life. The locked-in CPI file `cpi_locked` of 5.2 splices the actual history to `V` and so changes every period; the engine verifies it through its `halley.rec_sha256` metadata, which must equal the group's `cpi_rec_sha256`, and through the provenance rebuild (`locked_in_cpi` from `cpi_act` and `cpi_rec`), not by a hash of its own in the groups file. This reads 3.3's "fixed for the life of the group" over the file name of 3.3 and 13, pending the author.
+
 ### 3.4 What the previous run supplies
 
 Read from the run named by `prev_run_id`, through the hashes in its manifest (D21), never retyped:
@@ -970,6 +972,8 @@ What milestones M9 and M11 need from this document; the engine's syntax for the 
 | Outputs and manifest | 11 | the lines of 11.1 and the five values of 11.2 per group; the manifest records `prev_run_id`, the three locked-in hashes, the CPI estimate flag and the period-allocation note of C11 |
 | Checker rules exercised | 12.4 | G1 to G6 and the `groups` rules; J = 1 is a check in one place, not a shape assumption (D4) |
 
+*Engine note (added by the engine author on 2026-10-21; not part of this specification, and nothing above was changed to match the engine).* The engine's in-force stage is `InForceGroup` (M11), recorded in `docs/spec/annuity.md`, "Implementation notes and deviations", "In-force stage": the stage table `cpi_act` (the actual history of 3.6, `u = -26..0`, which no formula reads and from which the loader rebuilds the old and new runs' rebased expense table and locked-in CPI path), the load-time checks of a stage that rebuilds its locked-in files (each locked-in file rebuilt at the group's `tau0`, the actual CPI history, one build per policy across the bases, the old basis held to the previous run), the note on the period's single release (C12) in place of the monthly-step note, and the disclosed labels of the analysis of change of 11.2 (`aoc_a` to `aoc_e`, `aoc_ba`, `aoc_cb`, `aoc_dc`, `aoc_ed`).
+
 ## 16. Decision log
 
 Each item is one convention chosen in this document, with the reason. Object by number. Items the annuity spec already fixes (the projection, the monthly aggregation, Method 1 coverage units, the Example 8 loss-component ratio, the remeasurement rules) are not repeated.
@@ -1027,6 +1031,10 @@ Items 10 onward were raised by the spreadsheet builder (2026-10-17) while transc
 20. **I8 as a sheet check (12.1).** I9 is the CPI class only, and I8 (level class, `ann_pp(t) = instalment_pm` exactly) is not marked **(sheet)**. Should the level sheets carry I8 as a sheet check in I9's place? The spreadsheet builder's `checks` sheet shows the text "n/a (level class)" for I9 on the four level sheets, which `AND()` ignores.
 21. **`cu_act` as two typed totals (13).** Section 13 gives the life-month stories behind `cu_act` and says "the inputs are the two totals". Should the stories be reproduced as formulas? The spreadsheet builder typed `cu_act` as the two totals, 1667000 and 1640400, and did not reproduce the life-month stories as formulas.
 22. **One `esc_factor` formula on every sheet (6.3, C17).** Section 6.3 gives `esc_factor(t) = 1` for the level class and the `where(anniv(t), ...)` form for the CPI class, and marks `anniv` "the CPI class only"; C17 has one sheet layout copied eight times with different inputs. Is one formula on every sheet acceptable? The spreadsheet builder used `IF(class = "CPI", IF(anniv, I(t - L) / I(t - L - 12), 1), 1)` on every sheet, with the class read from the sheet's constants block, so that the eight (run, policy) sheets share one layout; `anniv` is computed on the level sheets too.
+
+Item 23 was added by the engine author (2026-10-21); it is not part of this specification as reviewed.
+
+23. **Instalment of a model point with no survivors at `V` (5.5, C16).** `OLD` carries the actual instalment at `V`, but a model point with no survivors has no row at `V`; the engine (`expected_in_force`) keeps the previous file's `instalment_pm`, the last one known. With an anniversary inside the period its expected escalation is then reported in `C - B` rather than in `delta_FCF_L`. Confirm, or give the rule.
 
 ## Sources
 

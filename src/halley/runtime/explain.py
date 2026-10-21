@@ -235,7 +235,10 @@ def _pow(a: Any, b: Any, array_power: bool) -> Any:
     An array exponent is libm's pow in the generated code only when the batch's shapes do not
     broadcast it into the power loop (:func:`~halley.codegen.numpy_backend.value_kind`). An
     exponent built from the month column alone (``v_m ** t``, ``-12 / _t[1:H+1]`` in a
-    whole-mode ``ann_spot``) is pow at every shape measured, but a model point field exponent
+    whole-mode ``ann_spot``) is pow at every shape measured over a window of two or more months
+    (over a one-month window, H = 1 for a formula from t = 1, the month column is a size-one
+    array and takes the fast path at every batch size, so this interpreter differs from the
+    stored value in the last place there), but a model point field exponent
     (``x(t) ** self.mp.k``) whose value is 0.5, 2 or -1 takes the fast path in a batch of one
     policy and not in a batch of three, and a scalar variable read as an exponent
     (``x ** alpha()``) takes it at almost every shape. Not mirrored: such a result depends on

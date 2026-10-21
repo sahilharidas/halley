@@ -854,9 +854,70 @@ def _check_given(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> None:
                 f"series {name}: its provenance records basis_horizon {reach!r}, not the horizon "
                 "of its basis's runs (an int of at least 1)"
             )
+        j = s.provenance["basis_scenarios"]
+        if not isinstance(j, int) or isinstance(j, bool) or j < 1:
+            raise LoadError(
+                f"series {name}: its provenance records basis_scenarios {j!r}, not the number of "
+                "scenarios of its basis's runs (an int of at least 1)"
+            )
         if not isinstance(s.values, np.ndarray) or s.values.dtype != np.float64:
             kind = s.values.dtype if isinstance(s.values, np.ndarray) else type(s.values).__name__
             raise LoadError(f"series {name}: its values are {kind}, not float64")
+    _check_bases(graph, series)
+
+
+BASIS_RECORD = ("source_runs", "valuation_date", "basis_scenarios", "basis_horizon", "members")
+"""What the series of one basis record alike: they are summed from the same runs over the same
+members (one :func:`~halley.aggregation.group_series` call), so they agree on these provenance
+keys (the source runs compared by run id and manifest hash, not by directory)."""
+
+
+def _basis_record(s: LoadedSeries, key: str) -> object:
+    value: object = s.provenance[key]
+    if key == "source_runs":
+        runs: list[Any] = list(value) if isinstance(value, (list, tuple)) else [value]
+        return [
+            (e.get("run_id"), e.get("manifest_sha256")) if isinstance(e, Mapping) else e
+            for e in runs
+        ]
+    return value
+
+
+def _check_bases(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> None:
+    """The series of one basis were summed from the same runs over the same members: each
+    agrees with the first series of its basis on :data:`BASIS_RECORD`, so that a stage never
+    adds the totals of one set of runs to those of another. Across bases a policy is a member
+    of one group (G4): its group may not change from one basis's membership to another's,
+    though a basis may hold fewer members (a policy that left before the valuation date is in
+    the old basis only)."""
+    first: dict[str, str] = {}
+    for name, decl in graph.series.items():
+        basis = decl.basis
+        if basis not in first:
+            first[basis] = name
+            continue
+        other = first[basis]
+        for key in BASIS_RECORD:
+            if _basis_record(series[name], key) != _basis_record(series[other], key):
+                raise LoadError(
+                    f"series {name} and series {other} of basis {basis} record other {key}; the "
+                    "series of a basis are summed from the same runs over the same members (one "
+                    "group_series call)"
+                )
+    owner: dict[object, tuple[object, str, str]] = {}
+    for name, decl in graph.series.items():
+        if first[decl.basis] != name:
+            continue  # the same members as the first series of its basis
+        for entry in series[name].provenance["members"]:
+            group, pids = entry[0], entry[1]
+            for pid in pids:
+                known = owner.setdefault(pid, (group, name, decl.basis))
+                if known[0] != group:
+                    raise LoadError(
+                        f"policy {pid} is a member of group {known[0]} in series {known[1]} "
+                        f"(basis {known[2]}) and of group {group} in series {name} (basis "
+                        f"{decl.basis}); a policy belongs to one group (G4)"
+                    )
 
 
 def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int | None:
@@ -868,14 +929,8 @@ def _stage_horizon(graph: ir.Graph, series: Mapping[str, LoadedSeries]) -> int |
     naming each one's basis and asking for ``RunSettings.horizon``. ``None`` without a ``cur``
     series or a series with a time dimension. The basis is the declaration's, which the series
     given must sum (:func:`_check_given`)."""
-    _check_given(graph, series)
+    _check_given(graph, series)  # the series of one basis record one basis_horizon
     cur = {n: _basis_horizon(series[n]) for n, d in graph.series.items() if d.basis == CUR_BASIS}
-    if len(set(cur.values())) > 1:
-        listing = "; ".join(f"series {n} records H = {h}" for n, h in cur.items())
-        raise LoadError(
-            f"the stage's series of basis cur disagree on its horizon: {listing}; the series of "
-            "a basis are summed from the same runs"
-        )
     if cur:
         return next(iter(cur.values()))
     timed = [n for n, d in graph.series.items() if d.has_time]
@@ -991,6 +1046,19 @@ def load_series(
             raise LoadError(f"{label}: a series without a time dimension has one row")
         if not decl.scenario and values.shape[2] != 1:
             raise LoadError(f"{label}: a mean over scenarios has one scenario")
+        reach = _basis_horizon(s)
+        if decl.has_time and s.horizon > reach:
+            # a copy cut to a stage's horizon holds fewer months than its basis, never more
+            raise LoadError(
+                f"{label}: its values cover months 0..{s.horizon} but its provenance records "
+                f"basis_horizon {reach}; a series holds at most its basis's months"
+            )
+        j = int(s.provenance["basis_scenarios"])
+        if decl.scenario and values.shape[2] != j:
+            raise LoadError(
+                f"{label}: it keeps the scenarios of its basis, J = {j}, but holds "
+                f"{values.shape[2]}"
+            )
         if not np.isfinite(values).all():
             raise LoadError(f"{label}: non-finite values")
         recorded = [m[0] for m in s.provenance["members"]]
@@ -1012,7 +1080,7 @@ def load_series(
             )
         pathwise = s.pathwise
         if pathwise is not None:
-            _check_pathwise(label, decl, values, pathwise)
+            _check_pathwise(label, decl, values, pathwise, j)
         if decl.has_time and name in relative:
             if run_off:
                 _require_zero_after(label, s, horizon)
@@ -1032,24 +1100,38 @@ def load_series(
             )
         out[name] = LoadedSeries(
             name,
-            values,
+            _owned(values),
             s.unit,
             s.has_time,
             s.start,
-            s.group_ids,
+            np.array(s.group_ids, dtype=object, copy=True),
             s.scenarios,
-            s.provenance,
-            pathwise,
+            dict(s.provenance),
+            None if pathwise is None else _owned(pathwise),
         )
     return out
 
 
+def _owned(values: NDArray[Any]) -> NDArray[np.float64]:
+    """The run's own read-only copy of a caller's array: what the stage ran on cannot change
+    when the caller later writes into the series it passed (the run's result, recompute and
+    explain read the copy)."""
+    owned = np.array(values, dtype=np.float64, order="C", copy=True)
+    owned.flags.writeable = False
+    return owned
+
+
 def _check_pathwise(
-    label: str, decl: ir.SeriesDecl, values: NDArray[np.float64], pathwise: NDArray[Any]
+    label: str,
+    decl: ir.SeriesDecl,
+    values: NDArray[np.float64],
+    pathwise: NDArray[Any],
+    basis_scenarios: int,
 ) -> None:
     """A mean's pathwise values are the basis's per-scenario group totals it averaged: finite
-    float64, shaped like the mean but for the scenarios. They are a record beside the mean,
-    which is what the stage reads and what the run id covers."""
+    float64, shaped like the mean but for the scenarios, which are the basis's J as its
+    provenance records it. They are a record beside the mean, which is what the stage reads and
+    what the run id covers."""
     if decl.scenario:
         raise LoadError(f"{label}: keeps its scenarios, so it has no pathwise values")
     if (
@@ -1057,6 +1139,7 @@ def _check_pathwise(
         or pathwise.dtype != np.float64
         or pathwise.ndim != 3
         or pathwise.shape[:2] != values.shape[:2]
+        or pathwise.shape[2] != basis_scenarios
         or not np.isfinite(pathwise).all()
     ):
         raise LoadError(

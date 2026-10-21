@@ -55,7 +55,7 @@ from halley.authoring.contracts import (
 )
 from halley.authoring.product import ModelPoint, Product, VarDef
 from halley.codegen import CompiledModel
-from halley.errors import BuildError, LoadError, Loc, RunError, UnitError
+from halley.errors import BuildError, HalleyError, LoadError, Loc, RunError, UnitError
 from halley.ir import units
 from halley.ir.units import Unit, unit_from_name
 from halley.runtime.loader import (
@@ -183,6 +183,14 @@ class Basis:
         by path)."""
         if not runs:
             raise LoadError(f"basis {self.name} has no runs")
+        for r in runs:
+            # a stage's run is keyed on its groups: its group ids would be taken as policies
+            kind = r.kind
+            if kind != "projection":
+                raise LoadError(
+                    f"basis {self.name}: run {r.run_id} is an {kind} run; a basis reads "
+                    "projection runs"
+                )
         first = runs[0]
         when = _valuation_date(first)
         for r in runs[1:]:
@@ -286,7 +294,8 @@ class GroupSum:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "loc", _declaration_loc())
-        if not _is_name(self.name):
+        # series.<name> refuses a name with a leading underscore, so no formula could read it
+        if not _is_name(self.name) or self.name.startswith("_"):
             raise BuildError(f"a series is named like a variable, not {self.name!r}", self.loc)
         what = f"series {self.name}"
         if not _is_name(self.basis):
@@ -564,9 +573,9 @@ class Aggregation(Product):
     * every file of a basis run built from the actual CPI history names the stage's table
       ``cpi_act``, and the cur runs' CPI path holds its rows for u <= 0 bit for bit
       (:func:`_check_actual_cpi`);
-    * the old, new and cur runs are made by one build of each class, its ``ir_sha256``, on one
-      backend, every policy by the same build in each basis (in-force 5.5, C17;
-      :func:`_check_one_build`);
+    * each policy is projected by one build, its ``ir_sha256`` on one backend, in each of the
+      old, new and cur bases, and each old run by its previous run's build (in-force 5.5, C17;
+      :func:`_check_one_build`, :func:`_check_previous_basis`);
     * the old basis is the previous run's: each old run's model points are the expected
       in-force derived from a cur-basis run of the previous aggregation run, its build is that
       run's, and its non-financial tables are that run's, or their rebase to V prices; the new
@@ -634,6 +643,14 @@ class Aggregation(Product):
                 )
             out[s.name] = s.decl()
         return out
+
+    @classmethod
+    def check_statics(cls, statics: Mapping[str, object]) -> None:
+        """A disclosure that is a function of the stage's statics is called with them at build:
+        one that raises, or gives no string or tuple of strings, is a BuildError at the stage
+        class, before any run (:func:`_declared_disclosures`, which the loader calls again to
+        record what it gives)."""
+        _declared_disclosures(cls, statics, BuildError)
 
 
 def _is_tuple(value: object) -> TypeGuard[tuple[object, ...]]:
@@ -1229,10 +1246,13 @@ the source's sha256 (``rebased_from``) or run id (``derived_from``)."""
 
 
 def require_one_group(group_ids: Sequence[str], where: str) -> None:
-    """G1 (in-force 12.4): one group per aggregation run in this version. This is the rule's one
-    place: :func:`load_aggregation_inputs` calls it once, and the rest of the loader (the
-    membership, the derived fields, the locked-in hashes, the manifest blocks) works per group,
-    so lifting the rule is deleting that call."""
+    """G1 (in-force 12.4): one group per aggregation run in this version, checked in one place:
+    :func:`load_aggregation_inputs` calls it once, and the membership, the derived fields, the
+    locked-in hashes and the manifest blocks work per group. The loader also resolves one
+    previous run per stage (:func:`_resolve_previous` refuses groups that name several
+    ``prev_run_id`` values; ``previous=``, the ``previous`` block, the run identity and the old
+    basis's build check hold one), a second restriction of this version that lifting G1 must
+    lift too."""
     if len(group_ids) != 1:
         raise LoadError(
             f"{where}: holds {len(group_ids)} groups ({', '.join(group_ids)}); an aggregation run "
@@ -2064,49 +2084,54 @@ class _Build(NamedTuple):
         return f"{self.model}, ir_sha256 {self.ir_sha256[:12]}..., backend {self.backend}"
 
 
-def _build_of(result: RunResult) -> _Build:
+def _build_of(result: RunResult, who: str) -> _Build:
+    """The build that made a basis run, from its verified manifest. A manifest without the
+    model's name, ``ir_sha256`` or the backend's name (one edited, since no hash covers the
+    manifest; ``run()`` writes all three) is a LoadError naming the run ``who``: a missing key
+    read as a placeholder would make two such runs one build."""
     manifest = result.manifest
     model: object = manifest.get("model")
     backend: object = manifest.get("backend")
-    return _Build(
-        str(model.get("name")) if _is_mapping(model) else "?",
-        str(manifest.get("ir_sha256")),
-        str(backend.get("name")) if _is_mapping(backend) else "?",
-    )
+    found = {
+        "model.name": model.get("name") if _is_mapping(model) else None,
+        "ir_sha256": manifest.get("ir_sha256"),
+        "backend.name": backend.get("name") if _is_mapping(backend) else None,
+    }
+    for key, value in found.items():
+        if not isinstance(value, str) or not value:
+            raise LoadError(
+                f"{who}: its manifest records no {key}; the stage holds every run to the build "
+                "that made it (in-force 5.5, C17)"
+            )
+    return _Build(str(found["model.name"]), str(found["ir_sha256"]), str(found["backend.name"]))
 
 
 _ONE_MODEL: Final = (
     f"the runs of bases {OLD_BASIS}, {NEW_BASIS} and {CUR_BASIS} are ordinary projections of "
     "one model that differ only in their inputs (in-force 5.5, C17), so that delta_FCF_L "
     "measures the change in the tables and the in-force, and the cur runs the change in the "
-    "financial inputs: build each class once and project every basis on it"
+    "financial inputs: project each policy on one build in every basis"
 )
 
 
 def _check_one_build(runs: Mapping[str, Sequence[_BasisRun]]) -> None:
     """The old, new and cur runs project on one model, for a stage that rebuilds its locked-in
     files (in-force 5.5: "Every run is an ordinary projection of section 6 ... They differ only
-    in the inputs below"; C17: the engine reuses the annuity model unchanged). Every run of a
-    class (the manifest's model name) across the three bases carries one build, its
-    ``ir_sha256``, on one backend, and every policy is projected by one build in every basis
-    that holds it, which also catches a subclass under another name. A build-time setting that
-    differs (``include_inv_exp=False`` in the old runs, ``cpi_lag_m=2`` in one of them, the new
-    and cur runs on another build than the old) moves delta_FCF_L, N(0) or the months after V
-    by a model change the group did not make, with every hash the stage checks and every
-    invariant intact. The old runs' build is held to the previous run's in
-    :func:`_check_previous_basis`. A LoadError names both runs and their builds."""
-    by_class: dict[str, tuple[_BasisRun, _Build]] = {}
+    in the inputs below"; C17: the engine reuses the annuity model unchanged). Every policy is
+    projected by one build, its ``ir_sha256`` (the class with its build-time settings) on one
+    backend, in every basis that holds it, which also catches a subclass under another name. A
+    build-time setting that differs between the bases (``include_inv_exp=False`` in the old
+    runs, ``cpi_lag_m=2`` in one of them, the new and cur runs on another build than the old)
+    moves delta_FCF_L, N(0) or the months after V by a model change the group did not make,
+    with every hash the stage checks and every invariant intact. Two builds of one class, each
+    projecting its own policies in every basis, are two models the group was measured on
+    alike, and pass. Each old run's build is held to its previous run's in
+    :func:`_check_previous_basis`, so the bases cannot all move to another build together. A
+    LoadError names the policy, both runs and their builds."""
     by_policy: dict[Any, tuple[_BasisRun, _Build]] = {}
     for basis in (OLD_BASIS, NEW_BASIS, CUR_BASIS):
         for r in runs.get(basis, ()):
-            build = _build_of(r.result)
-            first, known = by_class.setdefault(build.model, (r, build))
-            if known != build:
-                raise LoadError(
-                    f"basis {first.basis} run {first.run_id} ({known}) and basis {r.basis} run "
-                    f"{r.run_id} ({build}) project class {build.model} on different builds; "
-                    f"{_ONE_MODEL}"
-                )
+            build = _build_of(r.result, f"basis {r.basis} run {r.run_id}")
             for m in r.members:
                 first, known = by_policy.setdefault(m.pid, (r, build))
                 if known != build:
@@ -2335,13 +2360,20 @@ _CPI_COLUMN: Final = "cpi"
 
 def _history_of(f: ReadFile) -> tuple[list[int], dict[tuple[int, int], float]]:
     """A CPI file's rows by (scenario, u), scenario 0 for a file without a scenario column (the
-    table ``cpi_act``), and its scenarios; a missing column or a repeated row is a LoadError
-    naming the file."""
+    table ``cpi_act``), and its scenarios. The month column is ``t`` or ``u``, as the scenario
+    loader takes it (a run's ``cpi`` may name it either way); a file with both or neither, a
+    missing value column or a repeated row is a LoadError naming the file."""
     cols = table_columns(f)
-    for name in ("u", _CPI_COLUMN):
-        if name not in cols:
-            raise LoadError(f"{f.where}: column {name} is missing")
-    months: list[int] = [int(u) for u in cols["u"].tolist()]
+    named = [name for name in ("t", "u") if name in cols]
+    if len(named) != 1:
+        raise LoadError(
+            f"{f.where}: the month column is named t or u, not both"
+            if named
+            else f"{f.where}: the month column t (or u) is missing"
+        )
+    if _CPI_COLUMN not in cols:
+        raise LoadError(f"{f.where}: column {_CPI_COLUMN} is missing")
+    months: list[int] = [int(u) for u in cols[named[0]].tolist()]
     scenarios: list[int] = (
         [int(s) for s in cols["scenario"].tolist()] if "scenario" in cols else [0] * len(months)
     )
@@ -2406,8 +2438,9 @@ def _check_previous_basis(
       rebuilds it with ``expected_in_force``), never the actual in-force retyped;
     * each old run is made by that run's build, the same ``ir_sha256`` (C17: one model, reused
       unchanged; the backend may differ between periods, within D16's tolerance), which with
-      :func:`_check_one_build` holds the new and cur runs to it too: a model change between
-      periods is not a change this stage measures;
+      :func:`_check_one_build` (each policy on one build in every basis) holds the new and cur
+      runs of its policies to it too: a model change between periods is not a change this
+      stage measures;
     * each old run's non-financial tables (every table but :data:`FINANCIAL_INPUTS`) are that
       run's tables of the same names, by sha256, or a rebase of one (``halley.rebased_from``
       naming it, which the provenance check rebuilds), the expense table in V prices (5.4);
@@ -2448,7 +2481,7 @@ def _check_previous_basis(
             )
         then = finder.run(source)
         who = f"basis {CUR_BASIS} run {source} of {prev.who}"
-        built, was = _build_of(r.result), _build_of(then)
+        built, was = _build_of(r.result, f"basis {OLD_BASIS} run {r.run_id}"), _build_of(then, who)
         if built.ir_sha256 != was.ir_sha256:
             raise LoadError(
                 f"basis {OLD_BASIS} run {r.run_id} projects on {built}, but {who}, which its "
@@ -2854,8 +2887,15 @@ def _verify_provenance(
             )
             try:
                 table = helper(check)
-            except LoadError:
-                raise
+            except LoadError as exc:
+                # a helper's refusal names the file it checks when it is about that file; one
+                # about a source (no file of the sha256 named) is said of the file being checked
+                if exc.message.startswith(f.where):
+                    raise
+                raise LoadError(
+                    f"{f.where}: recomputing it from halley.{key} = {value}: {exc.message}",
+                    exc.loc,
+                ) from None
             except Exception as exc:  # the helper's own failure
                 raise LoadError(
                     f"{f.where}: recomputing it from halley.{key} = {value} raised "
@@ -2884,12 +2924,16 @@ def _verify_provenance(
 
 
 def _declared_disclosures(
-    stage: type[Aggregation], statics: Mapping[str, object]
+    stage: type[Aggregation],
+    statics: Mapping[str, object],
+    error: Callable[[str, Loc | None], HalleyError] = LoadError,
 ) -> dict[str, Any]:
     """What the stage declares (:attr:`Aggregation.disclosures`), as the manifest records it:
     a function entry called with the compiled stage's statics (read-only), so that a disclosure
     that depends on a build-time setting says what the run was built with. A function that
-    raises, or returns no string or tuple of strings, is a LoadError at the stage class."""
+    raises, or returns no string or tuple of strings, is an ``error`` at the stage class: a
+    BuildError when :meth:`Aggregation.check_statics` calls it at build, which is where such a
+    stage stops; a LoadError when the loader calls it to record the block."""
     view = MappingProxyType(dict(statics))
     out: dict[str, Any] = {}
     for key, entry in stage.disclosures.items():
@@ -2898,12 +2942,12 @@ def _declared_disclosures(
             try:
                 text = entry(view)
             except Exception as exc:  # the stage's own failure, at the class
-                raise LoadError(
+                raise error(
                     f"{stage.__qualname__}.disclosures: {key} raised {type(exc).__name__}: {exc}",
                     _class_loc(stage),
                 ) from exc
         if not _is_disclosure_text(text):
-            raise LoadError(
+            raise error(
                 f"{stage.__qualname__}.disclosures: {key} gives {text!r}, not a string or a "
                 "tuple of strings",
                 _class_loc(stage),
@@ -3005,7 +3049,7 @@ def load_aggregation_inputs(
     every member mapped to exactly one group row, issued on its recognition date; the stage's
     member rules on every run of their bases (:func:`_check_member_rules`); the membership as
     a table (:func:`_membership_file`); the structural hashes; for a stage that rebuilds its
-    locked-in files, one build of each class across the old, new and cur bases
+    locked-in files, one build of each policy across the old, new and cur bases
     (:func:`_check_one_build`); the locked-in hashes (for a stage that rebuilds its locked-in
     files, with their sources, curves and the group's ``tau0``, :func:`_check_locked_in`, and
     the actual CPI history they name and the cur runs' CPI path holds,

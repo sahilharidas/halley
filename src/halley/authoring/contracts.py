@@ -512,12 +512,19 @@ class BatchView(Protocol):
     ``a.run.m_val`` a run constant, ``a.scen(name, u)`` a scenario month shaped ``(1, 1, S)``,
     ``a.scen_range(name, lo, hi)`` months ``lo..hi`` shaped ``(hi - lo + 1, 1, S)``,
     ``a.table(name, column)`` a dense table column, ``a.at(name, index)`` a variable at a fixed
-    month, an int or a per-policy ``(1, P, 1)`` index, shaped ``(1, P, S)``, and
-    ``a.scale("Money")`` the per-policy tolerance scale of a unit shaped ``(1, P, 1)``.
+    month, an int or a per-policy ``(1, P, 1)`` index, shaped ``(1, P, S)``,
+    ``a.scale("Money")`` the per-policy tolerance scale of a unit shaped ``(1, P, 1)``, and
+    ``a.ids`` the batch's policy ids (group ids in an aggregation stage), in batch order.
+
+    Every array the view returns is read-only (``a.var``, ``a.at``, ``a.mp.<field>``,
+    ``a.table``, ``a.scen``, ``a.scen_range``, ``a.scale``, ``a.ids``, ``a.t``): writing into one
+    raises ValueError instead of changing the inputs of later invariants and batches or the
+    run's result; copy it first to modify it.
     """
 
     H: int
     t: NDArray[np.int64]
+    ids: NDArray[Any]
     mp: Any
     run: Any
 

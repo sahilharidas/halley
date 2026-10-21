@@ -314,9 +314,10 @@ class StageRecord:
     sha256, or ``None``), ``bases`` (the same for every run of every basis, with its outputs'
     hashes), ``locked_in``, ``provenance`` and ``disclosures`` (and, in a replay,
     ``replayed_from``). Such a run's id covers the IR, the groups file, every series' values,
-    every scenario and table file of the stage, the previous run's id and manifest hash, the
-    settings but those of :data:`NOT_IN_IDENTITY`, the backend and the horizon: not the bases'
-    directories, which may move, nor the copies' bytes, which name their writer."""
+    the membership's rows, every scenario and table file of the stage, the previous run's id and
+    manifest hash, the disclosures, the settings but those of :data:`NOT_IN_IDENTITY`, the
+    backend and the horizon: not the bases' directories, which may move, nor the copies' bytes,
+    which name their writer (:func:`_stage_identity`)."""
 
     groups: ReadFile
     derived: Any
@@ -388,6 +389,26 @@ def _require_no_recognised_curve(model: type[Any]) -> None:
     )
 
 
+def _require_no_group_schema(graph: ir.Graph) -> None:
+    """A stage whose groups carry the group key or the recognition date (a group schema of
+    in-force 3.3, :func:`~halley.authoring.contracts.group_schema`) runs through
+    :func:`~halley.aggregation.stage.run_aggregation`, whose loader derives each group's id from
+    its key, checks G1 (one group per run), the 3.3 rules on the groups file and every member's
+    group and issue date against the bases' runs, and records the membership a later period
+    checks G4 against. :func:`run` sees the group series alone and would take the groups as
+    typed, so it refuses such a stage. A stage keyed on ``group_id`` alone runs through
+    :func:`run` with ``series=group_series(...)``."""
+    fields = [name for name in (*GROUP_KEY, "recognition_date") if name in graph.fields]
+    if not fields:
+        return
+    raise LoadError(
+        f"{graph.model} measures groups of in-force 3.3 ({', '.join(fields)}); run it with "
+        "halley.aggregation.stage.run_aggregation, which derives each group's id from its key, "
+        "checks G1, the groups file's rules and every member against the bases' runs and records "
+        "the membership, not with run(), which sees only the group series (design section 9)"
+    )
+
+
 def _stage_identity(
     manifest: dict[str, Any],
     record: StageRecord,
@@ -396,26 +417,49 @@ def _stage_identity(
     horizon: int,
 ) -> dict[str, Any]:
     """The run identity of a stage run made from run directories (design section 9): the IR,
-    the groups file, every series by the hash of its values, every scenario and table file the
-    stage read, the previous run's id and manifest hash, the settings a run id covers, the
-    backend and the horizon. Nothing in it moves when the bases' directories do or when a
-    replay reads the copies instead of the files."""
+    the groups file, every series by the hash of its values, the membership by the hash of its
+    rows, every scenario and table file the stage read, the previous run's id and manifest hash,
+    the disclosures (what the stage declares, the confidence level and the para 120 curve's
+    hash), the settings a run id covers, the backend and the horizon. Nothing in it moves when
+    the bases' directories do or when a replay reads the copies instead of the files: the
+    disclosures' ``para_120_curve_verified`` names the copies it compared, and its hashes are
+    ``df_cur``'s metadata, which ``df_cur``'s own hash covers."""
     inputs = manifest["inputs"]
     previous = record.previous
+    disclosed: object = record.blocks.get("disclosures") or {}
+    disclosures = (
+        {k: v for k, v in disclosed.items() if k != "para_120_curve_verified"}
+        if isinstance(disclosed, dict)
+        else disclosed
+    )
     return {
         "kind": "aggregation",
         "ir_sha256": manifest["ir_sha256"],
         "groups": record.groups.sha256,
         "series": {name: e["values_sha256"] for name, e in inputs["series"].items()},
+        "membership": _membership_sha256(record.membership),
         "scenarios": {name: e["sha256"] for name, e in inputs["scenarios"].items()},
         "tables": {name: e["sha256"] for name, e in inputs["tables"].items()},
         "previous": None
         if previous is None
         else {"run_id": previous["run_id"], "manifest_sha256": previous["manifest_sha256"]},
+        "disclosures": _json_safe(disclosures),
         "settings": settings.identity(),
         "backend": {"name": compiled.backend, "numpy": np.__version__},
         "horizon": horizon,
     }
+
+
+def _membership_sha256(membership: ReadFile) -> str:
+    """The run identity's hash of a stage's membership (``policy_id``, ``basis``, ``group_id``):
+    its columns and its rows in the file's order, by value (a policy id's type included), not
+    the copy's bytes, which name the parquet writer. Two runs whose groups hold other members
+    measured other groups, though their group totals may agree."""
+    table = membership.table
+    columns = [str(c) for c in table.column_names]
+    rows = [[row[c] for c in columns] for row in table.to_pylist()]
+    body = json.dumps({"columns": columns, "rows": _json_safe(rows)}, sort_keys=True)
+    return hashlib.sha256(body.encode()).hexdigest()
 
 
 def _write_table(table: pa.Table, dest: Path) -> str:
@@ -504,9 +548,10 @@ def run(
     ``stage_record``: the groups file and the fields the loader derived are copied too, the
     record's blocks enter the manifest, and the run id is the stage's identity
     (:class:`StageRecord`). A stage whose groups name a previous run or lock in a basis, that
-    declares member rules, or whose groups are recognised at the valuation date, runs only that
-    way (:func:`_require_no_previous_run`, :func:`_require_no_member_rules`,
-    :func:`_require_no_recognised_curve`)."""
+    declares member rules, whose groups are recognised at the valuation date, or whose groups
+    carry the group key or the recognition date of in-force 3.3, runs only that way
+    (:func:`_require_no_previous_run`, :func:`_require_no_member_rules`,
+    :func:`_require_no_recognised_curve`, :func:`_require_no_group_schema`)."""
     graph = compiled.graph
     model = compiled.model
     run_path = Path(run_dir)
@@ -521,6 +566,7 @@ def run(
         _require_no_previous_run(graph)
         _require_no_member_rules(model)
         _require_no_recognised_curve(model)
+        _require_no_group_schema(graph)
     lanes = "groups" if stage else "policies"  # what the messages call the model points
     inputs = load_inputs(
         graph,

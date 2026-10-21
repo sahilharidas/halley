@@ -43,10 +43,16 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   must be boolean; an empty window (`months=(5, 2)`) is refused at declaration when its order is
   fixed and at the run otherwise; the first failing invariant is reported before any later one
   is evaluated.
-- The arrays an invariant's batch view takes from the loaded inputs (`a.mp.<field>`,
-  `a.table(...)`, `a.scen(...)`, `a.scen_range(...)` and `a.scale(...)`) are read-only views:
-  writing into one raises instead of changing the inputs of the later batches and of the run's
-  result.
+- Every array an invariant's batch view returns is read-only (`a.var(...)`, `a.at(...)`,
+  `a.mp.<field>`, `a.table(...)`, `a.scen(...)`, `a.scen_range(...)`, `a.scale(...)`, `a.ids`
+  and `a.t`): writing into one raises instead of changing the inputs of the later invariants and
+  batches, or the run's result and the ids its output files are keyed on.
+- `build()` holds every build-time parameter declared `Static[T]` to its type, as given to
+  `build()` and as the class's default: `Static[bool]` takes True or False only (the string
+  `"False"` built the other branch and recorded a string in the manifest), `Static[int]` a
+  Python int that is not a bool, `Static[float]` a Python number that is not a bool. Another
+  value is a BuildError at the class naming the parameter, its type and the value
+  (`build(CPILinkedAnnuity, cpi_lag_m=3.0)` failed with a message about time offsets).
 
 ### The aggregation stage's language
 
@@ -63,8 +69,12 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   not a variable's name (`"two words"`) or is named twice (`("fcf", "fcf")`). A declaration's
   location is not an argument: one made with `dataclasses.replace()` from another, as a subclass
   replaces its parent's, is located at the `replace()` line, so a later error about it points at
-  the subclass. A projection (a `Product` that is not an `Aggregation`) that sets `bases` or
-  `series` is a BuildError at the class: nothing would read them. A formula reads a series
+  the subclass. A series name with a leading underscore, which `self.series.<name>` cannot
+  read, is a BuildError at the declaration. A projection (a `Product` that is not an
+  `Aggregation`) that sets `bases` or `series` to a stage's declarations (a `Basis`, a
+  `GroupSum` or a tuple holding one) is a BuildError at the class: nothing would read them; a
+  projection's own constant of either name (`bases = ("best", "prudent")`) is its business. A
+  formula reads a series
   as `self.series.<name>(t + k)`, `self.series.<name>.at(k)` or, for a series declared
   `time=False`, `self.series.<name>()`, which messages and `explain` quote as `series.<name>()`.
   The checker checks every read like a variable read: the unit is the declared one, the
@@ -84,14 +94,24 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   must share the valuation date, horizon and J, read every scenario input they share from the
   same file (by the sha256 their manifests record, so that scenario s is one path in every run)
   and hold disjoint policies (`Basis.check`, which returns a `BasisInfo(valuation_date,
-  horizon)`, exported from `halley.aggregation`), and every group must have members, and a
-  member in the runs of each basis a series sums; a LoadError otherwise. `run(..., series=...)`
-  runs a stage on them, unless its groups name a previous run or lock in a basis (below). Each
-  series must carry float64 values and its provenance (`basis`,
+  horizon)`, exported from `halley.aggregation`, and refuses a stage's run, `outputs.kind =
+  "aggregation"`, whose group ids it would sum as policies), and every group must have
+  members, and a member in the runs of each basis a series sums; a LoadError otherwise.
+  `run(..., series=...)` runs a stage keyed on `group_id` on them (a stage on the group schema
+  of in-force 3.3 runs through `run_aggregation`, below). Each series must carry float64 values
+  and its provenance (`basis`,
   `variables`, `basis_scenarios`, `valuation_date`, `basis_horizon`, `source_runs`, `members`),
   and must sum what the stage declares: a series of other variables, or of another basis, is a
   LoadError (`series fcf_g: the stage sums fcf + cf of basis cur but was given fcf of basis
-  cur`). Every basis must value at the stage's valuation date. The stage's horizon is its `cur`
+  cur`). The series of one basis must record the same source runs (by run id and manifest
+  hash, not directory), valuation date, `basis_scenarios`, `basis_horizon` and members, as one
+  `group_series` call sums them (`series fcf_g and series cu_g of basis cur record other
+  source_runs; ...`), and a policy is a member of one group across the bases (G4); a series
+  holds at most its basis's months, a series that keeps its scenarios exactly its basis's J and
+  a mean's pathwise values the same J (`basis_scenarios` must be an int of at least 1). The run
+  keeps its own read-only copy of every series' values and pathwise values: a caller that writes
+  into the arrays it passed changes neither the run's inputs nor what `recompute` and `explain`
+  read. Every basis must value at the stage's valuation date. The stage's horizon is its `cur`
   basis's, which every series of that basis records as `basis_horizon` (a `cur` basis that
   supplies only series without a time dimension sets it too), or `RunSettings.horizon`, which
   may not exceed it; a series read relatively is cut to that horizon and comes from a basis that
@@ -100,7 +120,9 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   the series covers. A stage that reads a mean runs at one scenario: its own scenario
   inputs and the per-scenario series it reads pass `require_deterministic` when it loads (a
   declared series no formula reads does not count). A run-time error in a stage names the
-  failing groups (`; groups G0`), as do a failing invariant, built-in or the stage's own
+  failing groups (`; groups G0`) at every batch size, including a read outside a series' or a
+  variable's months that fails for every group of the batch (it named none in a batch of
+  several, in a projection too), as do a failing invariant, built-in or the stage's own
   (`invariant csm_small failed: group G0, t = 0: ...`), a failing input rule (`for group G1`)
   and a group field outside its bounds (`groups G1 break this`); `explain` says `for group G0`.
   The not-finite check now says `is not finite (NaN or infinity) at some month`, then the
@@ -125,8 +147,8 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   names the mean as the way a J > 1 basis reaches a stage.
 - Removed: `halley.aggregation.AggregationInputs`, which took several runs of the same policies;
   a `Basis` takes the runs of disjoint policies instead.
-- A variable may not be named `series_declarations` (a `Product` class method) and, in a stage,
-  `group`, `series` or `bases`.
+- A variable may not be named `series_declarations` or `check_statics` (`Product` class
+  methods) and, in a stage, `group`, `series` or `bases`.
 
 ### The aggregation stage's loader and runs
 
@@ -149,7 +171,9 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   `prev_valuation_date` at least a month before the valuation date and no earlier than the
   recognition date, at most one of `csm_prev` and `lc_prev` positive (the rules check the type
   of each column they read: a number column of strings names the file and column); one group
-  per run (G1, `require_one_group`, the rule's one place); the previous aggregation run named by
+  per run (G1, `require_one_group`, checked in one place; the loader also resolves one previous
+  run per stage, and refuses groups that name several `prev_run_id` values, a second
+  restriction of this version that lifting G1 must lift too); the previous aggregation run named by
   `prev_run_id`, found by scanning `RunSettings.runs_root/*/manifest.json` (no match or several
   is a LoadError; `previous=` overrides the search and must hold that run id), at one scenario
   (`require_deterministic`, D4) and with its membership copied (`inputs/membership.parquet`,
@@ -180,8 +204,20 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - `run()` refuses a stage whose group schema declares `prev_run_id`, a field derived from the
   previous run or the dates (`FROM_PREVIOUS`) or a locked-in hash (`LOCKED_IN_FIELDS`): such
   fields typed into the model points would bypass the previous run, G4 and the hash checks. It
-  is a LoadError naming the fields and `run_aggregation`, before anything is written. A stage
-  that sums its bases alone still runs through `run(..., series=group_series(...))`.
+  is a LoadError naming the fields and `run_aggregation`, before anything is written. So is
+  every stage whose groups carry the group key or `recognition_date` of in-force 3.3 (a
+  `group_schema` stage): `run_aggregation` derives each group's id from its key and checks G1,
+  the groups file's rules and every member's group and issue date against the bases' runs,
+  which `run()`, seeing only the group series, would take as typed. A stage keyed on
+  `group_id` alone (a portfolio total) still runs through `run(..., series=group_series(...))`.
+- `halley.aggregation.stage.load_aggregation_inputs(compiled, *, groups, bases,
+  scenarios=None, tables=None, previous=None, settings)` returns a `StageInputs` (the model
+  points with the derived fields, the series, the record and the scenario and table files as
+  read), the inputs `run_aggregation` passes to `run(..., stage_record=StageRecord(...))`;
+  `halley.aggregation.stage.find_run(run_id, runs_root)` returns the one directory under
+  `runs_root` whose manifest carries that run id (none or several is a LoadError).
+  `stage_record=` is the hook of `run_aggregation` and `replay_aggregation`: a `StageRecord`
+  built by hand is taken as given, and none of the loader's checks run.
 - `halley.authoring.contracts.group_schema(*fields, previous=False, locked_in=False, rules=(),
   valuation_date_rule=<month-end>)` builds a stage's group schema with the in-force 3.3 fields;
   `GROUP_KEY`, `PROFIT_BUCKETS`, `PREVIOUS_FIELDS`, `LOCKED_IN_FIELDS`, `FROM_PREVIOUS_RUN`,
@@ -208,8 +244,11 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   runs it read and the bases, each run read from the bytes verified). The previous run's bases
   are recorded relative to its `runs_root`: they are resolved under the stage's
   `RunSettings.runs_root` or, without one, under the absolute root the previous run recorded,
-  and skipped otherwise, never resolved against the working directory. The design's section 10
-  helpers register their recomputations for both keys (below).
+  and skipped otherwise, never resolved against the working directory. A helper's LoadError
+  that does not name the file being verified (a source the finder cannot find, say) is reported
+  against that file and the metadata entry it recomputes from (`scenario input p_l (...):
+  recomputing it from halley.rebased_from = ...: no file with sha256 ...`). The design's section
+  10 helpers register their recomputations for both keys (below).
 - An aggregation run's directory also keeps `inputs/groups.parquet` (the file as given),
   `inputs/derived_groups.parquet` (`group_id` and the derived fields), `inputs/membership.parquet`
   (`policy_id`, `basis`, `group_id`: every member of every basis run, by basis in the declared
@@ -231,9 +270,12 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   are recorded relative to `runs_root` when they lie under it.
   `inputs.series.<name>.source_runs` gains `outputs_sha256` beside `run_id`, `dir` and
   `manifest_sha256`, and `group_series(..., runs_root=None)` records `dir` the same way. Such a
-  run's id covers the IR, the groups file's hash, every series' `values_sha256`, every scenario
-  and table file's hash, the previous run's id and manifest hash, the settings but `label`,
-  `runs_root` and `workers`, the backend and the horizon; not where any run lives.
+  run's id covers the IR, the groups file's hash, every series' `values_sha256`, the
+  membership's rows (by value: two runs whose groups hold other policies with the same totals
+  have other ids), every scenario and table file's hash, the previous run's id and manifest
+  hash, the disclosures (what the stage declares, the confidence level and the para 120 curve's
+  hash), the settings but `label`, `runs_root` and `workers`, the backend and the horizon; not
+  where any run lives.
 - `halley.aggregation.stage.replay_aggregation(compiled, from_run, *, run_dir)` re-runs an
   aggregation run from its own directory alone, every file verified, the bases and the previous
   run unread: the same run id and the same bits when nothing the id covers changed. The replay's
@@ -301,12 +343,18 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   which a stage may not declare. A variable may not be named `discloses_current_curve` in a
   stage.
 - Both stages check the annuity spec's I11 (with the exact zero of the CSM from the last month
-  with coverage units on, the last month included), I12 (both forms), I13, the design's M1
-  (`LRC(t) - LRC(t-1) = IFIE(t) - revenue(t) - LC_svc(t)`) and M2 (`LCA(t) = LC_svc(t) - SAR(t)
-  [IFIE_BEL(t) + RA_fin(t)]`), both at 1e-12 x P_g, and, on `NewGroup`, I14 (CSM(0) = 0 in an
-  `ONEROUS` group, LC(0) = 0 in any other) on every run. M1 and M2 hold only on the curve the
-  cur runs' BEL and RA unwind on, so a `df_cur` at another level fails M1 in a stage run
-  through `run()`, which does not check the file. Their manifests disclose the approaches to
+  with coverage units on, the last month included, and the recursion at a scale of the terms'
+  absolute values, so that a CSM gone negative fails the sign check rather than the recursion
+  against a negative tolerance), I12 (both forms), I13 (the ratio wherever F(t) > 0 and F(0) >
+  0, so a group with LC(0) = 0 keeps LC(t) = 0; in-force 12.2's "and LC(0) > 0" left such a
+  group unchecked), the design's M1 (`LRC(t) - LRC(t-1) = IFIE(t) - revenue(t) - LC_svc(t)`)
+  and M2 (`LCA(t) = LC_svc(t) - SAR(t) [IFIE_BEL(t) + RA_fin(t)]`), both at 1e-12 x P_g, and, on
+  `NewGroup`, I14 (CSM(0) = 0 in an `ONEROUS` group, LC(0) = 0 in any other, within 1e-12 x
+  P_g: contracts that each tie G3's exact per-contract test can leave a group balance of a few
+  ulps, which was a RunError) on every run. M1 and M2 hold only on the curve the cur runs' BEL
+  and RA unwind on, so a `df_cur` at another level fails M1 in a stage that does not hold
+  `df_cur` to the cur runs' files (one without `discloses_current_curve`, below). Their
+  manifests disclose the approaches to
   discount rates and to the risk adjustment, three notes (the monthly CSM allocation step, the
   ignored timing convexity and the coverage-unit approach as built: `NOTE_UNITS_DISCOUNTED`,
   Method 1, or `NOTE_UNITS_UNDISCOUNTED` for `discount_coverage_units = False`), the confidence
@@ -316,8 +364,10 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   `csm.in_force_notes(statics)` (below).
 - An entry of `Aggregation.disclosures` may be a function of the stage's statics (a read-only
   mapping of its build-time settings, as built) that returns a string or a tuple of strings:
-  `run_aggregation` calls it with the compiled stage's, and one that raises or returns
-  anything else is a LoadError located at the stage class.
+  `build()` calls it with the statics it resolved, and one that raises or returns anything else
+  is a BuildError located at the stage class, before any run; `run_aggregation` calls it again
+  to record what it gives. `Product.check_statics(statics)` is the hook `build()` calls for this
+  (nothing for a projection).
 - A stage class may set `reads_to_run_off` (a bool; `CsmRollForward` sets it, since N(t) sums
   every later month of the units): a `RunSettings.horizon` below the cur basis's is then
   accepted only where every series the stage reads relatively is exactly 0 after it, and is a
@@ -457,12 +507,16 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
     table) names the stage's table `cpi_act`; the cur runs' CPI path, a plain file that names
     no history, holds the table's rows bit for bit from its first month to `u = 0`, in every
     scenario (in-force 5.3: `I_cur(u) = I_act(u)` for `u <= 0`), and a LoadError names the copy,
-    the scenario and the first month that differs;
+    the scenario and the first month that differs; its month column is `t` or `u`, as the
+    scenario loader takes it (a path keyed on `t` was refused as `column u is missing`);
   - the runs of the bases `old`, `new` and `cur` are ordinary projections of one model (in-force
-    5.5, C17): every run of a class carries one `ir_sha256` (the class with its build-time
-    settings, such as `include_inv_exp` or `cpi_lag_m`) on one backend, and each policy is
-    projected by one build in every basis that holds it, so a subclass under another name is
-    caught too; a LoadError names both runs and their builds;
+    5.5, C17): each policy is projected by one build in every basis that holds it, its
+    `ir_sha256` (the class with its build-time settings, such as `include_inv_exp` or
+    `cpi_lag_m`) on one backend, and each old run by its previous run's build (below), so a
+    subclass under another name is caught too; a LoadError names the policy, both runs and their
+    builds. Two builds of one class, each projecting its own policies in every basis, are
+    accepted (they were refused). A basis run whose manifest records no model name,
+    `ir_sha256` or backend name is a LoadError naming the run and the key;
   - each old run's model point copy carries `halley.derived_from` naming a run of the previous
     aggregation run's cur basis (the expected in-force at V, never retyped), its `ir_sha256` is
     that run's (the backend may differ between periods), and its non-financial tables are that
@@ -474,6 +528,89 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   named by the `previous` block of the run after it) and the runs they read, beside the
   previous run's and the stage's bases: in a later period the files a group locks in at
   recognition are read only by the recognition run's bases.
+
+### Known limitations
+
+- `recompute` and `explain` evaluate a power with a non-literal array exponent (a model point
+  field, a scalar variable or a scenario value) as libm's pow, so where NumPy took its sqrt,
+  square or reciprocal fast path for an exponent of 0.5, 2 or -1 (in a batch of one policy, for
+  example) they agree with the stored value within 1e-12 relative, not bit for bit.
+- Which non-literal power exponents take NumPy's fast path was measured on NumPy 2.5 (2.5.4 on
+  Windows) only: another NumPy may choose differently, which can move the last bit of such a
+  power between NumPy versions (within D5's 1e-12), and the documented shapes would need
+  probing again.
+- For literal and 0-d exponents, `recompute` and `explain` mirror NumPy's fast path by raising
+  a one-element array, which assumes NumPy takes the same loop for one element as for a batch.
+  The tests check this on the platform they run on, and skip where its libm cannot tell the
+  two paths apart.
+- A per-group month `self.series.x.at(self.group.k)` outside a series' months is a RunError
+  naming the groups when the batch runs, not a LoadError; a constant `.at(k)` is checked at
+  load, as `at()` and `self.scen.x.at()` are.
+- A group with no member in the runs of a basis is a LoadError, so an in-force group whose
+  members have all left by the valuation date cannot run through `InForceGroup` (its new and
+  cur bases hold none of them), and the release of its remaining CSM in that last period is not
+  modelled.
+- An `Invariant` copied with `dataclasses.replace()` keeps the location of the invariant it
+  copies, so its errors point at the original declaration, not at the `replace()` line.
+- A series copy in a stage's run directory holds the months the stage read (its `months`)
+  beside its basis's `basis_horizon`, which may be larger; the loader holds a series' months to
+  at most `basis_horizon` and to the stage's horizon, not to equality with `basis_horizon`.
+- A stage without a `cur` basis takes its default horizon from its time series' months; one
+  whose only series are scalars of other bases needs `RunSettings.horizon`.
+- The manifest repeats a basis's membership in every series entry of that basis
+  (`inputs.series.<name>.members`), beside `inputs/membership.parquet`, so it grows with the
+  number of policies times the number of series.
+- `group_schema` is imported from `halley.authoring.contracts`, and `register_provenance`,
+  `find_run` and `load_aggregation_inputs` from `halley.aggregation.stage`; they are not
+  re-exported from `halley` or `halley.aggregation`.
+- A run named by `prev_run_id` or `derived_from` is found by reading every
+  `runs_root/*/manifest.json` on each lookup: there is no index, so a lookup slows down with
+  the number of runs filed there; a run filed in a nested directory is not found; and a replay
+  or copy of a run filed under the same `runs_root` makes its run id ambiguous (a LoadError), so
+  file replays and copies outside `runs_root`.
+- `RunSettings.workers` is recorded and validated, but every batch runs in the calling process
+  until the process pool of design section 12.
+- A run's `manifest.json` is not itself hashed: every file it lists is verified against the
+  hash it records, and a later stage records the sha256 of the previous run's manifest, but an
+  edit to a manifest that keeps its listed hashes consistent is not detected on load.
+- `run(..., stage_record=)` takes a `StageRecord` as given: one built by hand runs none of the
+  loader's checks.
+- A stage's bases use one policy-id type, all integers or all strings; bases that mix them are
+  a LoadError.
+- The reference input files under `docs/spec`, and the hashes recorded in their metadata and in
+  the in-force groups files, are pyarrow's writer bytes: a pyarrow upgrade can change them
+  without changing a value. Rerun the `docs/spec/*_inputs.py` scripts, which the committed-files
+  tests flag.
+- A `MemberRule` is evaluated on one run of its basis at a time, so a rule across several runs
+  of a basis (several product classes together) cannot be written as one; `replay_aggregation`
+  does not evaluate member rules again, it carries over the original run's record of them.
+- The CSM stages read deterministic bases only (J = 1), and a J > 1 projection run is a
+  LoadError (`require_deterministic`): `NewGroup`'s G3 at J > 1, the para 47 test on each
+  contract's probability-weighted mean FCF, is open with the specification's G6, and M1 and M2
+  assume the cur runs discount on `df_cur`, which holds at J = 1 only (with pathwise
+  deflators the mean BEL does not roll forward on one curve).
+- The stage table `cpi_act` holds exactly the months u = -26..0 (its key is a dense grid), so
+  trim the actual CPI history to those 27 months (a longer or shorter one is a LoadError naming
+  the range); the expense rebase reads `I_act(-tau)` from it, so an in-force reporting period is
+  at most 26 months long; and the cur runs' CPI path is held to `cpi_act` for u = -26..0 only
+  (no accepted in-force run reads an earlier month: the locked-in path starts at u = -26, and a
+  CPI lag above 15 months fails the old and new runs' coverage check).
+- The in-force input rule "the locked-in curve covers [0, tau0 + H]" answers once per run (G1:
+  one group per aggregation run), so its message names the file, not a group; it needs a
+  per-group answer when G1 is lifted.
+- A custom stage that locks in a basis (`group_schema(locked_in=True)`) has its locked-in files
+  checked by hash only: the rebuild of each from the group's basis and `tau0`, and the
+  actual-CPI, one-build and previous-basis checks, run only when the stage sets
+  `rebuilds_locked_in = True`, as `InForceGroup` does.
+- A failed run-time invariant on a stage's scalar outputs (K1 to K7 of the in-force close) names
+  the invariant, the group and both sides, but no month, since the close is one value per group.
+- An in-force run's manifest records its bases (run id and manifest sha256) and the provenance
+  rebuilds, but not the structural checks of the old and new bases (the previous tables by
+  sha256, the new runs on the cur model point files, one build per policy); `replay_aggregation`
+  reads no basis run and does not run them again.
+- A model point with no survivors at V keeps its previous `instalment_pm` in the old basis (the
+  specification is silent; in-force open question 23 asks its author), so with an anniversary
+  inside the period its expected escalation is reported in C - B rather than in delta_FCF_L.
 
 ### Notes on determinism
 
@@ -487,7 +624,10 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   took pow. A literal exponent (`x ** 0.5`, the mid-month `pv_month`) takes one path at every
   batch size; the shipped products raise only to literals and to the month index (`v_m ** t`,
   `(1 + i) ** (-t)`, the `-12 / t` of `ann_spot`), which took libm's pow at every batch shape
-  measured.
+  measured over a window of two or more months. Over a one-month window (H = 1 for a formula
+  from t = 1) the month column is a size-one array and takes the fast path at every batch size,
+  so `recompute` and `explain` differ from the stored value in the last place there; the shipped
+  products' month exponents start at t = 0 or reach -1 only at t = 12, so they are unaffected.
 - `recompute` and `explain` take NumPy's fast path where the generated code does for a 0-d
   exponent (a keyless table's value) against a scalar base, as in
   `self.tables.rates.f["a"] ** self.tables.power.e`, so they agree with the stored value bit for

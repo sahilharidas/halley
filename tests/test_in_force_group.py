@@ -17,7 +17,7 @@ edge cases of 9.7, a model point with no survivors at V among them; the shifted 
 on constructed inputs (12.3, 14.8); G6 and the load-time checks of 12.4; the locked-in files
 held to the group's tau0 and to the curve each is read as, the locked-in runs' ILP of 0.0, the
 runs' actual CPI history, the old basis held to the previous run and the new basis to the cur
-basis's model points, and the three bases to one build of each class; a chain of two periods,
+basis's model points, and each policy to one build in the three bases; a chain of two periods,
 whose second has tau0 = 12 and tau = 6; batch and horizon independence (D5); reruns, replays
 and the run directory (D19, D21); and the committed reference workbooks, read through their
 cached values.
@@ -74,6 +74,7 @@ from halley.aggregation.csm import (
     CLOSE_INVARIANTS,
     CLOSE_OUTPUTS,
     CPI_ACT_FIRST_MONTH,
+    NOTE_PERIOD_RELEASE,
     ROLL_INVARIANTS,
     ROLL_OUTPUTS,
     in_force_notes,
@@ -1838,6 +1839,23 @@ def test_the_runs_files_name_the_stages_actual_cpi_history(
         r"actual history at V up to u = 0, I_cur\(u\) = I_act\(u\) \(in-force 5\.3\)",
         bases=chain.bases(cur=cur),
     )
+    # the scenario loader takes the month column as t or u, and so does the check of the cur
+    # runs' path: cur runs on cpi_cur with its column u named t give the stage's figures
+    cpi_cur = pq.read_table(_file("cpi_cur"))
+    named_t = cpi_cur.rename_columns(
+        ["t" if name == "u" else name for name in cpi_cur.column_names]
+    ).replace_schema_metadata(cpi_cur.schema.metadata)
+    cur_t = [chain.at_v("CUR", c, tmp_path / f"cur-t-{c}", cpi=named_t) for c in CLASSES]
+    by_t = chain.in_force(tmp_path / "cur-t", bases=chain.bases(cur=cur_t))
+    stored = list(chain.stage.manifest["outputs"]["variables"])
+    assert list(by_t.manifest["outputs"]["variables"]) == stored
+    for name in stored:
+        got = np.ascontiguousarray(by_t.var(name), dtype=np.float64).view(np.uint64)
+        want = np.ascontiguousarray(chain.stage.var(name), dtype=np.float64).view(np.uint64)
+        assert np.array_equal(got, want), name
+    both = cpi_cur.append_column("t", cpi_cur.column("u"))
+    with pytest.raises(LoadError, match="the month column is named t or u, not both"):
+        chain.at_v("CUR", "level", tmp_path / "cur-both", cpi=both)
     shifted = _shifted_cpi_act()
     _refused(
         chain,
@@ -1894,9 +1912,9 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
     but only the runs' inputs were compared. The old runs built with include_inv_exp=False
     (delta_FCF_L was 673068.25 and CSM(0) 83727.68), the old CPI run with cpi_lag_m=2 (CSM(0)
     251035.53) and the new and cur runs without investment expenses (delta_FCF_L 283837.60) each
-    passed every invariant. Each is now a LoadError naming both runs and their builds; so are a
-    renamed subclass projecting policy 11 in the old basis and all three bases on a build other
-    than the previous run's."""
+    passed every invariant. Each is now a LoadError naming a policy, both runs and their builds;
+    so are a renamed subclass projecting policy 11 in the old basis and all three bases on a
+    build other than the previous run's."""
     chain = chains["P"]
     previous = chain.recognised.run_id
     rec_level = chain.rec["level"].run_id
@@ -1985,12 +2003,12 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
     _refused(
         chain,
         tmp_path / "old-no-inv",
-        rf"basis old run {at_v['OLD'][0].run_id} \(halley\.products\.annuity\.LevelAnnuity, "
-        rf"ir_sha256 {ir(no_inv['level'])}\.\.\., backend numpy\) and basis new run "
-        rf"{chain.new['level'].run_id} \(halley\.products\.annuity\.LevelAnnuity, ir_sha256 "
-        rf"{ir(level)}\.\.\., backend numpy\) project class "
-        r"halley\.products\.annuity\.LevelAnnuity on different builds; the runs of bases old, "
-        r"new and cur are ordinary projections of one model .*\(in-force 5\.5, C17\)",
+        rf"basis old run {at_v['OLD'][0].run_id} projects policy 11 on "
+        rf"halley\.products\.annuity\.LevelAnnuity, ir_sha256 {ir(no_inv['level'])}\.\.\., "
+        rf"backend numpy, but basis new run {chain.new['level'].run_id} on "
+        rf"halley\.products\.annuity\.LevelAnnuity, ir_sha256 {ir(level)}\.\.\., backend "
+        r"numpy; the runs of bases old, new and cur are ordinary projections of one model .*"
+        r"\(in-force 5\.5, C17\), .*: project each policy on one build in every basis$",
         bases=chain.bases(old=at_v["OLD"]),
     )
     old_lag = [
@@ -2000,19 +2018,19 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
     _refused(
         chain,
         tmp_path / "old-lag-2",
-        rf"basis old run {old_lag[1].run_id} \(.*CPILinkedAnnuity, ir_sha256 {ir(lag_2)}\.\.\., "
-        rf"backend numpy\) and basis new run {chain.new['cpi'].run_id} \(.*CPILinkedAnnuity, "
-        rf"ir_sha256 {ir(cpi)}\.\.\., backend numpy\) project class .*CPILinkedAnnuity on "
-        r"different builds",
+        rf"basis old run {old_lag[1].run_id} projects policy \d+ on .*CPILinkedAnnuity, "
+        rf"ir_sha256 {ir(lag_2)}\.\.\., backend numpy, but basis new run "
+        rf"{chain.new['cpi'].run_id} on .*CPILinkedAnnuity, ir_sha256 {ir(cpi)}\.\.\., backend "
+        r"numpy; ",
         bases=chain.bases(old=old_lag),
     )
     _refused(
         chain,
         tmp_path / "new-and-cur-no-inv",
-        rf"basis old run {chain.old['level'].run_id} \(.*LevelAnnuity, ir_sha256 "
-        rf"{ir(level)}\.\.\., backend numpy\) and basis new run {at_v['NEW'][0].run_id} "
-        rf"\(.*LevelAnnuity, ir_sha256 {ir(no_inv['level'])}\.\.\., backend numpy\) project "
-        r"class .*LevelAnnuity on different builds",
+        rf"basis old run {chain.old['level'].run_id} projects policy 11 on .*LevelAnnuity, "
+        rf"ir_sha256 {ir(level)}\.\.\., backend numpy, but basis new run "
+        rf"{at_v['NEW'][0].run_id} on .*LevelAnnuity, ir_sha256 {ir(no_inv['level'])}\.\.\., "
+        r"backend numpy; ",
         bases=chain.bases(new=at_v["NEW"], cur=at_v["CUR"]),
     )
     old_renamed = [
@@ -2037,6 +2055,110 @@ def test_the_old_basis_is_the_previous_runs_and_the_new_basis_the_cur_model_poin
         r"members on the previous run's model as well as its tables",
         bases={name.lower(): runs for name, runs in at_v.items()},
     )
+
+
+def test_two_builds_of_one_class_each_project_their_own_policies(
+    compiled_annuity: dict[str, CompiledModel],
+    compiled_new_group: dict[bool, CompiledModel],
+    compiled_in_force_group: CompiledModel,
+    tmp_path: Path,
+) -> None:
+    """The one-build rule is per policy, not per class: variant O with the level file's policy
+    projected by ``CPILinkedAnnuity(cpi_lag_m=2)`` and the CPI policy by the default
+    ``CPILinkedAnnuity`` (two builds of one class), at recognition and at V, is recognised and
+    closed with every invariant passing. Moving the first policy's old run alone to the default
+    build is refused by the per-policy rule; moving it in all three bases is refused because
+    its old run is no longer on the build of the run it is derived from."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        lag_2 = build(CPILinkedAnnuity, cpi_lag_m=2)
+    default = compiled_annuity["cpi"]
+    chain = Chain(
+        "O",
+        {"level": lag_2, "cpi": default},
+        compiled_new_group[True],
+        compiled_in_force_group,
+        tmp_path / "runs",
+    )
+    assert all(r.passed for r in chain.recognised.invariants)
+    assert all(r.passed for r in chain.stage.invariants)
+    assert lag_2.ir_hash != default.ir_hash
+
+    def ir(compiled: CompiledModel) -> str:
+        return compiled.ir_hash[:12]
+
+    old = [chain.at_v("OLD", "level", tmp_path / "old-default", compiled=default), chain.old["cpi"]]
+    _refused(
+        chain,
+        tmp_path / "old-moved",
+        rf"basis old run {old[0].run_id} projects policy \d+ on .*CPILinkedAnnuity, ir_sha256 "
+        rf"{ir(default)}\.\.\., backend numpy, but basis new run {chain.new['level'].run_id} on "
+        rf".*CPILinkedAnnuity, ir_sha256 {ir(lag_2)}\.\.\., backend numpy; ",
+        bases=chain.bases(old=old),
+    )
+    moved = {
+        name.lower(): [
+            chain.at_v(name, "level", tmp_path / f"all-{name.lower()}", compiled=default),
+            chain.runs(name)["cpi"],
+        ]
+        for name in ("OLD", "NEW", "CUR")
+    }
+    _refused(
+        chain,
+        tmp_path / "all-moved",
+        rf"basis old run {moved['old'][0].run_id} projects on .*CPILinkedAnnuity, ir_sha256 "
+        rf"{ir(default)}\.\.\., backend numpy, but basis cur run {chain.rec['level'].run_id} of "
+        rf"the previous run {chain.recognised.run_id}, which its model points are derived from, "
+        rf"on .*CPILinkedAnnuity, ir_sha256 {ir(lag_2)}\.\.\., backend numpy",
+        bases=moved,
+    )
+
+
+def test_a_basis_run_whose_manifest_records_no_build_is_refused(
+    chains: dict[str, Chain], tmp_path: Path
+) -> None:
+    """The build of a basis run is read from its verified manifest, which no hash covers: a copy
+    of an old run whose manifest lost its ir_sha256 (every file it lists intact) is a LoadError
+    naming the run and the key, not a placeholder that another such run would match."""
+    chain = chains["P"]
+    source = chain.old["level"]
+    copy = tmp_path / "old-level"
+    shutil.copytree(source.run_dir, copy)
+    path = copy / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    del manifest["ir_sha256"]
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    _refused(
+        chain,
+        tmp_path / "unbuilt",
+        rf"^basis old run {source.run_id}: its manifest records no ir_sha256; the stage holds "
+        r"every run to the build that made it \(in-force 5\.5, C17\)$",
+        bases=chain.bases(old=[copy, chain.old["cpi"]]),
+    )
+
+
+def test_the_annuity_specs_notes_record_the_in_force_stage() -> None:
+    """The in-force stage's additions to the design are recorded in the annuity spec's
+    implementation notes, by the names the engine uses: the table cpi_act, the flag
+    rebuilds_locked_in, the period-release note that replaces the monthly-step note (its first
+    sentence verbatim) and every analysis-of-change label the manifest discloses."""
+    notes = (IF_DIR.parent / "annuity.md").read_text(encoding="utf-8")
+    notes = notes[notes.index("## Implementation notes and deviations") :]
+    names = [label.split(":")[0] for label in AOC_LABELS]
+    assert names == [
+        "aoc_a",
+        "aoc_b",
+        "aoc_c",
+        "aoc_d",
+        "aoc_e",
+        "aoc_ba",
+        "aoc_cb",
+        "aoc_dc",
+        "aoc_ed",
+    ]
+    first = NOTE_PERIOD_RELEASE.split(". ")[0]
+    for text in (*names, "cpi_act", "rebuilds_locked_in", "NOTE_PERIOD_RELEASE", first):
+        assert text in notes, text
 
 
 class Renamed(LevelAnnuity):

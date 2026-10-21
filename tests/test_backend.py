@@ -151,6 +151,13 @@ def test_a_non_literal_exponent_agrees_across_batchings_d5(tmp_path: Path) -> No
     assert set(one.arrays) == {"x", "whole", "acc", "term"}
     for name in one.arrays:
         np.testing.assert_allclose(one.var(name), three.var(name), rtol=1e-12, atol=0, err_msg=name)
+    # the batch of three takes libm's pow for the array exponent, and so does the interpreter:
+    # mirroring the fast path for an array exponent would break the agreement on K0 and K1
+    for pid in ("K0", "K1"):
+        for name in ("whole", "term"):
+            lane = three.lane(name, pid)
+            for t in range(1, three.H + 1):
+                assert recompute(three, pid, name, t) == lane[t], (pid, name, t)
 
 
 def test_run_directory_holds_inputs_code_outputs_and_manifest(tmp_path: Path) -> None:
@@ -485,3 +492,30 @@ def test_outputs_can_be_restricted_at_run_time(tmp_path: Path) -> None:
     back = load_run(res.run_dir)
     assert set(back.arrays) == {"r", "total"}
     assert set(res.arrays) > {"r", "total"}  # the session keeps every variable for explain
+
+
+class Ahead(Growth):
+    """``at(x, t + 1)`` reaches month H + 1 at t = H for every policy: the failing mask has a
+    month axis and no policy axis."""
+
+    @var
+    def ahead(self, t: Int) -> Count:
+        return at(self.x, t + 1)
+
+
+def test_an_at_that_fails_for_every_lane_names_every_lane(tmp_path: Path) -> None:
+    """The message names the failing policies at every batch size, not only in a batch of one,
+    where the mask's single lane happened to match the batch."""
+    compiled = build(Ahead)
+    for batch_size, named in ((1, "S00"), (2, "S00, S01"), (3, "S00, S01, S02")):
+        with pytest.raises(
+            RunError,
+            match=rf"at\(x, \.\.\.\) reads a month outside the domain of x, months 0\.\.12; "
+            rf"policies {named}\n  at Ahead\.ahead",
+        ):
+            run(
+                compiled,
+                model_points=simple_model_points(),
+                settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+                run_dir=tmp_path / f"ahead-{batch_size}",
+            )

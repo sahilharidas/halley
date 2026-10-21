@@ -57,6 +57,7 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     tables = {t.name: t.decl() for t in model.assumption_tables}
     scenarios = {s.name: s.decl() for s in model.scenario_inputs}
     series = model.series_declarations()  # None for a projection: it has no self.series
+    model.check_statics(resolved)  # a stage's disclosures that read the statics, say
 
     inst: Any = model.__new__(model)
     for name, value in resolved.items():
@@ -143,6 +144,7 @@ def _require_tuple_of(model: type[Product], name: str, cls: type) -> None:
 
 def _resolve_statics(model: type[Product], overrides: dict[str, object]) -> dict[str, object]:
     declared: dict[str, object] = {}
+    kinds: dict[str, object] = {}
     for klass in reversed(model.__mro__):
         if klass is object or klass is Product:
             continue
@@ -155,6 +157,8 @@ def _resolve_statics(model: type[Product], overrides: dict[str, object]) -> dict
         for name, hint in hints.items():
             if getattr(hint, "__origin__", None) is Static:
                 declared[name] = getattr(model, name, _MISSING)
+                args: tuple[object, ...] = getattr(hint, "__args__", ())
+                kinds[name] = args[0] if len(args) == 1 else None
     for name in overrides:
         if name not in declared:
             known = ", ".join(sorted(declared)) or "none"
@@ -169,7 +173,40 @@ def _resolve_statics(model: type[Product], overrides: dict[str, object]) -> dict
             f"build-time parameter(s) without a value: {', '.join(missing)}; "
             "give a default or pass them to build()"
         )
+    for name, value in resolved.items():
+        _check_static(model, name, kinds.get(name), value, given=name in overrides)
     return resolved
+
+
+def _check_static(
+    model: type[Product], name: str, kind: object, value: object, *, given: bool
+) -> None:
+    """A build-time parameter declared ``Static[T]`` holds a ``T``, as given to ``build()`` or as
+    the class's default: ``Static[bool]`` True or False (the string ``"False"`` is truthy and
+    would build the other branch), ``Static[int]`` an integer that is not a bool,
+    ``Static[float]`` a number that is not a bool, each a Python number, as a formula takes it (a
+    NumPy scalar is not a constant of the graph). A ``T`` that is not a class (a union, a
+    ``Literal``) is not checked. A BuildError at the class otherwise."""
+    if not isinstance(kind, type):
+        return
+    if kind is bool:
+        ok, wanted = value is True or value is False, "True or False"
+    elif kind is int:
+        ok, wanted = isinstance(value, int), "an integer"
+    elif kind is float:
+        ok, wanted = isinstance(value, (int, float)), "a number"
+    else:
+        ok, wanted = isinstance(value, kind), f"a {kind.__name__}"
+    if isinstance(value, bool) and kind is not bool:
+        ok = False  # True is an int to Python, never a month count or a rate
+    if ok:
+        return
+    where = f"build({model.__qualname__}, {name}=...)" if given else f"{model.__qualname__}.{name}"
+    raise BuildError(
+        f"{where}: {name} is a build-time parameter declared Static[{kind.__name__}], so its "
+        f"value is {wanted}, not {value!r} ({type(value).__name__})",
+        _class_loc(model),
+    )
 
 
 _MISSING = object()
@@ -188,6 +225,7 @@ _RESERVED_NAMES = {
     "invariants": "a Product class attribute",
     "abstract": "a Product class attribute",
     "series_declarations": "a Product class method",
+    "check_statics": "a Product class method",
 }
 """Names a variable may not take: the tracer sets the accessors on the instance, where they would
 shadow a ``@var`` of the same name, and ``Product`` reads its class attributes by name."""

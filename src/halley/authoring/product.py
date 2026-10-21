@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, ClassVar, cast, overload
 
 from halley import ir
@@ -479,16 +479,28 @@ class Product:
                 )
         return None
 
+    @classmethod
+    def check_statics(cls, statics: Mapping[str, object]) -> None:
+        """Checks of the class that need its build-time settings as resolved (``statics``),
+        which the tracer calls once after :meth:`series_declarations`; a mistake is a
+        BuildError at the model source. Nothing for a projection; an aggregation stage calls
+        the disclosures that are functions of the statics."""
+
 
 _STAGE_DECLARATIONS = ("bases", "series")
 """The class attributes of an aggregation stage that a projection does not have."""
 
 
 def _is_stage_declaration(value: object) -> bool:
-    """A non-empty tuple or list (of ``Basis`` or ``GroupSum``), or one declaration written
-    without the tuple around it (an object of :mod:`halley.aggregation`)."""
+    """A tuple or list holding a declaration (a ``Basis`` or ``GroupSum``), or one declaration
+    written without the tuple around it: an object of :mod:`halley.aggregation`. A projection's
+    own constant of another kind, such as ``bases = ("best", "prudent")``, is its business."""
     if isinstance(value, (tuple, list)):
-        return len(cast(tuple[object, ...], value)) > 0
+        return any(_is_stage_declaration_object(v) for v in cast(tuple[object, ...], value))
+    return _is_stage_declaration_object(value)
+
+
+def _is_stage_declaration_object(value: object) -> bool:
     return type(value).__module__.startswith("halley.aggregation")
 
 

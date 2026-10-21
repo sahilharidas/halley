@@ -12,15 +12,19 @@ import pytest
 from halley import Basis, HalleyError, LoadError, RunError, RunResult, RunSettings, build, run
 from halley.aggregation import (
     BasisInfo,
+    group_series,
     portfolio_totals,
     require_deterministic,
     sequential_sum,
 )
 from models import (
+    MEMBERS,
     VAL,
     Indexed,
+    Release,
     covered_points,
     run_covered,
+    run_stage,
     scenario_file,
     simple_model_points,
 )
@@ -107,3 +111,13 @@ def test_basis_requires_disjoint_ids_same_date_horizon_and_j(tmp_path: Path) -> 
         cur.check([up, down])
     same = run_covered(tmp_path, "same", covered_points("B"), shocks=(1.0, 1.5))
     assert cur.check([up, same]) == BasisInfo(VAL, 12)
+
+    # a stage's run is keyed on its groups: its group ids are not policies of a basis
+    bases = {"cur": [a, b]}
+    stage = run_stage(tmp_path, Release, group_series(Release, bases, MEMBERS), name="release")
+    assert stage.kind == "aggregation"
+    refused = rf"basis cur: run {stage.run_id} is an aggregation run; a basis reads projection runs"
+    with pytest.raises(LoadError, match=refused):
+        cur.check([stage])
+    with pytest.raises(LoadError, match=refused):
+        cur.check([a, stage])

@@ -579,8 +579,9 @@ def test_two_scenarios_share_the_history_and_split_the_path(
 
 def test_the_interpreter_agrees_with_the_generated_code(runs: dict[str, RunResult]) -> None:
     level, cpi = runs["level"], runs["cpi"]
-    # spot_ann(12) raises df(12) to the array exponent -12 / t, exactly -1.0 there: the
-    # interpreter takes libm's pow for an array exponent, as the backend does for this shape
+    # spot_ann(12) raises df(12) to the array exponent -12 / t, exactly -1.0 there; this pins
+    # agreement only, since df(12) of the level run is a value on which libm's pow and the
+    # reciprocal fast path agree (test_explain's ann_spot tests tell the two paths apart)
     months = (("bel", 0), ("q_mth", 7), ("df", 120), ("v_be", 100), ("ra", 0))
     for name, t in (*months, ("spot_ann", 12), ("fwd_ann", 13)):
         assert recompute(level, 1, name, t) == level.lane(name, 1)[t], name

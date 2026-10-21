@@ -256,7 +256,10 @@ def value_kind(node: ir.Node, step: bool) -> str:
     one policy and not in a batch of three; a scenario value read inside a recursive component
     takes it for several policies and one scenario; a scalar variable read as an exponent takes
     it at almost every shape; an exponent built from the month column alone (``v ** _t[0:H+1]``,
-    ``-12 / _t[1:H+1]`` in a whole-mode ``ann_spot``) took it in none of the shapes measured.
+    ``-12 / _t[1:H+1]`` in a whole-mode ``ann_spot``) took it in none of the shapes measured
+    over a window of two or more months. Over a one-month window (H = 1 for a formula from
+    t = 1) the month column is a size-one array and takes the fast path at every batch size, so
+    ``recompute`` and ``explain`` differ from the stored value in the last place there.
 
     A scalar or 0-d exponent (a literal, ``t`` inside a recursive component, a keyless table's
     value) is therefore on one path at every batch size. An array exponent whose value is 0.5, 2
@@ -290,12 +293,6 @@ def value_kind(node: ir.Node, step: bool) -> str:
             return kinds[0]  # emitted as its argument
         return ZERO_D if node.fn == "to_monthly_cf" else SCALAR  # to_monthly_cf is an np.where
     return ARRAY  # VarRead, VarAt, SumT, MpField, ScenRead, ScenAt, SeriesRead, SeriesAt
-
-
-def backend_scalar(node: ir.Node, step: bool) -> bool:
-    """Whether the generated code holds ``node`` as a Python or NumPy scalar, so that ``node **
-    k`` there is libm's pow and never NumPy's array fast path (see :func:`value_kind`)."""
-    return value_kind(node, step) == SCALAR
 
 
 # ---------------------------------------------------------------------------- generation
@@ -694,6 +691,10 @@ def run_batch(
 
 def _lane_ids(lanes: NDArray[np.bool_], inp: dict[str, Any], noun: str) -> str:
     ids = inp.get("policy_ids")
+    if ids is not None and lanes.ndim == 1 and lanes.shape[0] == 1 and len(ids) > 1:
+        # a mask without a lane axis (a month index alone, broadcast over the lanes) fails for
+        # every lane of the batch: name them all, as a batch of one names its lane
+        lanes = np.broadcast_to(lanes, (len(ids),))
     if ids is None or lanes.ndim == 0 or lanes.shape[0] != len(ids):
         return ""
     bad = [str(i) for i in np.asarray(ids)[lanes]]

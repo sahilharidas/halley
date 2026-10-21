@@ -100,8 +100,8 @@ formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spe
 | `src/halley/scheduler` | orders strongly connected components, assigns time direction |
 | `src/halley/codegen` | NumPy reference backend by code generation, then Numba |
 | `src/halley/runtime` | data contracts at load, batches, outputs, run manifest, invariants, explain and diff |
-| `src/halley/aggregation` | group-level stage: portfolio totals now, the IFRS 17 CSM roll-forward next |
-| `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib) |
+| `src/halley/aggregation` | aggregation stages over group series: portfolio totals and the IFRS 17 CSM roll-forward (NewGroup, InForceGroup) |
+| `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib), the annuities `LevelAnnuity`, `FixedEscalationAnnuity` and `CPILinkedAnnuity` (the annuity spec) and their reference inputs |
 | `docs/spec` | product specifications, their number scripts and the reference inputs |
 | `tests/data/lifelib` | lifelib's `BasicTerm_ME` inputs and results (MIT), the oracle for reference case 2 |
 

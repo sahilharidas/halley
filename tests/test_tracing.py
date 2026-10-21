@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 from halley import (
@@ -20,7 +21,9 @@ from halley import (
     var,
     where,
 )
+from halley.aggregation import NewGroup
 from halley.ir import MpField, RunConst, VarRead, graph_hash, render, walk
+from halley.products.annuity import CPILinkedAnnuity, LevelAnnuity
 from halley.products.lifelib_basic_term import BasicTerm
 from halley.products.term_assurance import TermAssurance
 from models import SIMPLE_SCHEMA, Growth
@@ -76,6 +79,48 @@ def test_static_branches_disappear_from_the_graph() -> None:
     assert plain.statics == {"has_loading": False}
     with pytest.raises(BuildError, match="no build-time parameter 'has_waiver'"):
         trace(Switched, {"has_waiver": True})
+
+
+def test_a_build_time_parameter_holds_its_declared_type() -> None:
+    """``Static[T]`` is checked against the value build() is given and the class's default: the
+    string "False" is truthy and would build the other branch with the manifest recording a
+    string, and a float or a bool where a month count is declared fails far from the
+    parameter. A BuildError at the class names the parameter, its type and the value."""
+    cases: tuple[tuple[type[Product], str, object, str], ...] = (
+        (NewGroup, "discount_coverage_units", "False", "True or False"),
+        (LevelAnnuity, "include_inv_exp", "False", "True or False"),
+        (CPILinkedAnnuity, "cpi_lag_m", 3.0, "an integer"),
+        (CPILinkedAnnuity, "cpi_lag_m", True, "an integer"),
+        (CPILinkedAnnuity, "cpi_lag_m", np.int64(4), "an integer"),  # not a graph constant
+    )
+    for model, name, value, wanted in cases:
+        kind = "bool" if wanted == "True or False" else "int"
+        with pytest.raises(BuildError) as info:
+            build(model, **{name: value})
+        assert info.value.message == (
+            f"build({model.__qualname__}, {name}=...): {name} is a build-time parameter declared "
+            f"Static[{kind}], so its value is {wanted}, not {value!r} ({type(value).__name__})"
+        )
+        assert info.value.loc is not None
+        assert info.value.loc.function == model.__qualname__
+    assert build(CPILinkedAnnuity, cpi_lag_m=4).graph.statics["cpi_lag_m"] == 4
+
+    class Defaulted(Product):
+        model_point = SIMPLE_SCHEMA
+        has_loading: Static[bool] = cast(Any, "no")
+
+        @var
+        def premium(self, t: Int) -> Money:
+            return self.mp.premium * (1.1 if self.has_loading else 1.0)
+
+    with pytest.raises(BuildError) as info:
+        trace(Defaulted)
+    assert info.value.message == (
+        "test_a_build_time_parameter_holds_its_declared_type.<locals>.Defaulted.has_loading: "
+        "has_loading is a build-time parameter declared Static[bool], so its value is True or "
+        "False, not 'no' (str)"
+    )
+    assert trace(Defaulted, {"has_loading": True}).statics == {"has_loading": True}
 
 
 def test_python_if_on_symbolic_value_names_where() -> None:

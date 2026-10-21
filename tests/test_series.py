@@ -539,6 +539,36 @@ def test_the_declarations_are_validated_at_trace() -> None:
 
     assert trace(OwnSeries).series == {}
 
+    class OwnBases(Product):  # a projection's own constant named bases is its business too
+        model_point = SIMPLE_SCHEMA
+        bases = ("best", "prudent")
+
+        @var
+        def x(self, t: Int) -> Int:
+            return t
+
+    assert trace(OwnBases).series == {}
+
+    class StageBases(Product):  # but a tuple of Basis is a stage's declaration
+        model_point = SIMPLE_SCHEMA
+        bases = (Basis("cur"),)
+
+        @var
+        def x(self, t: Int) -> Int:
+            return t
+
+    with pytest.raises(BuildError, match="StageBases sets bases, which an aggregation stage"):
+        trace(StageBases)
+
+    # series.<name> refuses a leading underscore, so a series so named could not be read
+    with pytest.raises(BuildError, match="a series is named like a variable, not '_cu'") as info:
+        GroupSum("_cu", "cur", "cu", "CoverageUnits")  # underscore series
+    assert info.value.loc is not None
+    assert (Path(info.value.loc.file), info.value.loc.line) == (
+        Path(__file__),
+        _line_of("underscore series"),
+    )
+
     # one declaration, and one hash, whatever the spelling: start=1 is the default
     spelled = GroupSum("s", "cur", "cu", "Money", start=1).decl()
     assert repr(spelled) == repr(GroupSum("s", "cur", "cu", "Money").decl())
@@ -1272,10 +1302,20 @@ def test_the_loader_checks_each_series_against_the_stage(
         typed = {**series, name: dataclasses.replace(series[name], values=values)}
         with pytest.raises(LoadError, match=f"series {name}: its values are {kind}, not float64"):
             run_stage(tmp_path, Release, typed, name="typed")
-    swapped = {**p_g.provenance, "members": list(reversed(p_g.provenance["members"]))}
-    other = {**series, "p_g": dataclasses.replace(p_g, provenance=swapped)}
+    for j in (0, 1.0, True, "1", None):
+        recorded = {**cu_g.provenance, "basis_scenarios": j}
+        odd = {**series, "cu_g": dataclasses.replace(cu_g, provenance=recorded)}
+        with pytest.raises(
+            LoadError, match=rf"series cu_g: its provenance records basis_scenarios {j!r}, not"
+        ):
+            run_stage(tmp_path, Release, odd, name="j")
+    swapped = list(reversed(p_g.provenance["members"]))
+    other = {  # every series of the basis alike, so that they agree with one another
+        n: dataclasses.replace(y, provenance={**y.provenance, "members": swapped})
+        for n, y in series.items()
+    }
     with pytest.raises(
-        LoadError, match="series p_g: its provenance records the members of groups G1, G0, not of"
+        LoadError, match="series cu_g: its provenance records the members of groups G1, G0, not of"
     ):
         run_stage(tmp_path, Release, other, name="members")
     with pytest.raises(LoadError, match="covers groups G0, G1 but the model points are G0, G1, G2"):
@@ -1323,6 +1363,194 @@ def test_a_run_records_what_it_stored_for_the_stage(cur: dict[str, list[RunResul
     with pytest.raises(LoadError, match="records no unit or domain for cu"):
         legacy.variable_info("cu")
     assert json.loads(json.dumps(a.manifest["outputs"]["variables"]["cu"]))["start"] == 1
+
+
+def test_the_loader_holds_each_series_to_the_declared_unit_time_and_shape(
+    cur: dict[str, list[RunResult]], cur_j2: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """Each check load_series makes of a given series, one at a time, with its exact message:
+    the unit (D11 across runs), the time dimension, the scenario treatment, the shape, one row
+    without a time dimension, one scenario after a mean, finite values. run_aggregation builds
+    the series from the stage's own declarations; these guard run(series=...) and replays."""
+    series = group_series(Release, cur, MEMBERS)
+    cu, p = series["cu_g"], series["p_g"]
+    nan = cu.values.copy()
+    nan[3, 0, 0] = np.nan
+    cases: tuple[tuple[str, Any, str], ...] = (
+        (
+            "unit",
+            {"cu_g": dataclasses.replace(cu, unit=u.unit_from_name("Count"))},
+            r"^series cu_g: the stage declares it CoverageUnits but its basis records Count "
+            r"\(D11 across runs\)$",
+        ),
+        (
+            "time",
+            {"p_g": dataclasses.replace(p, has_time=True)},
+            r"^series p_g: the stage declares it without a time dimension but it has one$",
+        ),
+        (
+            "shape",
+            {"cu_g": dataclasses.replace(cu, values=cu.values[:, :, 0])},
+            r"^series cu_g: values must be shaped \(months, 2 groups, scenarios\), not "
+            r"\(13, 2\)$",
+        ),
+        (
+            "one-row",
+            {"p_g": dataclasses.replace(p, values=np.repeat(p.values, 2, axis=0))},
+            r"^series p_g: a series without a time dimension has one row$",
+        ),
+        (
+            "one-scenario",
+            {
+                "cu_g": dataclasses.replace(
+                    cu, values=np.repeat(cu.values, 2, axis=2), pathwise=None
+                )
+            },
+            r"^series cu_g: a mean over scenarios has one scenario$",
+        ),
+        (
+            "finite",
+            {"cu_g": dataclasses.replace(cu, values=nan)},
+            r"^series cu_g: non-finite values$",
+        ),
+    )
+    for name, changed, match in cases:
+        with pytest.raises(LoadError, match=match):
+            run_stage(tmp_path, Release, {**series, **changed}, name=name)
+    means = group_series(Release, cur_j2, MEMBERS)  # a J = 2 basis averaged
+    with pytest.raises(
+        LoadError, match=r"^series cu_g: the stage declares scenarios='each', not 'mean'$"
+    ):
+        run_stage(tmp_path, ReleaseEach, means, name="scenarios")
+
+
+def test_the_series_of_a_basis_come_from_one_set_of_runs_and_members(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """The series of one basis are summed from the same runs over the same members, as one
+    group_series call sums them: a series summed from other runs of the basis, or over another
+    membership, is a LoadError naming both series. Across bases a policy belongs to one group
+    (G4), though a basis may hold fewer of a group's members."""
+    series = group_series(Release, cur, MEMBERS)
+    other_runs = group_series(Release, release_bases(tmp_path / "cur2", shocks=(1.2,)), MEMBERS)
+    with pytest.raises(
+        LoadError,
+        match=r"^series fcf_g and series cu_g of basis cur record other source_runs; the series "
+        r"of a basis are summed from the same runs over the same members \(one group_series "
+        r"call\)$",
+    ):
+        run_stage(tmp_path, Release, {**series, "fcf_g": other_runs["fcf_g"]}, name="runs")
+
+    regrouped = {"G0": ["A00", "A01", "A02"], "G1": ["B00", "B01", "B02"]}
+    other_members = group_series(Release, cur, regrouped)
+    with pytest.raises(
+        LoadError,
+        match=r"^series fcf_g and series cu_g of basis cur record other members; ",
+    ):
+        run_stage(tmp_path, Release, {**series, "fcf_g": other_members["fcf_g"]}, name="members")
+
+    old = {"old": cur["cur"]}
+    two = group_series(TwoBases, {**cur, **old}, MEMBERS)
+    assert run_stage(tmp_path, TwoBases, two, name="two").H == 12
+    moved = group_series(TwoBases, {**cur, **old}, regrouped)
+    with pytest.raises(
+        LoadError,
+        match=r"^policy A01 is a member of group G1 in series cu_g \(basis cur\) and of group G0 "
+        r"in series cu_old \(basis old\); a policy belongs to one group \(G4\)$",
+    ):
+        run_stage(tmp_path, TwoBases, {**two, "cu_old": moved["cu_old"]}, name="moved")
+
+
+def test_the_provenance_of_a_series_is_held_to_its_values(
+    cur: dict[str, list[RunResult]], cur_j2: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """A series holds at most its basis's months, an "each" series exactly its basis's
+    scenarios, and a mean's pathwise values the basis's J, as the provenance records them. A
+    copy cut to a stage's horizon below its basis's still loads (a replay feeds it back)."""
+    series = group_series(Release, cur, MEMBERS)
+    short = {
+        n: dataclasses.replace(y, provenance={**y.provenance, "basis_horizon": 6})
+        for n, y in series.items()
+    }
+    with pytest.raises(
+        LoadError,
+        match=r"^series cu_g: its values cover months 0\.\.12 but its provenance records "
+        r"basis_horizon 6; a series holds at most its basis's months$",
+    ):
+        run_stage(tmp_path, Release, short, name="months", horizon=6)
+
+    each = group_series(ReleaseEach, cur_j2, MEMBERS)
+    one = {n: dataclasses.replace(y, values=y.values[:, :, 1:].copy()) for n, y in each.items()}
+    with pytest.raises(
+        LoadError,
+        match=r"^series cu_g: it keeps the scenarios of its basis, J = 2, but holds 1$",
+    ):
+        run_stage(tmp_path, ReleaseEach, one, name="each")
+
+    means = group_series(Release, cur_j2, MEMBERS)
+    mean_cu = means["cu_g"]
+    assert mean_cu.pathwise is not None
+    cut = dataclasses.replace(mean_cu, pathwise=mean_cu.pathwise[:, :, :1].copy())
+    with pytest.raises(
+        LoadError,
+        match=r"^series cu_g: its pathwise values must be finite float64 shaped like the mean, "
+        r"\(13, 2\), with the basis's scenarios$",
+    ):
+        run_stage(tmp_path, Release, {**means, "cu_g": cut}, name="pathwise")
+
+
+def test_a_stage_runs_on_its_own_copy_of_the_series(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """The run keeps a read-only copy of every series it was given: a caller that writes into
+    its arrays afterwards (a sensitivity reusing them) changes neither the run's inputs nor what
+    recompute and explain read."""
+    series = group_series(Release, cur, MEMBERS)
+    res = run_stage(tmp_path, Release, series, name="owned")
+    assert res.inputs is not None
+    kept = res.inputs.series["cu_g"]
+    assert kept.values.flags.writeable is False
+    assert not np.shares_memory(kept.values, series["cu_g"].values)
+    series["cu_g"].values[4, 0, 0] *= 2.0
+    assert recompute(res, "G0", "cu_next", 3) == res.lane("cu_next", "G0")[3]
+
+
+def test_a_basis_reads_projection_runs(cur: dict[str, list[RunResult]], stage: RunResult) -> None:
+    """A stage's run is keyed on its groups: given as a basis run, its group ids would be summed
+    as policies. Basis.check refuses it, so group_series does."""
+    with pytest.raises(
+        LoadError,
+        match=rf"^basis cur: run {stage.run_id} is an aggregation run; a basis reads projection "
+        r"runs$",
+    ):
+        group_series(Release, {"cur": [stage]}, {"H0": ["G0", "G1"]})
+
+
+class AtAll(Aggregation):
+    """``series.cu_g.at(t + 1)`` reaches month H + 1 at t = H for every group."""
+
+    model_point = STAGE_SCHEMA
+    bases = (Basis("cur"),)
+    series = (GroupSum("cu_g", "cur", "cu", "CoverageUnits"),)
+
+    @var
+    def ahead(self, t: Int) -> CoverageUnits:
+        return self.series.cu_g.at(t + 1)
+
+
+def test_an_at_beyond_the_series_names_every_group(
+    cur: dict[str, list[RunResult]], tmp_path: Path
+) -> None:
+    """The failing mask has a month axis and no group axis; the message names the groups at
+    every batch size, not only in a batch of one."""
+    series = group_series(AtAll, cur, MEMBERS)
+    for batch_size, named in ((1, "G0"), (2, "G0, G1")):
+        with pytest.raises(
+            RunError,
+            match=r"series\.cu_g\.at\(\.\.\.\) reads a month outside the months of series cu_g, "
+            rf"1\.\.12; groups {named}\n",
+        ):
+            run_stage(tmp_path, AtAll, series, name=f"at-all-{batch_size}", batch_size=batch_size)
 
 
 # ------------------------------------------------------------- the valuation date and horizon
@@ -1552,8 +1780,9 @@ def test_a_cur_basis_of_scalars_sets_the_stage_horizon(
     two["p_again"] = dataclasses.replace(two["p_again"], provenance=shifted)
     with pytest.raises(
         LoadError,
-        match=r"the stage's series of basis cur disagree on its horizon: series p_g records "
-        r"H = 12; series p_again records H = 24",
+        match=r"^series p_again and series p_g of basis cur record other basis_horizon; the "
+        r"series of a basis are summed from the same runs over the same members \(one "
+        r"group_series call\)$",
     ):
         run_stage(tmp_path, TwoCur, two, name="two-cur")
 

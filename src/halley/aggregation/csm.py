@@ -272,8 +272,11 @@ def _i11_rhs(a: BatchView) -> NDArray[Any]:
 
 
 def _i11_scale(a: BatchView, lhs: NDArray[Any], rhs: NDArray[Any]) -> NDArray[Any]:
-    """CSM(t - 1) + |Acc(t)| + R(t): the size of the terms combined."""
-    return (a.var("csm")[:-1] + np.abs(a.var("acc")[1:])) + a.var("release")[1:]
+    """|CSM(t - 1)| + |Acc(t)| + |R(t)|: the size of the terms combined, which is CSM(t - 1) +
+    |Acc(t)| + R(t) on a CSM and a release that are never negative. Taken in absolute value so
+    that a broken stage whose CSM or release went negative gets a positive tolerance, and the
+    recursion reports a residual against it rather than any residual against a negative one."""
+    return (np.abs(a.var("csm")[:-1]) + np.abs(a.var("acc")[1:])) + np.abs(a.var("release")[1:])
 
 
 def _from_the_last_units(a: BatchView) -> NDArray[np.bool_]:
@@ -324,7 +327,11 @@ def _i13_rhs(a: BatchView) -> NDArray[Any]:
 
 
 def _i13_where(a: BatchView) -> NDArray[np.bool_]:
-    return np.asarray((a.var("fcf_g") > 0) & (a.at("fcf_g", 0) > 0) & (a.at("lc", 0) > 0))
+    """Where F(t) > 0 and F(0) > 0: the annuity spec's I13, with LC(0) = 0 included, where the
+    ratio requires LC(t) = 0. In-force 12.2 restates it "where F(t) > 0 and LC(0) > 0", which
+    would leave a loss component that grows from 0 in a profitable group unchecked; this form
+    implies that one."""
+    return np.asarray((a.var("fcf_g") > 0) & (a.at("fcf_g", 0) > 0))
 
 
 def _p_g(a: BatchView, lhs: NDArray[Any], rhs: NDArray[Any]) -> NDArray[Any]:
@@ -400,7 +407,8 @@ ROLL_INVARIANTS = (
         months=(1, "H"),
         where=_i13_where,
         reads=("lc", "fcf_g"),
-        doc="the loss component's share of F is constant without a remeasurement, where F > 0",
+        doc="the loss component's share of F is constant without a remeasurement, where F(t) > 0 "
+        "and F(0) > 0 (so LC(t) = 0 in a group with LC(0) = 0)",
     ),
     Invariant(
         "I13 LC(t) = 0 where F(t) = 0",
@@ -451,14 +459,20 @@ I14 = Invariant(
     "I14 G3 for the group: CSM(0) = 0 if ONEROUS, else LC(0) = 0",
     _i14_lhs,
     0.0,
-    tol=0,
-    reads=("csm_0", "lc_0"),
+    tol=EPS,
+    scale=_p_g,
+    reads=("csm_0", "lc_0", "p_g"),
     doc="every contract of an ONEROUS group is onerous, so P_g < FCF_g(0), and no contract of "
-    "another group is, so P_g >= FCF_g(0); the member rule G3 checks each contract at load",
+    "another group is, so P_g >= FCF_g(0), within 1e-12 x P_g; the member rule G3 checks each "
+    "contract exactly at load",
 )
 """The annuity spec's I14 as the stage can check it on its own figures: the group-level
 consequence of G3 holding for every contract. The per-contract test is the member rule
-:data:`G3`, which the loader evaluates on the runs' ``onerous`` outputs."""
+:data:`G3`, which the loader evaluates on the runs' ``onerous`` outputs, exactly. The group sums
+P_g and FCF_g(0) in another order than each contract's test (``P_i - (BEL_i(0) + RA_i(0))``,
+FCF formed first), so contracts that each tie exactly can leave a group balance of a few ulps
+of P_g on the wrong side; I14 accepts it within 1e-12 x P_g, the scale of the stage's other
+invariants."""
 
 # ------------------------------------------------------------------------------ member rules
 

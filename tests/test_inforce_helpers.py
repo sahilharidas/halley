@@ -610,6 +610,21 @@ def test_the_recomputations_are_registered_and_reproduce_every_derived_file() ->
     assert file_difference(f, recompute_rebased(_check(f, "rebased_from", find))) == (
         f"column rf_df, row 5: {values[5]!r} against {p_l.table.column('rf_df')[5].as_py()!r}"
     )
+    # bit for bit is the values, the column types and the halley.* metadata: a file whose values
+    # are the recomputation's but whose metadata carries one entry more, or whose month column
+    # is another integer type, is not the recomputed file either
+    noted = dict(p_l.table.schema.metadata)
+    noted[b"halley.note"] = b"typed by hand"
+    f = read_source(p_l.table.replace_schema_metadata(noted), "noted p_l")
+    difference = file_difference(f, recompute_rebased(_check(f, "rebased_from", find)))
+    assert difference is not None
+    assert difference.startswith("metadata {")
+    assert "typed by hand" in difference
+    wide = p_l.table.set_column(1, "t", p_l.table.column("t").cast(pa.int64()))
+    f = read_source(wide.replace_schema_metadata(p_l.table.schema.metadata), "wide p_l")
+    assert file_difference(f, recompute_rebased(_check(f, "rebased_from", find))) == (
+        "column t is int64 against int32"
+    )
     by_hand = dict(p_l.table.schema.metadata)
     by_hand[b"halley.helper"] = b"by_hand"
     f = read_source(p_l.table.replace_schema_metadata(by_hand), "by hand")
@@ -617,6 +632,31 @@ def test_the_recomputations_are_registered_and_reproduce_every_derived_file() ->
         recompute_rebased(_check(f, "rebased_from", find))
     with pytest.raises(LoadError, match="no file with sha256"):
         recompute_rebased(_check(files["expense_old"], "rebased_from", _finder({})))
+
+
+def test_a_source_not_found_is_reported_against_the_file_being_verified() -> None:
+    """The finder's refusal names only the sha256 it looked for; the loader reports it against
+    the file it was verifying (a later period whose recognition runs moved, say), with the
+    metadata entry it recomputes from. A helper's refusal that names the file already is left
+    as it is."""
+    p_l = read_source(_file("p_l"), "scenario input p_l")
+    nowhere = stage_module._Finder([], None, {}, None)
+    with pytest.raises(LoadError) as info:
+        stage_module._verify_provenance(iter([p_l]), nowhere, V, {}, None)
+    message = str(info.value)
+    source = p_l.metadata["rebased_from"]
+    assert message.startswith(
+        f"scenario input p_l ({_file('p_l')}): recomputing it from halley.rebased_from = "
+        f"{source}: no file with sha256 {source} in the stage's inputs"
+    )
+    by_hand = dict(p_l.table.schema.metadata)
+    by_hand[b"halley.helper"] = b"by_hand"
+    f = read_source(p_l.table.replace_schema_metadata(by_hand), "scenario input p_l")
+    with pytest.raises(LoadError) as info:
+        stage_module._verify_provenance(iter([f]), nowhere, V, {}, None)
+    assert str(info.value).startswith(
+        "scenario input p_l: carries halley.rebased_from, but its halley.helper is 'by_hand'"
+    )
 
 
 def test_the_expected_in_force_is_recomputed_from_the_run_it_names(

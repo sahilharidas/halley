@@ -433,6 +433,89 @@ def test_recompute_mirrors_the_reciprocal_fast_path_inside_ann_spot(tmp_path: Pa
             assert recompute(res, pid, "spot", t) == lane[t], (pid, t)
 
 
+class SpotByMonth(Product):
+    """``ann_spot`` at the month itself: the emitted exponent ``-12 / _t[1:H+1]`` is the month
+    column, an array, which is exactly -1.0 at t = 12."""
+
+    model_point = MID_SCHEMA
+
+    @var(domain="state")
+    def df(self, t: Int) -> Factor:
+        return self.mp.disc
+
+    @var
+    def spot(self, t: Int) -> Rate[Annual]:
+        return ann_spot(self.df(t), t)
+
+
+def test_recompute_takes_libm_pow_for_the_month_exponent_of_ann_spot(tmp_path: Path) -> None:
+    """A month-column exponent over a window of several months takes libm's pow at every batch
+    size, so ``ann_spot(df(t), t)`` at t = 12 is ``d ** -1.0 - 1``, not the reciprocal, and the
+    interpreter, which routes ``ann_spot``'s power by the kinds of both operands, agrees bit for
+    bit at every month."""
+    discs = _reciprocal_fast_path_values()
+    compiled = build(SpotByMonth)
+    assert "** (-12 / _t[1:H+1])" in compiled.source
+    for batch_size in (1, 3):
+        res = run(
+            compiled,
+            model_points=_points(discs, rem_m=12),
+            settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+            run_dir=tmp_path / f"spot-{batch_size}",
+        )
+        for pid, d in zip(res.ids, discs, strict=True):
+            lane = res.lane("spot", pid)
+            assert lane[12] == (d**-1.0) - 1  # libm's pow
+            assert lane[12] != (1.0 / d) - 1  # not the reciprocal fast path
+            for t in range(res.H + 1):
+                assert recompute(res, pid, "spot", t) == lane[t], (batch_size, pid, t)
+
+
+class InverseByMonth(Product):
+    """A model point field raised to the negated month column, ``M_disc ** (-_t[1:H+1])``."""
+
+    model_point = MID_SCHEMA
+
+    @var
+    def inv(self, t: Int) -> Factor:
+        return self.mp.disc ** (-t)
+
+
+def test_a_month_exponent_over_one_month_takes_the_fast_path(tmp_path: Path) -> None:
+    """The documented exception to the month-column rule: over a one-month window (H = 1 for a
+    formula from t = 1) the month column is a size-one array and NumPy takes its reciprocal fast
+    path at every batch size, so the stored value is ``1 / d`` while ``recompute`` (libm's pow)
+    differs from it in the last place. Over two months the column takes pow and the two agree
+    bit for bit. A NumPy that chooses otherwise fails here, which flags the documented rule."""
+    discs = _reciprocal_fast_path_values()
+    compiled = build(InverseByMonth)
+    assert "(M_disc ** (-_t[1:H+1]))" in compiled.source
+    for batch_size in (1, 3):
+        one = run(
+            compiled,
+            model_points=_points(discs, rem_m=1),
+            settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+            run_dir=tmp_path / f"one-month-{batch_size}",
+        )
+        two = run(
+            compiled,
+            model_points=_points(discs, rem_m=2),
+            settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+            run_dir=tmp_path / f"two-months-{batch_size}",
+        )
+        for pid, d in zip(one.ids, discs, strict=True):
+            stored = one.lane("inv", pid)[1]
+            assert stored == 1.0 / d  # the reciprocal fast path
+            again = recompute(one, pid, "inv", 1)
+            assert again == d**-1.0  # libm's pow
+            assert abs(again - stored) <= 1e-12 * abs(stored)
+            lane = two.lane("inv", pid)
+            assert lane[1] == d**-1.0
+            assert lane[1] != 1.0 / d
+            for t in range(two.H + 1):
+                assert recompute(two, pid, "inv", t) == lane[t], (batch_size, pid, t)
+
+
 def test_diff_locates_the_largest_change(
     compiled_term: CompiledModel,
     reference_sources: dict[str, Any],

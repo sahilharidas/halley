@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
 from halley import (
@@ -652,30 +653,41 @@ def test_at_requires_an_integer_index(tmp_path: Path) -> None:
 
 
 def test_the_view_is_read_only(tmp_path: Path) -> None:
-    """``a.mp.<field>``, ``a.table``, ``a.scen`` and ``a.scale`` are views of the loaded inputs
-    (the Money scale here is the premium column itself); writing into one raises, and the inputs
-    are untouched for the later batches and the run's result."""
+    """``a.mp.<field>``, ``a.table``, ``a.scen``, ``a.scale``, ``a.ids`` and ``a.t`` are views of
+    the loaded inputs or shared by the batch's invariants (the Money scale here is the premium
+    column itself); writing into one raises, and the inputs are untouched for the later
+    invariants and batches and for the run's result and its files."""
     refused: list[str] = []
+    seen_t: list[int] = []
 
     def tamper(a: BatchView) -> Any:
         targets = {
-            "mp": a.mp.premium,
-            "table": a.table("margin", "share"),
-            "scen": a.scen("df", 1),
-            "scen_range": a.scen_range("df", 0, 2),
-            "scale": a.scale("Money"),
+            "mp": (a.mp.premium, 999.0),
+            "table": (a.table("margin", "share"), 999.0),
+            "scen": (a.scen("df", 1), 999.0),
+            "scen_range": (a.scen_range("df", 0, 2), 999.0),
+            "scale": (a.scale("Money"), 999.0),
+            "ids": (a.ids, "ZZZ"),
+            "t": (a.t, 999),
         }
-        for name, target in targets.items():
+        for name, (target, value) in targets.items():
             try:
-                target[...] = 999.0
+                target[...] = value
             except ValueError:
                 refused.append(name)
+        return a.var("x")
+
+    def later(a: BatchView) -> Any:
+        seen_t.append(int(a.t[0, 0, 0]))
         return a.var("x")
 
     class Tampering(Margin):
         scenario_inputs = Indexed.scenario_inputs[:1]
         tolerance_scales: ClassVar[dict[str, str]] = {"Money": "premium"}
-        invariants = (Invariant("x >= 0", tamper, 0.0, kind="ge", tol=0),)
+        invariants = (
+            Invariant("x >= 0", tamper, 0.0, kind="ge", tol=0),
+            Invariant("x >= 0 again", later, 0.0, kind="ge", tol=0),
+        )
 
         @var
         def disc(self, t: Int) -> Factor:
@@ -690,13 +702,18 @@ def test_the_view_is_read_only(tmp_path: Path) -> None:
         settings=RunSettings(valuation_date=VAL, batch_size=1),
         run_dir=tmp_path / "tamper",
     )
-    assert refused == ["mp", "table", "scen", "scen_range", "scale"] * 3
+    assert refused == ["mp", "table", "scen", "scen_range", "scale", "ids", "t"] * 3
+    assert seen_t == [0, 0, 0]
     assert res.invariants[-1].passed
     assert res.inputs is not None
     assert list(res.inputs.model_points.columns["premium"]) == [10.0, 20.0, 30.0]
     assert res.inputs.tables["margin"].values["share"][()] == 0.5
     assert res.inputs.scenarios["df"].values[1, 0, 0] == 0.99
     assert res.inputs.scenarios["df"].values[2, 0, 0] == 0.99**2
+    assert list(res.ids) == ["S00", "S01", "S02"]
+    assert list(res.inputs.model_points.ids) == ["S00", "S01", "S02"]
+    monthly = pq.read_table(res.run_dir / "outputs" / "monthly.parquet")
+    assert sorted(set(monthly.column("policy_id").to_pylist())) == ["S00", "S01", "S02"]
 
 
 def test_a_one_row_result_under_a_window_names_the_window(tmp_path: Path) -> None:
