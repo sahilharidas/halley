@@ -116,6 +116,7 @@ formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spe
 | `src/halley/aggregation` | aggregation stages over group series: portfolio totals and the IFRS 17 CSM roll-forward (NewGroup, InForceGroup) |
 | `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib), the annuities `LevelAnnuity`, `FixedEscalationAnnuity` and `CPILinkedAnnuity` (the annuity spec) and their reference inputs |
 | `docs/spec` | product specifications, their number scripts and the reference inputs |
+| `benchmarks` | the Spec's workloads W1 and W2 on each backend (the harness and results come with M6's benchmark stage) |
 | `tests/data/lifelib` | lifelib's `BasicTerm_ME` inputs and results (MIT), the oracle for reference case 2 |
 
 ## Licence
