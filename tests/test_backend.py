@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,13 @@ from models import (
     Expensed,
     Growth,
     Indexed,
+    IntPowers,
+    Inverted,
     Margin,
     Powered,
     closed_form_expensed,
     closed_form_growth,
+    int_powers_expected,
     margin_table,
     powered_model_points,
     run_growth,
@@ -491,6 +495,54 @@ def test_the_interpreter_agrees_with_the_generated_code(tmp_path: Path) -> None:
             assert recompute(res, pid, name, 0) == res.lane(name, pid)[0], (pid, name)
 
 
+def test_not_is_logical_whatever_the_generated_code_holds(tmp_path: Path) -> None:
+    """``~`` of a Bool is logical not: inside a recursion ``t > 9`` and ``self.run.horizon <
+    t`` are Python bools, as is ``self.run.horizon > 5`` in a variable without a time
+    dimension, and Python's ``~True`` is -2, which ``where`` takes as true. The interpreter
+    agrees with every stored value."""
+    res = run(
+        build(Inverted),
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "run",
+    )
+    early = [0.0] + [1.0 if t <= 9 else 0.0 for t in range(1, 13)]  # 0.0 at t = 0: the init
+    assert list(res.lane("stepped", "S00")) == early  # and a domain from t = 1
+    assert list(res.lane("whole", "S00")) == early
+    assert res.lane("short", "S00")[0] == 0.0
+    for pid in res.ids:
+        for t in range(13):
+            for name in ("stepped", "whole"):
+                assert recompute(res, pid, name, t) == res.lane(name, pid)[t], (pid, name, t)
+        assert recompute(res, pid, "short", 0) == res.lane("short", pid)[0]
+
+
+def test_an_integer_literal_to_an_int_power_is_a_float_power(tmp_path: Path) -> None:
+    """``2 ** t`` is a Factor, raised as a float: NumPy's int64 power wrapped past 2**63
+    (``2 ** 63`` was -9.2e18 and ``2 ** 64`` 0.0 over the month column) and refused a negative
+    exponent, and ``-2 ** t``, as the generated code spelled ``(-2) ** t``, was ``-(2 ** t)``.
+    Whole mode, a recursion, a base of literals and a variable without a time dimension; the
+    interpreter agrees with every stored value."""
+    res = run(
+        build(IntPowers),
+        model_points=simple_model_points(rem_m=70),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "run",
+    )
+    graph = res.graph
+    assert graph is not None
+    names = ("whole", "stepped", "halves", "signs", "chosen", "chosen_stepped")
+    for pid in res.ids:
+        for name in names:
+            lane = res.lane(name, pid)
+            for t in range(graph.variables[name].formula_range[0], 71):
+                assert lane[t] == pytest.approx(int_powers_expected(name, t), rel=1e-15)
+                assert recompute(res, pid, name, t) == lane[t], (pid, name, t)
+        assert res.lane("scalar", pid)[0] == 2.0**70 == recompute(res, pid, "scalar", 0)
+    assert res.lane("whole", "S00")[63:65].tolist() == [2.0**63, 2.0**64]
+    assert res.lane("signs", "S00")[63] == -(2.0**63)
+
+
 def test_outputs_can_be_restricted_at_run_time(tmp_path: Path) -> None:
     res = run_growth(tmp_path, outputs=("r", "total"))
     assert set(res.manifest["outputs"]["variables"]) == {"r", "total"}
@@ -543,6 +595,16 @@ def test_the_numpy_backends_run_ids_do_not_move(term_run: RunResult) -> None:
     if np.__version__ != "2.5.4":
         pytest.skip(f"the pinned run id was recorded with NumPy 2.5.4, not {np.__version__}")
     assert term_run.run_id == PINNED_RUN_ID
+
+
+def test_the_default_test_run_holds_the_numba_backend_to_this_one() -> None:
+    """D16: every backend is tested against the NumPy one, so the default ``pytest`` run, the
+    gate a change passes, selects the Numba backend's differentials; ``-m "not numba"`` leaves
+    them out only when asked."""
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    options = tomllib.loads(pyproject.read_text(encoding="utf-8"))["tool"]["pytest"]
+    assert "numba" not in options["ini_options"]["addopts"]
+    assert any(m.startswith("numba:") for m in options["ini_options"]["markers"])
 
 
 def test_an_unknown_backend_is_a_build_error() -> None:

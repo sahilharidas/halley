@@ -3254,7 +3254,7 @@ def replay_aggregation(
     the previous run are not read, so they may have moved or gone; the manifest blocks that
     record them are carried over, with ``replayed_from``. ``compiled`` is the stage that made
     the run: a run directory holds the generated code, not the model, and a stage with another
-    IR is a LoadError.
+    IR, or built for another backend than the run's, is a LoadError.
 
     The replay is then compared with the run (:func:`_compare_replay`):
     ``replayed_from.matches`` records whether it has the run's id, values and output files bit
@@ -3270,6 +3270,13 @@ def replay_aggregation(
         raise LoadError(
             f"{source} was made by a stage with ir_sha256 {manifest.get('ir_sha256')}, but "
             f"{compiled.name} has {compiled.ir_hash}; replay it with the stage that made it"
+        )
+    made_by = str(manifest.get("backend", {}).get("name", "numpy"))
+    if made_by != compiled.backend:
+        raise LoadError(
+            f"{source} was made on the {made_by} backend, but {compiled.name} was built for the "
+            f"{compiled.backend} backend; replay it with the stage that made it, built with "
+            f"backend={made_by!r}"
         )
     groups = v.read(inputs["groups"], "groups")
     derived = v.read(inputs["derived_groups"], "derived group fields")

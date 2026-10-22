@@ -295,6 +295,27 @@ def value_kind(node: ir.Node, step: bool) -> str:
     return ARRAY  # VarRead, VarAt, SumT, MpField, ScenRead, ScenAt, SeriesRead, SeriesAt
 
 
+def float_power(node: ir.Binary) -> bool:
+    """Whether ``node`` raises an integer literal, or a value built from integer literals alone
+    (``where(c, 2, 3)``), to an Int power. The checker makes the result a Factor, and the
+    generated code raises the base as a float: NumPy raises an int64 to an int64 power in
+    int64, which wraps past 2**63 without a word and refuses a negative exponent, and inside a
+    recursive component Python's ints would give an exact integer instead. The ``explain``
+    interpreter raises the same float."""
+    return node.op == "pow" and node.a.unit == units.INTEGER and node.b.unit == units.INT
+
+
+def negative_literal(node: ir.Node) -> bool:
+    """Whether ``node`` is a negative numeric literal, which the base of ``**`` must emit in
+    parentheses: ``-2 ** t`` is ``-(2 ** t)`` in Python."""
+    return (
+        isinstance(node, ir.Const)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+        and node.value < 0
+    )
+
+
 # ---------------------------------------------------------------------------- generation
 
 
@@ -410,10 +431,14 @@ class _Generator:
         if isinstance(node, ir.RunConst):
             return f"R_{node.name}"
         if isinstance(node, ir.Unary):
-            op = "-" if node.op == "neg" else "~"
-            return f"({op}{self.expr(node.a, ctx)})"
+            if node.op == "neg":
+                return f"(-{self.expr(node.a, ctx)})"
+            # not ~: a comparison of plain Python numbers (t in a recursive component, a run
+            # constant, a literal) is a Python bool, and ~True is -2, which is true
+            return f"np.logical_not({self.expr(node.a, ctx)})"
         if isinstance(node, ir.Binary):
-            return f"({self.expr(node.a, ctx)} {_BINOPS[node.op]} {self.expr(node.b, ctx)})"
+            a = self.pow_base(node, ctx) if node.op == "pow" else self.expr(node.a, ctx)
+            return f"({a} {_BINOPS[node.op]} {self.expr(node.b, ctx)})"
         if isinstance(node, ir.Where):
             return (
                 f"np.where({self.expr(node.cond, ctx)}, {self.expr(node.a, ctx)}, "
@@ -423,6 +448,21 @@ class _Generator:
             args = [self.expr(a, ctx) for a in node.args]
             return self.call(node.fn, args)
         raise BuildError(f"unknown node {type(node).__name__}", node.loc)
+
+    def pow_base(self, node: ir.Binary, ctx: _Ctx) -> str:
+        """The base of ``a ** b``: a float where :func:`float_power` says so, converted without
+        changing what the code holds (:func:`value_kind`: a scalar stays a scalar, a 0-d array
+        a 0-d array), so the power takes the path it took before; a negative literal in
+        parentheses (:func:`negative_literal`)."""
+        base = node.a
+        if isinstance(base, ir.Const) and float_power(node):
+            a = repr(float(base.value))
+        else:
+            a = self.expr(base, ctx)
+            if float_power(node):
+                scalar = value_kind(base, ctx.mode == "step") == SCALAR
+                a = f"float({a})" if scalar else f"np.asarray({a}, dtype=np.float64)"
+        return f"({a})" if negative_literal(base) else a
 
     @staticmethod
     def call(fn: str, args: list[str]) -> str:

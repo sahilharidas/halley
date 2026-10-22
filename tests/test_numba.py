@@ -20,11 +20,15 @@ later sessions. The module is marked ``numba``.
 from __future__ import annotations
 
 import copy
+import getpass
 import hashlib
 import importlib
 import json
+import os
 import re
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -47,6 +51,7 @@ from halley import (
     Field,
     Int,
     Key,
+    LoadError,
     Money,
     Monthly,
     Prob,
@@ -55,6 +60,7 @@ from halley import (
     RunError,
     RunResult,
     RunSettings,
+    ScenarioInput,
     Schema,
     Table,
     ann_fwd,
@@ -68,6 +74,7 @@ from halley import (
     ir,
     load_run,
     run,
+    sum_t,
     to_monthly,
     to_monthly_cf,
     to_monthly_prob,
@@ -93,6 +100,7 @@ from halley.products.lifelib_basic_term import VALUATION_DATE as LIFELIB_DATE
 from halley.products.lifelib_basic_term import BasicTerm
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
 from halley.runtime import within
+from halley.runtime.run import backend_identity
 from models import (
     MEMBERS,
     SIMPLE_SCHEMA,
@@ -100,6 +108,8 @@ from models import (
     Expensed,
     Growth,
     Indexed,
+    IntPowers,
+    Inverted,
     Margin,
     Powered,
     Release,
@@ -383,6 +393,36 @@ def test_the_in_force_chain(
     replay = replay_aggregation(numba_in_force_group, got.stage.run_dir, run_dir=tmp_path / "re")
     assert replay.run_id == got.stage.run_id
     assert replay.manifest["replayed_from"]["matches"] is True
+    if k != "P":
+        return
+    # a run is replayed on the backend that made it: the other one is a LoadError, not a run
+    # whose id differs for a reason the manifest's backend block seems to explain
+    for stage, made, other, by in (
+        (compiled_in_force_group, got.stage, "numba", "numpy"),
+        (numba_in_force_group, want.stage, "numpy", "numba"),
+    ):
+        with pytest.raises(
+            LoadError,
+            match=rf"^{re.escape(str(made.run_dir))} was made on the {other} backend, but "
+            rf"{re.escape(stage.name)} was built for the {by} "
+            rf"backend; replay it with the stage that made it, built with backend='{other}'$",
+        ):
+            replay_aggregation(stage, made.run_dir, run_dir=tmp_path / f"re-{by}")
+    # another Numba or llvmlite compiles other kernels and moves the run id: recorded
+    versions = numba_backend.NumbaBackend().versions()
+    for entry in ("numba", "llvmlite"):
+        edited = tmp_path / f"other-{entry}"
+        shutil.copytree(got.stage.run_dir, edited)
+        path = edited / "manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["backend"][entry] = "0.0"
+        manifest["run_id"] = "0" * 16
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        replay = replay_aggregation(numba_in_force_group, edited, run_dir=tmp_path / f"re-{entry}")
+        record = replay.manifest["replayed_from"]
+        assert record["matches"] is False
+        assert record["differences"] == [f"run id {got.stage.run_id} against {'0' * 16}"]
+        assert record["environment"] == {entry: {"run": "0.0", "replay": versions[entry]}}
 
 
 def test_an_aggregation_stage_over_group_series(tmp_path: Path) -> None:
@@ -457,6 +497,109 @@ def test_the_engine_test_models(tmp_path: Path) -> None:
         if case == "growth":
             assert list(got.var("masked")[:5, 0, 0]) == [0.0, 0.0, 0.0, 1.0, 0.5]
             assert np.isfinite(got.arrays["ratio"]).all()
+
+
+def test_not_of_plain_numbers(tmp_path: Path) -> None:
+    """``~`` of ``t > 9`` and of a run constant's comparison inside a recursion and in a
+    variable without a time dimension, where the NumPy backend's code holds Python bools, and in
+    whole mode: logical not on both backends."""
+
+    def go(backend: str) -> RunResult:
+        return run(
+            built(Inverted, backend),
+            model_points=simple_model_points(),
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        )
+
+    got = on_both(go)
+    early = [0.0] + [1.0 if t <= 9 else 0.0 for t in range(1, 13)]
+    assert list(got.lane("stepped", "S00")) == early
+    assert list(got.lane("whole", "S00")) == early
+    assert got.lane("short", "S00")[0] == 0.0
+
+
+def test_an_integer_literal_to_an_int_power(tmp_path: Path) -> None:
+    """``2 ** t`` over the month column and inside a recursion, ``2 ** -t``, ``(-2) ** t`` and
+    a base of literals, past 2**63: a float power on both backends, with the sign of a negative
+    base."""
+
+    def go(backend: str) -> RunResult:
+        return run(
+            built(IntPowers, backend),
+            model_points=simple_model_points(rem_m=70),
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        )
+
+    got = on_both(go)
+    assert got.lane("whole", "S00")[63:67].tolist() == [2.0**63, 2.0**64, 2.0**65, 2.0**66]
+    assert got.lane("stepped", "S00")[64] == 2.0**64
+    assert got.lane("signs", "S00")[63:65].tolist() == [-(2.0**63), 2.0**64]
+    assert got.lane("halves", "S00")[70] == 2.0**-70
+    assert got.lane("scalar", "S00")[0] == 2.0**70
+
+
+class Shares(Growth):
+    """``sum_t`` read in formulas with a time dimension, in whole mode and inside a forward
+    recursion: the total does not depend on the month, so a kernel takes it once per lane."""
+
+    @var
+    def share(self, t: Int) -> Factor:
+        return self.cf(t) / sum_t(self.cf)
+
+    @var(init=0.0)
+    def cum(self, t: Int) -> Factor:
+        return self.cum(t - 1) + self.cf(t) / sum_t(self.cf)
+
+
+def test_a_total_read_every_month(tmp_path: Path) -> None:
+    def go(backend: str) -> RunResult:
+        return run(
+            built(Shares, backend),
+            model_points=simple_model_points(),
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        )
+
+    got = on_both(go)
+    assert got.var("cum")[-1, :, 0] == pytest.approx([1.0, 1.0, 1.0], rel=1e-12)
+    # each kernel that sums cf does so before its loop over months, not at every month
+    kernels = [k for k in built(Shares, "numba").source.split("\ndef k_")[1:] if "for _u" in k]
+    assert len(kernels) == 3  # total, share and cum
+    for kernel in kernels:
+        assert kernel.count("for _u in range(2, H + 1):") == 1
+        if "for t in range" in kernel:
+            assert kernel.index("for _u in range") < kernel.index("for t in range")
+
+
+DUNDER = Table("mort__base", keys=(Key("k", lo=0, hi=10),), columns=(Column("v", "Factor"),))
+
+
+class Dunder(Product):
+    """A table whose name holds a double underscore, which the generated argument names of a
+    table's columns also use (``T_<table>__<column>``)."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (DUNDER,)
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return self.tables.mort__base[where(t < 10, t, 10)]
+
+
+def test_a_table_named_with_a_double_underscore(tmp_path: Path) -> None:
+    def go(backend: str) -> RunResult:
+        return run(
+            built(Dunder, backend),
+            model_points=simple_model_points(),
+            tables={"mort__base": bump_table()},
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        )
+
+    got = on_both(go)
+    assert got.lane("x", "S00")[12] == pytest.approx(1.0, rel=1e-12)
 
 
 def test_a_non_literal_exponent(tmp_path: Path) -> None:
@@ -1012,6 +1155,84 @@ def test_a_scenario_month_outside_the_file(tmp_path: Path) -> None:
     )
 
 
+FRACTIONAL_SCHEMA = Schema(
+    fields=(
+        Field("policy_id", "string", unique=True),
+        Field("j", "number", "Int"),
+        Field("pols_if_init", "number", "Count", gt=0),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+)
+
+
+class FractionalAt(Product):
+    """A month from a model point field of kind ``number`` with unit ``Int``, whose values the
+    loader does not hold to whole numbers: the NumPy backend tests the value against the domain
+    and truncates it afterwards, so 12.5 and -0.5 are outside months 0..12 and 3.7 reads month
+    3."""
+
+    model_point = FRACTIONAL_SCHEMA
+
+    @var(init=lambda mp: mp.pols_if_init)
+    def x(self, t: Int) -> Count:
+        return self.x(t - 1) * 0.99
+
+    @var
+    def y(self) -> Count:
+        return at(self.x, self.mp.j)
+
+
+class FractionalScen(Product):
+    """``scen.df.at(j)`` with such a month: -0.5 is before the file's first row, 12.5 is in its
+    last row (row 12 of 13), as NumPy truncates it."""
+
+    model_point = FRACTIONAL_SCHEMA
+    scenario_inputs = (ScenarioInput("df", "Factor"),)
+
+    @var
+    def d(self, t: Int) -> Factor:
+        return self.scen.df.at(self.mp.j) * 1.0
+
+
+def fractional_points(j: float) -> Any:
+    return pa.table(
+        {
+            "policy_id": pa.array(["F0", "F1"], pa.string()),
+            "j": pa.array([j, 3.0], pa.float64()),
+            "pols_if_init": pa.array([1.0, 2.0], pa.float64()),
+            "rem_m": pa.array([12, 12], pa.int32()),
+        }
+    )
+
+
+def test_a_fractional_month(tmp_path: Path) -> None:
+    df = scenario_file("df", 0, 12, 1, lambda s, u: 0.99**u)
+
+    def go(model: type[Product], j: float, backend: str) -> RunResult:
+        return run(
+            built(model, backend),
+            model_points=fractional_points(j),
+            scenarios={"df": df} if model is FractionalScen else None,
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / f"{model.__name__}-{j}-{backend}",
+        )
+
+    inside = on_both(lambda backend: go(FractionalAt, 3.7, backend))
+    assert inside.lane("y", "F0")[0] == inside.lane("x", "F0")[3]
+    last = on_both(lambda backend: go(FractionalScen, 12.5, backend))
+    assert last.lane("d", "F0")[1] == 0.99**12
+    for j in (12.5, -0.5):
+        same_error(
+            lambda backend, j=j: go(FractionalAt, j, backend),
+            r"^at\(x, \.\.\.\) reads a month outside the domain of x, months 0\.\.12; policies F0$",
+        )
+    same_error(
+        lambda backend: go(FractionalScen, -0.5, backend),
+        r"^scen\.df\.at\(\.\.\.\) reads a month outside the scenario file; policies F0$",
+    )
+
+
 def test_a_series_month_outside_the_series(tmp_path: Path) -> None:
     bases = release_bases(tmp_path / "bases")
     keyed = group_series(Keyed, bases, MEMBERS)
@@ -1077,7 +1298,14 @@ def test_the_run_directory_and_manifest(tmp_path: Path) -> None:
     assert "platform" in block
     assert "pyarrow" in block
     assert set(numpy_run.manifest["backend"]) == {"name", "numpy", "pyarrow", "python", "platform"}
-    # the identity adds the Numba and llvmlite versions: another backend is another run
+    # the identity adds the Numba and llvmlite versions, which compile the kernels: two builds
+    # on another Numba or llvmlite are two runs, and another backend is another run
+    assert backend_identity("numba", block) == {
+        "name": "numba",
+        "numpy": np.__version__,
+        "numba": numba.__version__,
+        "llvmlite": llvmlite.__version__,
+    }
     assert res.run_id != numpy_run.run_id
     back = load_run(d, verify=True)
     assert back.run_id == res.run_id
@@ -1113,6 +1341,47 @@ def test_the_generated_module_and_its_cache(
     # the generated code keeps the model's grouping and compiles with fast-math off
     assert 'fastmath=False, error_model="numpy"' in compiled.source
     assert "V_r[t, p, s] = ((V_r[t+1, p, 0] + V_cf[t+1, p, 0]) * 0.5)" in compiled.source
+
+
+def test_the_default_cache_directory_is_the_users_own(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without ``HALLEY_NUMBA_CACHE`` the modules go to ``halley-numba-<user>`` under the
+    temporary directory, which Linux and macOS share between users: created private to the
+    user, and refused if another user owns it or can write to it, since Numba loads the
+    compiled kernels it holds."""
+    monkeypatch.delenv(numba_backend.CACHE_ENV, raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    user = re.sub(r"[^A-Za-z0-9_.-]", "_", getpass.getuser())
+    directory = tmp_path / f"halley-numba-{user}"
+    assert numba_backend.cache_dir() == directory
+    path = numba_backend.store_module("0" * 64, "X = 1\n")
+    assert path == directory / f"{'0' * 64}.py"
+    assert path.read_text(encoding="utf-8") == "X = 1\n"
+    if hasattr(os, "getuid"):
+        assert directory.stat().st_mode & 0o077 == 0
+    monkeypatch.setattr(os, "getuid", lambda: directory.stat().st_uid + 1, raising=False)
+    with pytest.raises(
+        BuildError,
+        match=rf"^the Numba backend's cache directory {re.escape(str(directory))} belongs to "
+        r"another user or others can write to it, and Numba loads the compiled kernels it holds: "
+        r"remove it, or set HALLEY_NUMBA_CACHE to a directory of your own$",
+    ):
+        numba_backend.store_module("0" * 64, "X = 1\n")
+
+
+def test_a_cache_directory_that_cannot_be_written_is_a_build_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "a-file"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setenv(numba_backend.CACHE_ENV, str(blocker))
+    with pytest.raises(
+        BuildError,
+        match=rf"^the Numba backend cannot write its module to {re.escape(str(blocker))}: .+; "
+        r"set HALLEY_NUMBA_CACHE to a directory you can write to$",
+    ):
+        numba_backend.store_module("0" * 64, "X = 1\n")
 
 
 def test_a_kernel_numba_cannot_compile_is_a_build_error(

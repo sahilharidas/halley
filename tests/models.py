@@ -118,6 +118,75 @@ class Growth(Product):
         return at(self.cf, self.mp.k)
 
 
+class Inverted(Growth):
+    """``~`` of comparisons between plain numbers: of ``t`` and of a run constant inside a
+    forward recursion and of a run constant in a variable without a time dimension, where the
+    NumPy backend's generated code holds Python bools (``~True`` is -2, which is true), and of
+    ``t`` in whole mode, where it holds an array. ``stepped`` and ``whole`` are 1.0 up to month
+    9 and 0.0 after it; ``short`` is 0.0 over a horizon of more than 5 months."""
+
+    @var(init=0.0)
+    def stepped(self, t: Int) -> Factor:
+        return self.stepped(t - 1) * 0 + where(~(t > 9) & ~(self.run.horizon < t), 1.0, 0.0)
+
+    @var
+    def whole(self, t: Int) -> Factor:
+        return where(~(t > 9), 1.0, 0.0)  # type: ignore[return-value] - literals take the unit
+
+    @var
+    def short(self) -> Factor:
+        return where(~(self.run.horizon > 5), 1.0, 0.0)  # type: ignore[return-value]
+
+
+class IntPowers(Product):
+    """An integer literal raised to an Int power, which the checker makes a Factor: over the
+    month column (whole mode), inside a forward recursion (where ``t`` is a Python int), to a
+    negative exponent, from a negative base, from a base built of integer literals alone in both
+    modes, and in a variable without a time dimension. Over 70 months ``2 ** t`` and ``3 ** t``
+    pass 2**63, where NumPy's int64 power wraps without a word."""
+
+    model_point = SIMPLE_SCHEMA
+
+    @var
+    def whole(self, t: Int) -> Factor:
+        return 2**t  # type: ignore[operator] - an int literal to an Int power
+
+    @var(init=1.0)
+    def stepped(self, t: Int) -> Factor:
+        return self.stepped(t - 1) * 0 + 2**t  # type: ignore[operator]
+
+    @var
+    def halves(self, t: Int) -> Factor:
+        return 2 ** (-t)  # type: ignore[operator]
+
+    @var
+    def signs(self, t: Int) -> Factor:
+        return (-2) ** t  # type: ignore[operator]
+
+    @var
+    def chosen(self, t: Int) -> Factor:
+        return where(t > 3, 3, 2) ** t  # type: ignore[operator]
+
+    @var(init=1.0)
+    def chosen_stepped(self, t: Int) -> Factor:
+        return self.chosen_stepped(t - 1) * 0 + where(t > 3, 3, 2) ** t  # type: ignore[operator]
+
+    @var
+    def scalar(self) -> Factor:
+        return 2**self.run.horizon  # type: ignore[operator]
+
+
+def int_powers_expected(name: str, t: int) -> float:
+    """What :class:`IntPowers` stores for ``name`` at month ``t``: the float power."""
+    if name in ("whole", "stepped"):
+        return 2.0**t
+    if name == "halves":
+        return 2.0**-t
+    if name == "signs":
+        return (-2.0) ** t
+    return (3.0 if t > 3 else 2.0) ** t
+
+
 class Indexed(Product):
     """Scenario inputs: a discount curve read at t and t-1, a CPI path read three months back
     and at month 0, so the loader must find history rows."""

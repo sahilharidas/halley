@@ -11,8 +11,9 @@ IR's order (D19): a variable read at ``t + k`` is ``V_y[t + k, p, s]`` (index 0 
 does not have), a model point field ``M_f[0, p, 0]``, a scenario input ``Z_s[t + k - u0, 0,
 s]``, a group series ``Y_s[t + k, p, s]``; ``where`` evaluates both operands and selects, as
 ``np.where`` does, so a discarded branch may divide by zero (``error_model="numpy"`` gives inf
-or nan, never an exception); ``sum_t`` is a sequential loop in ascending ``t``; ``at(x, k)``
-reads month ``k`` per lane; ``**`` is LLVM's pow with a float exponent. Kernels compile with
+or nan, never an exception); ``sum_t`` is a sequential loop in ascending ``t``, taken once per
+lane before the loop over months; ``at(x, k)`` reads month ``k`` per lane; ``**`` is LLVM's pow
+with a float exponent, an integer base raised as a float. Kernels compile with
 ``fastmath=False`` (no contraction to FMA, no reassociation) and ``cache=True``.
 
 The run-time checks have the NumPy backend's semantics. A kernel never reads out of bounds:
@@ -32,6 +33,7 @@ kernels beside it between processes.
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import importlib
 import importlib.util
@@ -40,6 +42,7 @@ import platform
 import re
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -49,7 +52,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
-from halley.codegen.numpy_backend import ARRAY, BatchFn, LaneError, run_batch, value_kind
+from halley.codegen.numpy_backend import (
+    ARRAY,
+    BatchFn,
+    LaneError,
+    negative_literal,
+    run_batch,
+    value_kind,
+)
 from halley.errors import BuildError, Loc
 from halley.ir import units
 from halley.scheduler import STEP, Component, Schedule
@@ -58,7 +68,7 @@ NAME: Final = "numba"
 ARTEFACT: Final = "numba_backend.py"
 CACHE_ENV: Final = "HALLEY_NUMBA_CACHE"
 """An environment variable naming the directory of the generated modules and their compiled
-kernels, instead of ``<temp>/halley-numba``."""
+kernels, instead of ``<temp>/halley-numba-<user>``."""
 POLICY_BLOCK: Final = 64
 """Policies one iteration of a kernel's outer loop takes: months run inside a block, so the
 inner loops read contiguous lanes of each month."""
@@ -80,12 +90,22 @@ def _numba() -> Any:
         ) from None
 
 
+def _user() -> str:
+    """The name of the user running Halley, as a file name: the login name, else the user id."""
+    try:
+        name = getpass.getuser()
+    except Exception:  # no login name in the environment and no password database entry
+        uid: Callable[[], int] | None = getattr(os, "getuid", None)
+        name = str(uid()) if uid is not None else "user"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "user"
+
+
 def cache_dir() -> Path:
     """Where the generated modules and Numba's cache of their kernels live: the directory
-    named by ``HALLEY_NUMBA_CACHE``, or ``halley-numba`` under the system's temporary
-    directory."""
+    named by ``HALLEY_NUMBA_CACHE``, or ``halley-numba-<user>`` under the system's temporary
+    directory, one per user: on Linux and macOS that directory is shared by every user."""
     named = os.environ.get(CACHE_ENV)
-    return Path(named) if named else Path(tempfile.gettempdir()) / "halley-numba"
+    return Path(named) if named else Path(tempfile.gettempdir()) / f"halley-numba-{_user()}"
 
 
 # ----------------------------------------------------------------------------- run time
@@ -271,6 +291,13 @@ class _Kernel:
     boundary: list[str] = field(default_factory=lambda: [])
     loop: list[str] = field(default_factory=lambda: [])
     temps: int = 0
+    lanes_s: str = "1"
+    """The scenario lanes the kernel loops over: ``S``, or ``1`` without a scenario axis."""
+    block: list[str] = field(default_factory=lambda: [])
+    """Statements each block of policies runs before the kernel's loops over months: the
+    ``sum_t`` totals of its lanes."""
+    sums: dict[str, str] = field(default_factory=lambda: {})
+    """The per-block array of each variable's ``sum_t`` totals, by the variable's name."""
 
 
 def _loc_str(loc: Loc | None) -> str:
@@ -332,32 +359,62 @@ class _Generator:
         """The statements the statement being generated needs first: checked reads."""
         self.lasts: set[str] = set()
         """Series read with ``.at``: the wrapper passes their last month to the messages."""
-        self.inputs: dict[str, None] = {}
-        """Every kernel argument the wrapper prepares from the batch, in first-use order."""
+        self.inputs: dict[str, str] = {}
+        """Every kernel argument the wrapper prepares from the batch, in first-use order, with
+        the statement that prepares it: kept when the argument is named, never parsed back out
+        of the name (a table may be named ``mort__base``)."""
         self.kernel_entries: list[str] = []
         self.check_entries: list[str] = []
 
     # ------------------------------------------------------------------ arguments
-    def use(self, name: str, numba_type: str) -> str:
+    def use(self, name: str, numba_type: str, prepare: str | None = None) -> str:
+        """A kernel argument; ``prepare`` is the wrapper's expression for an input (a
+        variable's array is allocated by the wrapper instead)."""
         self.k.args.setdefault(name, numba_type)
+        if prepare is not None:
+            self.inputs.setdefault(name, prepare)
         return name
 
     def var_array(self, name: str) -> str:
         return self.use(f"V_{name}", _dtype(self.vars[name])[1])
 
     def field_array(self, name: str) -> str:
-        decl = self.graph.fields[name]
-        kind = _FLOAT_ARRAY if decl.kind == "number" else _INT_ARRAY
-        return self.use(f"M_{name}", kind)
+        number = self.graph.fields[name].kind == "number"
+        dtype = "np.float64" if number else "np.int64"
+        return self.use(
+            f"M_{name}",
+            _FLOAT_ARRAY if number else _INT_ARRAY,
+            f"_as_input(inp[{f'mp.{name}'!r}], {dtype})",
+        )
 
     def column(self, table: str, column: str) -> ir.ColumnDecl:
         return next(c for c in self.graph.tables[table].columns if c.name == column)
 
     def table_array(self, table: str, column: str) -> str:
         decl = self.graph.tables[table]
-        base = "int64" if self.column(table, column).unit == units.INT else "float64"
+        integer = self.column(table, column).unit == units.INT
         dims = ", ".join([":"] * (max(1, len(decl.keys)) - 1) + ["::1"])
-        return self.use(f"T_{table}__{column}", f"{base}[{dims}]")
+        return self.use(
+            f"T_{table}__{column}",
+            f"{'int64' if integer else 'float64'}[{dims}]",
+            f"_as_table(inp[{f'tbl.{table}.{column}'!r}], "
+            f"{'np.int64' if integer else 'np.float64'})",
+        )
+
+    def scen_arrays(self, name: str) -> tuple[str, str]:
+        """A scenario input's values ``(n, 1, J)`` and the month of their first row."""
+        z = self.use(f"Z_{name}", _FLOAT_ARRAY, f"_as_input(inp[{f'scen.{name}'!r}], np.float64)")
+        u0 = self.use(f"u0_{name}", "int64", f"int(inp[{f'scen.{name}.u0'!r}])")
+        return z, u0
+
+    def series_array(self, name: str) -> str:
+        return self.use(
+            f"Y_{name}", _FLOAT_ARRAY, f"_as_input(inp[{f'series.{name}'!r}], np.float64)"
+        )
+
+    def run_const(self, name: str) -> str:
+        prepare = "H" if name == "horizon" else f"int(inp[{f'run.{name}'!r}])"
+        return self.use(f"R_{name}", "int64", prepare)
 
     def temp(self, prefix: str) -> str:
         self.k.temps += 1
@@ -377,15 +434,30 @@ class _Generator:
         self.k.boundary.append(entry)
         return _i64(len(self.k.boundary))
 
-    def checked(self, value: str, node: ir.Node) -> str:
-        """``value`` held in a temporary; an index if Numba would see a float there (a model
-        point field of kind ``number`` used as a month or a key), truncated as NumPy's index
-        conversion does."""
+    def index(
+        self, node: ir.Node, ctx: _Ctx, *, raw: bool | None = None, shift: str | None = None
+    ) -> tuple[str, str]:
+        """A checked read's month or key: the value its check tests and the index it reads
+        at, each in a temporary computed before the statement (``shift`` subtracted first: a
+        scenario file's first month). Where Numba sees a float (a model point field of kind
+        ``number`` used as a month or a key) the index is the value truncated to an int64, as
+        NumPy's index conversion truncates it, and the check tests what the NumPy backend
+        tests: the value itself where that backend holds an array (``_at`` compares the array
+        and converts it afterwards, so 12.5 is outside months 0..12), the truncated index where
+        it holds a scalar (``int(i)`` first). ``raw`` says which instead: a table key's
+        ``_ck`` tests the value whatever it holds."""
+        value = self.expr(node, ctx)
+        if isinstance(node, ir.Const):
+            value = _i64(value)  # Numba would type the temporary by the constant's value
         x = self.temp("x")
-        if self.kind(node) == "float" or isinstance(node, ir.Const):
-            value = _i64(value)  # a constant too: Numba would type the temporary by its value
-        self.pre.append(f"{x} = {value}")
-        return x
+        self.pre.append(f"{x} = {value}" if shift is None else f"{x} = {value} - {shift}")
+        if self.kind(node) != "float":
+            return x, x
+        i = self.temp("i")
+        self.pre.append(f"{i} = np.int64({x})")
+        if raw is None:
+            raw = value_kind(node, ctx.mode == "step") == ARRAY
+        return (x if raw else i), i
 
     # ------------------------------------------------------------------ expressions
     def expr(self, node: ir.Node, ctx: _Ctx) -> str:
@@ -414,8 +486,7 @@ class _Generator:
                 raise BuildError(
                     f"scen.{node.name}(t) appears in a variable without a time dimension", node.loc
                 )
-            z = self.use(f"Z_{node.name}", _FLOAT_ARRAY)
-            u0 = self.use(f"u0_{node.name}", "int64")
+            z, u0 = self.scen_arrays(node.name)
             return f"{z}[{_row(node.offset)} - {u0}, 0, s]"
         if isinstance(node, ir.ScenAt):
             return self.scen_at(node, ctx)
@@ -424,7 +495,7 @@ class _Generator:
         if isinstance(node, ir.SeriesAt):
             return self.series_at(node, ctx)
         if isinstance(node, ir.RunConst):
-            return self.use(f"R_{node.name}", "int64")
+            return self.run_const(node.name)
         if isinstance(node, ir.Unary):
             a = self.expr(node.a, ctx)
             return f"(-{a})" if node.op == "neg" else f"(not {a})"
@@ -472,13 +543,13 @@ class _Generator:
                     f"starts at t = {v.start}",
                     node.loc,
                 )
-        x = self.checked(self.expr(index, ctx), index)
+        test, x = self.index(index, ctx)
         pos = self.check("at", index, ctx, (node.name, v.start))
         pi, si = _lane(v.dims)
         out = self.temp("v")
         self.pre += [
             f"{out} = {_dtype(v)[2]}",
-            f"if {x} < {v.start} or {x} > H:",
+            f"if not ({v.start} <= {test} <= H):",
             f"    _flag({pos}, {x}, p, s, E_pos, E_lo, E_hi)",
             "else:",
             f"    {out} = {self.var_array(node.name)}[{x}, {pi}, {si}]",
@@ -486,37 +557,50 @@ class _Generator:
         return out
 
     def sum_t(self, node: ir.SumT) -> str:
-        """``sum_t(x)``: a sequential loop over x's domain in ascending ``t`` (D19)."""
+        """``sum_t(x)``: a sequential loop over x's domain in ascending ``t`` (D19). The
+        checker admits no complete read of a member of the reader's own recursion, so x comes
+        from an earlier component and its total does not depend on the month: each lane's is
+        taken once per block of policies, before the kernel's loops over months, and read
+        from there."""
         v = self.vars[node.name]
-        pi, si = _lane(v.dims)
-        name = self.var_array(node.name)
-        out = self.temp("v")
-        self.pre += [
-            f"{out} = {name}[{v.start}, {pi}, {si}]",
-            f"for _u in range({v.start + 1}, H + 1):",
-            f"    {out} += {name}[_u, {pi}, {si}]",
-        ]
-        return out
+        held = self.k.sums.get(node.name)
+        if held is None:
+            pi, si = _lane(v.dims)
+            name = self.var_array(node.name)
+            held, acc = self.temp("sum"), self.temp("a")
+            self.k.sums[node.name] = held
+            self.k.block += [
+                f"{held} = np.empty((_hi - _lo, {self.k.lanes_s}), dtype={_dtype(v)[0]})",
+                "for p in range(_lo, _hi):",
+                f"    for s in range({self.k.lanes_s}):",
+                f"        {acc} = {name}[{v.start}, {pi}, {si}]",
+                f"        for _u in range({v.start + 1}, H + 1):",
+                f"            {acc} += {name}[_u, {pi}, {si}]",
+                f"        {held}[p - _lo, s] = {acc}",
+            ]
+        return f"{held}[p - _lo, s]"
 
     def scen_at(self, node: ir.ScenAt, ctx: _Ctx) -> str:
-        x = self.checked(self.expr(node.index, ctx), node.index)
+        """``scen.<s>.at(i)``: the file's row ``i - u0`` tested against its rows first; a
+        float month is truncated after the subtraction, as the NumPy backend's ``_scen_at``
+        converts ``index - u0``, and its message names that row's month."""
+        z, u0 = self.scen_arrays(node.name)
+        test, i = self.index(node.index, ctx, shift=u0)
         pos = self.check("scen_at", node.index, ctx, (node.name,))
-        z = self.use(f"Z_{node.name}", _FLOAT_ARRAY)
-        u0 = self.use(f"u0_{node.name}", "int64")
         out = self.temp("v")
         self.pre += [
             f"{out} = 0.0",
-            f"if {x} - {u0} < 0 or {x} - {u0} >= {z}.shape[0]:",
-            f"    _flag({pos}, {x}, p, s, E_pos, E_lo, E_hi)",
+            f"if not (0 <= {test} < {z}.shape[0]):",
+            f"    _flag({pos}, {i} + {u0}, p, s, E_pos, E_lo, E_hi)",
             "else:",
-            f"    {out} = {z}[{x} - {u0}, 0, s]",
+            f"    {out} = {z}[{i}, 0, s]",
         ]
         return out
 
     def series_read(self, node: ir.SeriesRead, ctx: _Ctx) -> str:
         """A group series, ``(Tn | 1, g, S | 1)``: read like a variable of its dimensions."""
         decl = self.graph.series[node.name]
-        y = self.use(f"Y_{node.name}", _FLOAT_ARRAY)
+        y = self.series_array(node.name)
         si = "s" if decl.scenario else "0"
         if node.offset is None:  # a series without a time dimension, (1, g, S)
             return f"{y}[0, p, {si}]"
@@ -528,15 +612,15 @@ class _Generator:
 
     def series_at(self, node: ir.SeriesAt, ctx: _Ctx) -> str:
         decl = self.graph.series[node.name]
-        x = self.checked(self.expr(node.index, ctx), node.index)
+        test, x = self.index(node.index, ctx)
         pos = self.check("series_at", node.index, ctx, (node.name, decl.start))
-        y = self.use(f"Y_{node.name}", _FLOAT_ARRAY)
+        y = self.series_array(node.name)
         self.lasts.add(node.name)
         si = "s" if decl.scenario else "0"
         out = self.temp("v")
         self.pre += [
             f"{out} = 0.0",
-            f"if {x} < {decl.start} or {x} > {y}.shape[0] - 1:",
+            f"if not ({decl.start} <= {test} <= {y}.shape[0] - 1):",
             f"    _flag({pos}, {x}, p, s, E_pos, E_lo, E_hi)",
             "else:",
             f"    {out} = {y}[{x}, p, {si}]",
@@ -567,13 +651,13 @@ class _Generator:
                     )
                 parts.append(str(i - lo))
                 continue
-            x = self.checked(self.expr(key_node, ctx), key_node)
+            test, x = self.index(key_node, ctx, raw=True)
             pos = self.check("key", key_node, ctx, (key.name, node.table, lo, hi))
             self.pre += [
-                f"if {x} < {lo} or {x} > {hi}:",
+                f"if not ({lo} <= {test} <= {hi}):",
                 f"    _flag({pos}, {x}, p, s, E_pos, E_lo, E_hi)",
             ]
-            ok.append(f"{lo} <= {x} <= {hi}")
+            ok.append(f"{lo} <= {test} <= {hi}")
             parts.append(f"{x} - {lo}" if lo else x)
         name = self.table_array(node.table, node.column)
         if not parts:
@@ -592,8 +676,12 @@ class _Generator:
     def power(self, node: ir.Binary, ctx: _Ctx) -> str:
         """``a ** b`` with a float exponent, so that it is LLVM's pow: Numba raises to an
         integer exponent by repeated multiplication, and 0.0 to a negative one with a
-        ZeroDivisionError whatever the error model."""
+        ZeroDivisionError whatever the error model. An integer base is then raised as a float,
+        as the NumPy backend raises it (``float_power``); a negative literal base is in
+        parentheses."""
         a = self.expr(node.a, ctx)
+        if negative_literal(node.a):
+            a = f"({a})"
         b_node = node.b
         if (
             isinstance(b_node, ir.Const)
@@ -677,14 +765,6 @@ class _Generator:
 
     def kernel(self, index: int, comp: Component) -> tuple[str, str]:
         """The source of component ``index``'s kernel, and the wrapper's call of it."""
-        self.k = _Kernel()
-        for name in comp.members:
-            self.var_array(name)  # the outputs first
-        groups: list[tuple[str | None, str | None, list[str]]] = []
-        if comp.mode == STEP:
-            self.step_groups(comp, groups)
-        else:
-            self.whole_groups(comp, groups)
         dims: frozenset[str] = frozenset()
         for name in comp.members:
             dims = dims | (self.vars[name].dims or frozenset())
@@ -692,12 +772,21 @@ class _Generator:
         parallel = policy and PARALLEL
         lanes_p = "P" if policy else "1"
         lanes_s = "S" if ir.SCENARIO in dims else "1"
+        self.k = _Kernel(lanes_s=lanes_s)
+        for name in comp.members:
+            self.var_array(name)  # the outputs first
+        groups: list[tuple[str | None, str | None, list[str]]] = []
+        if comp.mode == STEP:
+            self.step_groups(comp, groups)
+        else:
+            self.whole_groups(comp, groups)
         nb, nl = len(self.k.boundary), len(self.k.loop)
         body: list[str] = [
             f"    for _b in {'numba.prange' if parallel else 'range'}"
             f"(({lanes_p} + {POLICY_BLOCK - 1}) // {POLICY_BLOCK}):",
             f"        _lo = _b * {POLICY_BLOCK}",
             f"        _hi = min(_lo + {POLICY_BLOCK}, {lanes_p})",
+            *(f"        {line}" for line in self.k.block),
         ]
         for header, ordinal, stmts in groups:
             pad = "        "
@@ -709,8 +798,6 @@ class _Generator:
             body.append(f"{pad}for p in range(_lo, _hi):")
             body.append(f"{pad}    for s in range({lanes_s}):")
             body.extend(f"{pad}        {line}" for line in stmts)
-        for name in self.k.args:
-            self.inputs.setdefault(name, None)
         names = [*self.k.args, "H", "P", "S"]
         types = [*self.k.args.values(), "int64", "int64", "int64"]
         if nb or nl:
@@ -846,7 +933,6 @@ class _Generator:
         """``run_batch(inp, H)``: the inputs as the kernels' arguments, the variables'
         arrays as the NumPy backend allocates them, the kernels in schedule order with the
         checks after each, the finiteness checks, the arrays."""
-        g = self.graph
         out = [
             "def run_batch(inp, H):",
             "    P = inp['P']",
@@ -854,26 +940,7 @@ class _Generator:
             "    Tn = H + 1",
             "    _cur = ''",
         ]
-        for name in self.inputs:
-            if name.startswith("M_"):
-                fname = name[2:]
-                dtype = "np.float64" if g.fields[fname].kind == "number" else "np.int64"
-                out.append(f"    {name} = _as_input(inp['mp.{fname}'], {dtype})")
-            elif name.startswith("T_"):
-                table, column = name[2:].split("__", 1)
-                unit = self.column(table, column).unit
-                dtype = "np.int64" if unit == units.INT else "np.float64"
-                out.append(f"    {name} = _as_table(inp['tbl.{table}.{column}'], {dtype})")
-            elif name.startswith("Z_"):
-                out.append(f"    {name} = _as_input(inp['scen.{name[2:]}'], np.float64)")
-            elif name.startswith("u0_"):
-                out.append(f"    {name} = int(inp['scen.{name[3:]}.u0'])")
-            elif name.startswith("Y_"):
-                out.append(f"    {name} = _as_input(inp['series.{name[2:]}'], np.float64)")
-            elif name.startswith("R_"):
-                rname = name[2:]
-                value = "H" if rname == "horizon" else f"int(inp['run.{rname}'])"
-                out.append(f"    {name} = {value}")
+        out += [f"    {name} = {prepare}" for name, prepare in self.inputs.items()]
         lasts = ", ".join(f"{n!r}: Y_{n}.shape[0] - 1" for n in sorted(self.lasts))
         out += [
             f"    _last = {{{lasts}}}",
@@ -937,11 +1004,47 @@ def _write(path: Path, source: str) -> None:
             return
     except OSError:
         pass
-    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}-", suffix=".tmp")
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+def _private(directory: Path) -> None:
+    """Refuse the default cache directory unless it belongs to this user and no one else can
+    write to it: Numba loads the compiled kernels it holds (its index and data files are
+    unpickled), so a file another user put there would run in this process. Checked where the
+    system has user ids; Windows has none, and its temporary directory is the user's own."""
+    uid: Callable[[], int] | None = getattr(os, "getuid", None)
+    if uid is None:
+        return
+    st = directory.stat()
+    if st.st_uid != uid() or st.st_mode & 0o022:
+        raise BuildError(
+            f"the Numba backend's cache directory {directory} belongs to another user or others "
+            "can write to it, and Numba loads the compiled kernels it holds: remove it, or set "
+            f"{CACHE_ENV} to a directory of your own"
+        )
+
+
+def store_module(ir_hash: str, source: str) -> Path:
+    """Write the generated module to :func:`cache_dir` ``/ <ir_hash>.py`` and return its path.
+    The directory is created private to the user (mode 0o700 where modes apply), and the
+    default one must be the user's own (:func:`_private`). A directory that cannot be created
+    or written is a BuildError naming ``HALLEY_NUMBA_CACHE``."""
+    directory = cache_dir()
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not os.environ.get(CACHE_ENV):
+            _private(directory)
+        path = directory / f"{ir_hash}.py"
+        _write(path, source)
+    except OSError as exc:
+        raise BuildError(
+            f"the Numba backend cannot write its module to {directory}: {exc}; set {CACHE_ENV} "
+            "to a directory you can write to"
+        ) from exc
+    return path
 
 
 def compile_source(source: str, model: str) -> BatchFn:
@@ -957,8 +1060,7 @@ def compile_source(source: str, model: str) -> BatchFn:
         if found is None:
             raise BuildError(f"the Numba backend's source for {model} names no IR_SHA256")
         ir_hash = found.group(1)
-        path = cache_dir() / f"{ir_hash}.py"
-        _write(path, source)
+        path = store_module(ir_hash, source)
         name = f"halley_numba_{ir_hash}"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:  # pragma: no cover - a .py path always has one

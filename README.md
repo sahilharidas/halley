@@ -50,8 +50,10 @@ compares two runs; `halley.load_run` reads a run back without the model.
 `build(TermAssurance, backend="numba")` generates the Numba backend instead (`pip install
 halley[numba]`): compiled loops from the same IR, held to the NumPy reference within 1e-9 relative
 and bit-identical between its own reruns. Its first build compiles every kernel, which takes a
-while for a product; Numba caches them beside the generated module (under `halley-numba` in the
-system's temporary directory, or `HALLEY_NUMBA_CACHE`), so later builds load them.
+while for a product; Numba caches them beside the generated module, so later builds load them.
+The cache is `halley-numba-<user>` in the system's temporary directory, one per user and private
+to them, since Numba loads the compiled kernels it finds there and on Linux and macOS that
+directory is shared; `HALLEY_NUMBA_CACHE` names another.
 
 A model is written like this (an excerpt of `TermAssurance`):
 
@@ -88,16 +90,16 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-ver
 ```bash
 uv sync
 uv run pytest
-uv run pytest -m numba
 uv run ruff check .
 uv run pyright
 ```
 
-The Numba backend's tests (`tests/test_numba.py`, marked `numba`) are deselected by default:
-on a cold kernel cache they take over five minutes, nearly all of it compiling every product's
-kernels (under two minutes once Numba's cache holds them). Run them with `-m numba` before
-committing a change to code generation or the runtime, and in CI as a second job beside the
-default one, keeping Numba's cache directory (`HALLEY_NUMBA_CACHE`) between runs if it can.
+The default `pytest` run includes the Numba backend's differentials (`tests/test_numba.py`,
+marked `numba`), which hold it to the NumPy reference (D16). On a cold kernel cache they take
+about two and a half minutes, nearly all of it compiling every product's kernels, and about a
+minute once Numba's cache holds them, so keep the cache directory (`HALLEY_NUMBA_CACHE`)
+between CI runs if you can. `uv run pytest -m "not numba"` leaves them out for a quicker loop
+while editing; it is not the run a change passes before it is committed.
 
 `docs/spec/term_assurance_inputs.py` regenerates the reference Parquet inputs from the spec's
 formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spec prints.

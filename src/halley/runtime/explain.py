@@ -17,7 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from halley import ir
-from halley.codegen.numpy_backend import ARRAY, SCALAR, ZERO_D, value_kind
+from halley.codegen.numpy_backend import ARRAY, SCALAR, ZERO_D, float_power, value_kind
 from halley.errors import HalleyError, Loc
 from halley.runtime.run import RunResult
 
@@ -155,6 +155,8 @@ class Lane:
             a = self.eval(node.a, t, step)
             b = self.eval(node.b, t, step)
             if node.op == "pow":
+                if float_power(node):
+                    a = float(a)  # an integer literal to an Int power, raised as a float
                 return _pow(a, b, _array_power(node.a, node.b, step))
             return _binary(node.op, a, b)
         if isinstance(node, ir.Where):

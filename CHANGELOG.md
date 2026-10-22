@@ -16,6 +16,26 @@ inputs live (M9). The cost: the `run_id` in the manifest of every run made befor
 differs from the id a recomputation of the same inputs and settings would give. No run
 directory is rewritten; compare old runs by their manifests' hashes, not by id.
 
+### Formulas the NumPy backend computed wrongly
+
+Three kinds of formula now compute what the checker types them as. A model that uses one stores
+other values under the run id it had before (the identity holds the IR, which is unchanged), so
+compare such a run with an older one by its values. No shipped product uses them; their values
+and run ids do not move.
+
+- `~` of a Bool is logical not wherever it appears. A comparison of plain Python numbers (`t`
+  inside a recursive component, `self.run.*` and literals in a variable without a time
+  dimension) was a Python bool in the generated code, and Python's `~True` is -2, which
+  `where()` takes as true: `where(~(t > 9), 1.0, 0.0)` inside a recursion gave 1.0 after month
+  9, where whole mode, `recompute` and `explain` gave 0.0.
+- An integer literal raised to an Int power, a Factor, is a float power. Over the month column
+  NumPy raised `2 ** t` in int64, which wraps past 2**63 without a word (`2 ** 63` was -9.2e18
+  and `2 ** 64` was 0.0) and refuses a negative exponent (`2 ** -t` was a ValueError), while
+  inside a recursive component the same formula was an exact Python integer. A base built from
+  integer literals alone (`where(c, 2, 3) ** t`) is raised as a float too.
+- A negative literal base keeps its sign: `(-2) ** t` was generated as `-2 ** t`, which Python
+  reads as `-(2 ** t)`, on both backends (`recompute` and `explain` had it right).
+
 ### Manifest additions
 
 - `inputs.<kind>.<name>.metadata`: the input file's `halley.*` metadata and `version`, as
@@ -554,11 +574,16 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   the NumPy version); a Numba run's identity adds the Numba and llvmlite versions, so the same
   inputs on the two backends are two runs. `replay_aggregation` treats a change of `numba` or
   `llvmlite` as one that moves the run id, and of `using_svml` or `processor` as one that can
-  move a value.
-- The generated module is written to `<temp>/halley-numba/<ir_hash>.py`, or under the directory
-  named by `HALLEY_NUMBA_CACHE`, and imported from there; Numba caches the compiled kernels
-  beside it, so the first build of a product compiles every kernel (tens of seconds) and later
-  builds, in any process, load them.
+  move a value. A stage run is replayed on the backend that made it: `replay_aggregation` with a
+  stage built for the other backend is a LoadError saying which backend to build it with.
+- The generated module is written to `<temp>/halley-numba-<user>/<ir_hash>.py`, or under the
+  directory named by `HALLEY_NUMBA_CACHE`, and imported from there; Numba caches the compiled
+  kernels beside it, so the first build of a product compiles every kernel (tens of seconds) and
+  later builds, in any process, load them. The default directory is one per user, created
+  private to them (mode 0o700 where modes apply), since on Linux and macOS the temporary
+  directory is shared and Numba loads the compiled kernels it finds there: one that another user
+  owns or can write to is a BuildError. A cache directory that cannot be created or written is a
+  BuildError naming `HALLEY_NUMBA_CACHE`.
 
 ### Known limitations
 
@@ -643,13 +668,18 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   specification is silent; in-force open question 23 asks its author), so with an anniversary
   inside the period its expected escalation is reported in C - B rather than in delta_FCF_L.
 - The Numba backend reproduces the NumPy backend's run-time checks, not the exceptions its
-  Python and NumPy arithmetic raises outside them: in a recursive component a division or
-  modulo by zero between plain Python numbers (literals, `t`, `self.run.*`) is a
-  ZeroDivisionError on the NumPy backend and inf, nan or 0 on the Numba backend (the
-  finiteness check then fails for a float), and an integer literal raised to a negative Int is
-  a ValueError on the NumPy backend and a float power on the Numba backend.
-- A model point field of kind `number` with unit `Int`, used as a table key, is an IndexError
-  on the NumPy backend and truncated to an integer on the Numba backend.
+  Python arithmetic raises outside them. Wherever both operands of a division or modulo are
+  plain Python numbers in the NumPy backend's code (literals, `self.run.*`, and `t` inside a
+  recursive component: in a recursion, an `init`, a `terminal` or a variable without a time
+  dimension), a zero divisor is a RunError reporting the ZeroDivisionError there, while the
+  Numba backend gives inf, nan or 0. Stored, a float such value fails the finiteness check;
+  in the discarded branch of a `where()`, as in the guarded `where(t > 3, 1.0 / (t - 3), 0.0)`
+  inside a recursion, the Numba run succeeds where the NumPy run fails.
+- A model point field of kind `number` with unit `Int` is not held to whole numbers. Used as a
+  month (`at()`, `scen.<name>.at()`, `series.<name>.at()`) it is tested against the domain
+  before it is truncated, on both backends (12.5 is outside months 0..12, 3.7 reads month 3);
+  used as a table key it is an IndexError on the NumPy backend and truncated to an integer
+  after the range check on the Numba backend.
 - The Numba kernels run on one core: the policy loop can run in parallel (`numba.prange` over
   blocks of 64 policies, `halley.codegen.numba_backend.PARALLEL`), but that is off, since it
   more than doubles the compile time for little gain on memory-bound kernels; spreading
