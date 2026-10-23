@@ -45,13 +45,7 @@ from halley import ir
 from halley.authoring.contracts import FROM_PREVIOUS, GROUP_KEY, LOCKED_IN_FIELDS
 from halley.codegen import CompiledModel, backend_named
 from halley.errors import LoadError
-from halley.runtime.invariants import (
-    BatchView,
-    InvariantResult,
-    check_builtin,
-    check_declared,
-    merge_results,
-)
+from halley.runtime.invariants import InvariantResult, merge_results
 from halley.runtime.loader import (
     Inputs,
     LoadedSeries,
@@ -62,6 +56,7 @@ from halley.runtime.loader import (
     parse_copy,
     verify_copy,
 )
+from halley.runtime.workers import run_batches
 
 OUTPUT_SCHEMA_VERSION = 1
 """Bumped when the layout of the output files changes. A later aggregation stage reads a
@@ -107,9 +102,14 @@ class RunSettings:
     its groups name (``prev_run_id``), and against which its manifest records the directory of
     every run it read (design section 9). Recorded, not in the run id."""
     workers: int = 1
-    """Processes to spread the batches over (design section 12). Recorded, not in the run id:
-    the results do not depend on it. Until the process pool of section 12 lands every batch
-    runs in this process, whatever the value."""
+    """Processes to spread the batches over (design section 12, :mod:`halley.runtime.workers`):
+    at 1, or with a single batch, every batch runs in the calling process; above, in
+    ``min(workers, batches)`` worker processes started with the spawn method, each of which
+    imports the model's class from its module (so it must be defined at the top level of an
+    importable module, and a script must guard its entry point with
+    ``if __name__ == "__main__":``). The outputs, invariant results and errors are the same bit
+    for bit at the same ``batch_size`` (D5, D19), so it is recorded but not in the run id. An
+    aggregation stage's batches are its groups: a stage of one group (G1) runs in one process."""
 
     def __post_init__(self) -> None:
         if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
@@ -599,32 +599,22 @@ def run(
     horizon = inputs.H
     n_pol = len(inputs.ids)
     n_scen = inputs.n_scenarios
-    scales = inputs.scales(graph)
     needed = sorted(compiled.schedule.needed)
-    parts: dict[str, list[NDArray[Any]]] = {name: [] for name in needed}
-    batches: list[list[InvariantResult]] = []
     backend = backend_named(compiled.backend)
-    bs = max(1, settings.batch_size)
-    for lo in range(0, n_pol, bs):
-        hi = min(lo + bs, n_pol)
-        inp = inputs.batch(graph, lo, hi)
-        out = backend.run_batch(compiled.fn, graph, inp, horizon, lanes)
-        batch_scales = {u: s[lo:hi] for u, s in scales.items()}
-        results = check_builtin(graph, out, inputs.ids[lo:hi], horizon, batch_scales, lanes)
-        view = BatchView(graph, out, inputs, lo, hi, batch_scales, lanes)
-        results.extend(check_declared(model.invariants, view))
-        batches.append(results)
-        for name in needed:
-            parts[name].append(out[name])
-    invariants = merge_results(batches)
+    # in this process or over worker processes; either way in ascending batch order, the first
+    # failing batch's error raised (halley.runtime.workers)
+    done = run_batches(
+        compiled, inputs, tuple(needed), lanes, settings.batch_size, settings.workers
+    )
+    invariants = merge_results([results for _arrays, results in done])
     arrays: dict[str, NDArray[Any]] = {}
     for name in needed:
         v = graph.variables[name]
         dims = v.dims or frozenset()
         if ir.POLICY in dims:
-            arrays[name] = np.concatenate(parts[name], axis=1)
+            arrays[name] = np.concatenate([out[name] for out, _results in done], axis=1)
         else:
-            arrays[name] = parts[name][0]
+            arrays[name] = done[0][0][name]
     has_time = {name: graph.variables[name].has_time for name in needed}
 
     stored = list(settings.outputs or graph.outputs or needed)

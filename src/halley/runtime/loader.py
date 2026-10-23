@@ -17,7 +17,7 @@ import datetime as dt
 import hashlib
 import io
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +73,17 @@ class ReadFile:
     def where(self) -> str:
         """The label with the file's path, for messages."""
         return f"{self.label} ({self.path})" if self.path is not None else self.label
+
+    def without_data(self) -> ReadFile:
+        """This file as a run's worker processes see it (:meth:`Inputs.for_workers`): its hash,
+        path, label and metadata, but an empty table and no bytes. The parent process keeps the
+        table and the bytes for the input checks and the run directory's copies; no batch reads
+        them, so they are not sent to every worker."""
+        return ReadFile(_NO_TABLE, self.sha256, self.path, None, self.label, dict(self.metadata))
+
+
+_NO_TABLE = pa.table({})
+"""The table of a file without its data (:meth:`ReadFile.without_data`)."""
 
 
 def _schema_metadata(table: pa.Table) -> dict[str, str]:
@@ -290,7 +301,10 @@ def _doc(doc: str) -> str:
 
 @dataclass(slots=True)
 class ModelPoints:
-    schema: Schema
+    """The model points as loaded and checked against the schema, which the model holds (its
+    derived fields and rules are functions, so it is not kept here: a run's worker processes
+    take the model points without it, :meth:`Inputs.for_workers`)."""
+
     ids: NDArray[Any]
     columns: dict[str, NDArray[Any]]
     """Every field and derived field, sorted by id: numbers float64, ints int64, enums as their
@@ -431,7 +445,7 @@ def load_model_points(
         if decl.enum is not None:
             lookup = {v: i for i, v in enumerate(decl.enum)}
             codes[name] = np.array([lookup[v] for v in columns[name]], dtype=np.int64)
-    return ModelPoints(schema, ids, columns, codes, f)
+    return ModelPoints(ids, columns, codes, f)
 
 
 # ----------------------------------------------------------------------------------- tables
@@ -1291,6 +1305,25 @@ class Inputs:
             valuation_date=valuation_date,
             valuation_month=self.run["m_val"],
             horizon=self.H,
+        )
+
+    def for_workers(self) -> Inputs:
+        """These inputs as a run's worker processes take them (``RunSettings.workers``): the
+        same arrays (not copied), every file without its table and bytes
+        (:meth:`ReadFile.without_data`), and each group series without a mean's pathwise totals,
+        which no batch reads. What a batch and the invariants read is all here, and it pickles:
+        it is sent once to each worker. Every array the loader makes is C-contiguous, so a
+        worker's unpickled copy has the caller's layout as well as its values."""
+        mp = self.model_points
+        return Inputs(
+            replace(mp, file=mp.file.without_data()),
+            {name: replace(t, file=t.file.without_data()) for name, t in self.tables.items()},
+            {name: replace(s, file=s.file.without_data()) for name, s in self.scenarios.items()},
+            self.n_scenarios,
+            self.H,
+            dict(self.run),
+            dict(self.extras),
+            {name: replace(y, pathwise=None) for name, y in self.series.items()},
         )
 
     def batch(self, graph: ir.Graph, lo: int, hi: int) -> dict[str, Any]:

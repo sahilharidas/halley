@@ -55,6 +55,12 @@ The cache is `halley-numba-<user>` in the system's temporary directory, one per 
 to them, since Numba loads the compiled kernels it finds there and on Linux and macOS that
 directory is shared; `HALLEY_NUMBA_CACHE` names another.
 
+`RunSettings(workers=4)` spreads the batches (`batch_size` policies each) over four processes on
+either backend, with the same results bit for bit as one process at the same batch size: the
+same run id, outputs, invariant results and errors. The workers are started with the spawn
+method and import the model's class from its module, so define it at the top level of a module
+and guard a script's entry point with `if __name__ == "__main__":`.
+
 A model is written like this (an excerpt of `TermAssurance`):
 
 ```python

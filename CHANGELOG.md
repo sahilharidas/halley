@@ -330,9 +330,9 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   output file differs with nothing in the backend block changed; a file that differs while the
   values agree, with another pyarrow or Python, is recorded only.
 - `RunSettings` gains `runs_root` (a path; recorded, not in the run id) and `workers` (a
-  positive int, default 1; recorded, not in the run id; every batch still runs in the calling
-  process until the process pool of design section 12), `identity()` (the settings a run id
-  covers) and `RunSettings.from_dict(manifest["settings"])`. A projection's run id is unchanged.
+  positive int, default 1; recorded, not in the run id; see "Process parallelism (M6)"
+  below), `identity()` (the settings a run id covers) and
+  `RunSettings.from_dict(manifest["settings"])`. A projection's run id is unchanged.
 - `load_run(run_dir, verify=True)` checks every file the manifest records a hash for first and
   reads the run from the bytes checked; `halley.runtime.run.verified_run` (a `VerifiedRun`: the
   manifest, its sha256 and the verified bytes, with `read(entry, label)` for a copy and
@@ -614,6 +614,42 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   that another user owns or can write to is a BuildError. A cache directory that cannot be
   created or written is a BuildError naming `HALLEY_NUMBA_CACHE`.
 
+### Process parallelism (M6)
+
+- `RunSettings(workers=n)` spreads a run's batches over `min(n, batches)` worker processes
+  (`halley.runtime.workers`), on either backend; with `workers=1`, the default, or a single
+  batch, every batch runs in the calling process as before. The workers are a
+  `ProcessPoolExecutor` started with the spawn method (Windows has no other). Each is sent
+  once, at its start, the generated source, the backend's name, the graph, the model's class
+  and the inputs without their files' tables and bytes (`Inputs.for_workers()`), and compiles
+  the batch function itself (on the Numba backend it loads the kernels the build cached); a
+  task is one batch. The caller takes the results in ascending batch order, assembles the
+  arrays and merges the invariant results as one process does, and raises the error of the
+  first failing batch in that order.
+- At the same `batch_size` a run with several workers is the run with one bit for bit, on both
+  backends: the same run id, output files, arrays and invariant results, and the same error,
+  message and location, when it fails. `workers` is recorded in the manifest
+  (`settings.workers`) and is still not in the run id.
+- A worker imports the model's class from its module, so with `workers` above 1 a model class
+  defined inside a function, or in an interactive session, is a RunError at the class before
+  any process starts (it runs with `workers=1`), and a script that starts such a run must
+  guard its entry point with `if __name__ == "__main__":`. A worker that cannot start (its
+  model's module fails to import, say) fails its batches with a RunError saying so; one that
+  ends without a result, as when the system ends it for its memory, is a RunError suggesting a
+  lower `batch_size` or fewer workers. A worker runs the checks under the caller's NumPy
+  floating-point error handling (`np.geterr()`).
+- An aggregation stage's batches are its groups, so `run(..., series=group_series(...))` over
+  several groups spreads them over the workers too. A stage run made by `run_aggregation` (and
+  its replay) measures one group (G1), a single batch, so it runs in the calling process
+  whatever `workers` says.
+- `BuildError`, `UnitError`, `LoadError` and `RunError` pickle with their message, location
+  and notes (they share a base whose `__reduce__` passes the message and the `Loc`, where an
+  exception's default pickling passes the formatted text alone), so one raised in a worker
+  reaches the caller whole; its `__cause__` there is the worker's traceback.
+- `halley.runtime.loader.ModelPoints` no longer holds the schema (its derived fields and rules
+  are functions, which do not pickle, and nothing read it): `CompiledModel.schema` is the
+  schema. `ReadFile.without_data()` is a file without its table and bytes.
+
 ### Known limitations
 
 - `recompute` and `explain` evaluate a power with a non-literal array exponent (a model point
@@ -653,8 +689,13 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   the number of runs filed there; a run filed in a nested directory is not found; and a replay
   or copy of a run filed under the same `runs_root` makes its run id ambiguous (a LoadError), so
   file replays and copies outside `runs_root`.
-- `RunSettings.workers` is recorded and validated, but every batch runs in the calling process
-  until the process pool of design section 12.
+- Every run with `workers` above 1 starts its own worker processes, and each imports Halley,
+  NumPy, pyarrow and the model (and, on the Numba backend, loads the cached kernels) before its
+  first batch: a few seconds on the development machine, so workers pay off for runs whose
+  batches take longer than that. Each batch's arrays of every kept variable are pickled back to
+  the caller, which holds all of them as one process does; on Windows a run starts at most 61
+  workers (the process pool's limit there). A worker applies Python's default warning filters,
+  not the caller's.
 - A run's `manifest.json` is not itself hashed: every file it lists is verified against the
   hash it records, and a later stage records the sha256 of the previous run's manifest, but an
   edit to a manifest that keeps its listed hashes consistent is not detected on load.
@@ -760,3 +801,9 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   each lane with the same scalar code whatever the batch, so a non-literal exponent gives the
   same bits in a batch of one policy as in a batch of three (tested without SVML, whose
   vectorised maths the manifest's `using_svml` records).
+- The number of workers does not move a bit (D19): a batch computes the same values in any
+  process of the machine, and the caller assembles the batches and merges their invariant
+  results in ascending batch order. The batch composition still can, as above, so compare runs
+  bit for bit at the same `batch_size` (tested with one and two workers on both backends:
+  TermAssurance, a two-scenario CPI-linked annuity run in three batches and a stage over two
+  groups).
