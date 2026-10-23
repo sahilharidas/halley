@@ -11,15 +11,20 @@ from halley import (
     Annual,
     BuildError,
     BuildWarning,
+    Column,
     Count,
     Factor,
+    Field,
     Int,
+    Key,
     Money,
     MoneyPerPolicy,
     Monthly,
     Prob,
     Product,
     Rate,
+    Schema,
+    Table,
     UnitError,
     at,
     build,
@@ -31,6 +36,7 @@ from halley import (
     var,
     where,
 )
+from halley.authoring import int_field, maximum, minimum
 from halley.ir import units as u
 from halley.products.term_assurance import MORT_TABLE, RATES, SCHEMA, TermAssurance
 from models import SIMPLE_SCHEMA, Expensed, Margin
@@ -246,6 +252,139 @@ def test_table_key_units_are_checked() -> None:
             return self.tables.rates["interest"]
 
     _fails(BadConst, "not a value of key name")
+
+
+ENUM_SCHEMA = Schema(
+    fields=(
+        Field("policy_id", "string", unique=True),
+        Field("sex", "enum", enum=("M", "F")),
+        Field("sex2", "enum", enum=("M", "F")),
+        Field("band", "enum", enum=("A", "B", "C")),
+        Field("sex_rev", "enum", enum=("F", "M")),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+)
+BY_SEX = Table("by_sex", keys=(Key("sex", enum=("M", "F")),), columns=(Column("v", "Factor"),))
+BY_K = Table("by_k", keys=(Key("k", lo=0, hi=10),), columns=(Column("v", "Factor"),))
+
+
+def test_an_enum_key_is_a_value_or_a_field_with_the_keys_values_in_order() -> None:
+    """The generated code reads an enum key's table at the field's code, its position in the
+    field's own enum: a field listing the key's values in another order would read the other
+    row, and a where() or minimum() of fields with other values would read outside the table,
+    on both backends."""
+
+    class Reordered(Product):
+        model_point = ENUM_SCHEMA
+        assumption_tables = (BY_SEX,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_sex[self.mp.sex_rev] * 1.0
+
+    _fails(
+        Reordered,
+        r"^mp\.sex_rev lists the values of key sex of table by_sex in another order \(F, M "
+        r"against M, F\); list them in the key's order",
+    )
+
+    class OtherValues(Product):
+        model_point = ENUM_SCHEMA
+        assumption_tables = (BY_SEX,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_sex[where(t > 0, self.mp.band, self.mp.sex)] * 1.0
+
+    _fails(OtherValues, r"^mp\.band does not have the same enum values as key sex of table by_sex")
+
+    class Smallest(Product):
+        model_point = ENUM_SCHEMA
+        assumption_tables = (BY_SEX,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_sex[minimum(self.mp.sex, self.mp.sex2)] * 1.0
+
+    _fails(
+        Smallest,
+        r"^key sex of table by_sex is an enum \(M, F\); pass one of its values, a model point "
+        r"field with the same values in the same order, or a where\(\) between such fields",
+    )
+
+    class Chosen(Product):
+        model_point = ENUM_SCHEMA
+        assumption_tables = (BY_SEX,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_sex[where(t > 1, self.mp.sex2, self.mp.sex)] * 1.0
+
+    check(trace(Chosen))
+
+
+def test_a_float_literal_is_not_an_int() -> None:
+    """An Int holds whole numbers: a float literal beside an Int in where(), minimum() or
+    maximum(), or as an Int variable's value, is a unit mistake (D11), not a value truncated
+    when it is stored or used as a key."""
+
+    class Key25(Product):
+        model_point = SIMPLE_SCHEMA
+        assumption_tables = (BY_K,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_k[where(t > 3, self.mp.k, 2.5)]
+
+    _fails(
+        Key25,
+        r"^unit mismatch: the branches of where\(\) are Int and number: an Int holds whole "
+        r"numbers, so write the literal as an int",
+        UnitError,
+    )
+
+    class Least(Product):
+        model_point = SIMPLE_SCHEMA
+        assumption_tables = (BY_K,)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_k[maximum(2.5, t)]
+
+    _fails(Least, r"^unit mismatch: the branches of maximum\(\) are number and Int", UnitError)
+
+    class Half(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def n(self, t: Int) -> Int:
+            return 2.5  # type: ignore[return-value]
+
+    _fails(Half, r"^n is declared Int but its formula is number", UnitError)
+
+    class HalfInit(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var(init=0.5)
+        def n(self, t: Int) -> Int:
+            return self.n(t - 1) + 1
+
+    _fails(HalfInit, r"^the init value of n is number, not Int", UnitError)
+
+    class Whole(Product):
+        model_point = SIMPLE_SCHEMA
+        assumption_tables = (BY_K,)
+
+        @var(init=0)
+        def n(self, t: Int) -> Int:
+            return self.n(t - 1) + where(t > 3, self.mp.k, 2)
+
+        @var
+        def x(self, t: Int) -> Factor:
+            return self.tables.by_k[minimum(self.n(t), 10)]
+
+    check(trace(Whole))
 
 
 def test_roles_are_checked() -> None:

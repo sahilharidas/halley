@@ -36,6 +36,28 @@ and run ids do not move.
 - A negative literal base keeps its sign: `(-2) ** t` was generated as `-2 ** t`, which Python
   reads as `-(2 ** t)`, on both backends (`recompute` and `explain` had it right).
 
+### Formulas that are now build errors
+
+Each of these built and then gave a wrong value or failed at run time: a model that uses one no
+longer builds. No shipped product does.
+
+- An enum model point field used as a table key lists the key's values in the key's order. A
+  field declared `enum=("F", "M")` read a table keyed `enum=("M", "F")` at the F row for an M
+  policy, on both backends, since the generated code reads the table at the field's position in
+  its own enum (`recompute` and `explain` read the M row). It is a BuildError at the lookup's
+  line naming both orders.
+- An enum key that is not one of the key's values is a model point field or a `where()` between
+  such fields. Anything else is a BuildError at the lookup's line: a `where()` with a field of
+  other values (`where(t > 0, self.mp.band, self.mp.sex)`, band A, B or C against a key M, F,
+  read outside the two-row table for band C, an IndexError on the NumPy backend and memory past
+  the array on the Numba backend), a `minimum()` or `maximum()` of fields, or an enum column of
+  another table.
+- A float literal is not an Int. `where(c, self.mp.k, 2.5)`, and `minimum()` or `maximum()` of
+  an Int and a float literal, are UnitErrors, as is an Int variable whose formula, `init` or
+  `terminal` is a float literal. Stored in an Int variable such a value was truncated; as a
+  table key it was an IndexError on the NumPy backend and truncated on the Numba backend. An
+  integer literal still takes an Int's unit (`where(c, self.mp.k, 2)`).
+
 ### Manifest additions
 
 - `inputs.<kind>.<name>.metadata`: the input file's `halley.*` metadata and `version`, as
@@ -568,22 +590,29 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - A run directory of the Numba backend holds its generated module as
   `generated/numba_backend.py` (a NumPy run's stays `generated/numpy_backend.py`).
 - The manifest's `backend` block of a Numba run records `numba`, `llvmlite`, `numpy`,
-  `using_svml` (whether Numba uses Intel's SVML) and `processor` beside `pyarrow`, `python`
-  and `platform`. A NumPy run's block is unchanged.
+  `using_svml` (whether Numba uses Intel's SVML), `processor` (the operating system's name for
+  the machine), and `cpu_name` and `cpu_features`, the CPU and the instruction set extensions
+  LLVM compiles the kernels for (`NUMBA_CPU_NAME` and `NUMBA_CPU_FEATURES` when set, else the
+  host's), beside `pyarrow`, `python` and `platform`. A NumPy run's block is unchanged.
 - The run id of a NumPy run is unchanged (its identity's backend entry is still the name and
   the NumPy version); a Numba run's identity adds the Numba and llvmlite versions, so the same
   inputs on the two backends are two runs. `replay_aggregation` treats a change of `numba` or
-  `llvmlite` as one that moves the run id, and of `using_svml` or `processor` as one that can
-  move a value. A stage run is replayed on the backend that made it: `replay_aggregation` with a
-  stage built for the other backend is a LoadError saying which backend to build it with.
-- The generated module is written to `<temp>/halley-numba-<user>/<ir_hash>.py`, or under the
+  `llvmlite` as one that moves the run id, and of `using_svml`, `processor`, `cpu_name` or
+  `cpu_features` as one that can move a value. A stage run is replayed on the backend that
+  made it: `replay_aggregation` with a stage built for the other backend is a LoadError saying
+  which backend to build it with.
+- The generated module is written to `<temp>/halley-numba-<user>/<ir_hash>-<text hash>.py`
+  (the text hash is the first 16 hex digits of the sha256 of the module's text), or under the
   directory named by `HALLEY_NUMBA_CACHE`, and imported from there; Numba caches the compiled
   kernels beside it, so the first build of a product compiles every kernel (tens of seconds) and
-  later builds, in any process, load them. The default directory is one per user, created
-  private to them (mode 0o700 where modes apply), since on Linux and macOS the temporary
-  directory is shared and Numba loads the compiled kernels it finds there: one that another user
-  owns or can write to is a BuildError. A cache directory that cannot be created or written is a
-  BuildError naming `HALLEY_NUMBA_CACHE`.
+  later builds, in any process, load them. A file holds one text only: two checkouts of a
+  product (whose modules name different source files in their messages) have a file each, so
+  neither overwrites the module the other is importing, and the module a run imported is the
+  one its run directory holds as `generated/numba_backend.py`. The default directory is one
+  per user, created private to them (mode 0o700 where modes apply), since on Linux and macOS
+  the temporary directory is shared and Numba loads the compiled kernels it finds there: one
+  that another user owns or can write to is a BuildError. A cache directory that cannot be
+  created or written is a BuildError naming `HALLEY_NUMBA_CACHE`.
 
 ### Known limitations
 
@@ -675,11 +704,14 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   Numba backend gives inf, nan or 0. Stored, a float such value fails the finiteness check;
   in the discarded branch of a `where()`, as in the guarded `where(t > 3, 1.0 / (t - 3), 0.0)`
   inside a recursion, the Numba run succeeds where the NumPy run fails.
-- A model point field of kind `number` with unit `Int` is not held to whole numbers. Used as a
-  month (`at()`, `scen.<name>.at()`, `series.<name>.at()`) it is tested against the domain
-  before it is truncated, on both backends (12.5 is outside months 0..12, 3.7 reads month 3);
-  used as a table key it is an IndexError on the NumPy backend and truncated to an integer
-  after the range check on the Numba backend.
+- An input declared with unit `Int` but held as floats, a model point field of kind `number`, a
+  scenario input or a group series, is not held to whole numbers; these are the only Int
+  values that can hold a fraction (a float literal beside an Int is a UnitError). Used as a
+  month (`at()`, `scen.<name>.at()`, `series.<name>.at()`) such a value is tested against the
+  domain before it is truncated, on both backends (12.5 is outside months 0..12, 3.7 reads
+  month 3); used as a table key it is an IndexError on the NumPy backend, whatever its values
+  (the array is a float array), and truncated to an integer after the range check on the Numba
+  backend.
 - The Numba kernels run on one core: the policy loop can run in parallel (`numba.prange` over
   blocks of 64 policies, `halley.codegen.numba_backend.PARALLEL`), but that is off, since it
   more than doubles the compile time for little gain on memory-bound kernels; spreading
@@ -689,7 +721,9 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   to a second per component on the development machine (the in-force stage, 60 components,
   about half a minute). The module's text names the model's source lines for the messages, so
   a change to it for the same IR hash (another Halley, the model's lines or file moved, two
-  checkouts of one model) rewrites the module and recompiles its kernels.
+  checkouts of one model) writes another module file and compiles its kernels again; the
+  earlier files and their kernels stay in the cache directory, which is not pruned (delete it
+  to reclaim the space).
 - On the Numba backend the probability and finiteness checks still run in NumPy over every
   stored array after the kernels, as the NumPy backend's do, which is a large share of a
   batch's time.

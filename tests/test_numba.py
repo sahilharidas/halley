@@ -87,6 +87,7 @@ from halley.aggregation import (
     group_series,
     replay_aggregation,
 )
+from halley.aggregation.stage import VALUE_ENVIRONMENT
 from halley.authoring import exp, expm1, int_field, log, log1p, maximum, minimum, sqrt
 from halley.codegen import BACKENDS, numba_backend
 from halley.products import annuity_data as data
@@ -634,6 +635,7 @@ CALLS_SCHEMA = Schema(
         Field("amt", "number", "Money", ge=0),
         int_field("k", ge=0, le=5),
         int_field("rem_m", ge=1, le=1000),
+        Field("j", "number", "Int"),
     ),
     horizon="rem_m",
 )
@@ -641,7 +643,9 @@ CALLS_SCHEMA = Schema(
 
 class Calls(Product):
     """Every formula function the NumPy backend emits, with integer arithmetic, booleans, a
-    negative literal exponent of zero in a discarded branch and an Int that takes a float."""
+    negative literal exponent of zero in a discarded branch and an Int that takes a float (a
+    model point field of kind ``number`` with unit Int, which the loader does not hold to whole
+    numbers: a float literal there is a UnitError)."""
 
     model_point = CALLS_SCHEMA
 
@@ -747,7 +751,7 @@ class Calls(Product):
 
     @var
     def wi(self, t: Int) -> Int:
-        return where(self.b(t), 2, 0.5)  # type: ignore[return-value] - truncated to 0
+        return where(~self.b(t), self.mp.j, 2)  # j = 0.5, truncated to 0 as it is stored
 
     @var
     def total(self) -> Factor:
@@ -766,6 +770,7 @@ def calls_points() -> Any:
             "amt": pa.array([0.0, 100.0, 2500.0, 1e6], pa.float64()),
             "k": pa.array([1, 1, 2, 5], pa.int32()),
             "rem_m": pa.array([30] * n, pa.int32()),
+            "j": pa.array([0.5] * n, pa.float64()),
         }
     )
 
@@ -1073,6 +1078,227 @@ def test_a_non_finite_result(tmp_path: Path) -> None:
     )
 
 
+class BumpedBackward(Product):
+    """A key check inside a backward recursion: the NumPy backend steps from t = H - 1 down,
+    so the first failure is at t = 11, where ``k + t`` is 13 to 15 for all three policies (a
+    kernel numbering its steps from t = 0 would name t = 7, k = 4 alone)."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (BUMP,)
+
+    @var(terminal=0.0)
+    def r(self, t: Int) -> Factor:
+        return self.r(t + 1) * 0.5 + self.tables.bump[self.mp.k + t] * 1.0
+
+
+class ProbThenKey(Product):
+    """``q`` is a probability out of range and ``y``, a later component, reads a key outside
+    its table: the NumPy backend checks q's range after q's component, so it reports q."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (BUMP,)
+
+    @var
+    def q(self, t: Int) -> Prob[Monthly]:
+        return -0.5 + 0.0  # type: ignore[return-value]
+
+    @var
+    def y(self, t: Int) -> Count:
+        return self.mp.pols_if_init * self.q(t) * self.tables.bump[t + 5]
+
+
+class FiniteOrder(Product):
+    """``zz`` is computed first and ``aa`` from it, both non-finite: the finiteness checks
+    run at the end in sorted order, so the NumPy backend names aa."""
+
+    model_point = SIMPLE_SCHEMA
+
+    @var
+    def zz(self, t: Int) -> Factor:
+        return 1.0 / (t - t)
+
+    @var
+    def aa(self, t: Int) -> Factor:
+        return self.zz(t) * 2.0
+
+
+class FiniteThenAt(Product):
+    """``bb`` (an early component) is non-finite and ``cc`` (a later one) reads it with an
+    ``at()`` outside its domain: the finiteness checks run after every component, so the
+    NumPy backend reports the at()."""
+
+    model_point = SIMPLE_SCHEMA
+
+    @var
+    def bb(self, t: Int) -> Factor:
+        return 1.0 / (t - t)
+
+    @var
+    def cc(self, t: Int) -> Factor:
+        return at(self.bb, t + 1) * 0.0
+
+
+@pytest.mark.parametrize(
+    ("model", "variable", "pattern"),
+    [
+        (
+            BumpedBackward,
+            "r",
+            r"^lookup key k of table bump is outside its declared range \[0, 10\]: value 13 to "
+            r"15; no silent extrapolation; policies S00, S01, S02$",
+        ),
+        (
+            ProbThenKey,
+            "q",
+            r"^q is a probability but takes values outside \[0, 1\]: -0\.5 to -0\.5; policies "
+            r"S00, S01, S02$",
+        ),
+        (
+            FiniteOrder,
+            "aa",
+            r"^aa is not finite \(NaN or infinity\) at some month; policies S00, S01, S02$",
+        ),
+        (
+            FiniteThenAt,
+            "cc",
+            r"^at\(bb, \.\.\.\) reads a month outside the domain of bb, months 1\.\.12; "
+            r"policies S00, S01, S02$",
+        ),
+    ],
+    ids=["backward-steps", "probability-after-its-component", "finite-sorted", "finite-last"],
+)
+def test_the_first_failing_check_in_the_numpy_backends_order(
+    model: type[Product], variable: str, pattern: str, tmp_path: Path
+) -> None:
+    """Which check fails first, and so the message and variable named, follows the NumPy
+    backend: the steps of a backward recursion from H - 1 down, a probability's range after
+    its own component, the finiteness checks after every component in sorted order."""
+    err = same_error(
+        lambda backend: run(
+            build(model, backend=backend),
+            model_points=simple_model_points(),
+            tables={"bump": bump_table()} if model.assumption_tables else None,
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        ),
+        pattern,
+    )
+    assert err.loc is not None
+    assert err.loc.function == f"{model.__qualname__}.{variable}"
+
+
+ENUM_SCHEMA = Schema(
+    fields=(
+        Field("policy_id", "string", unique=True),
+        Field("sex", "enum", enum=("M", "F")),
+        Field("sex2", "enum", enum=("M", "F")),
+        Field("band", "enum", enum=("A", "B", "C")),
+        Field("sex_rev", "enum", enum=("F", "M")),
+        int_field("rem_m", ge=1, le=1000),
+    ),
+    horizon="rem_m",
+)
+BY_SEX = Table("by_sex", keys=(Key("sex", enum=("M", "F")),), columns=(Column("v", "Factor"),))
+
+
+class EnumWhere(Product):
+    """A where() between enum fields with other values than the key's: band C is code 2 of a
+    two-row table."""
+
+    model_point = ENUM_SCHEMA
+    assumption_tables = (BY_SEX,)
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return self.tables.by_sex[where(t > 0, self.mp.band, self.mp.sex)] * 1.0
+
+
+class EnumOrder(Product):
+    """A field listing the key's values in another order: its code 0 is F, the key's is M."""
+
+    model_point = ENUM_SCHEMA
+    assumption_tables = (BY_SEX,)
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return self.tables.by_sex[self.mp.sex_rev] * 1.0
+
+
+class FloatKey(Product):
+    """An Int key that would hold 2.5: truncated on one backend, an IndexError on the other."""
+
+    model_point = SIMPLE_SCHEMA
+    assumption_tables = (BUMP,)
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return self.tables.bump[where(t > 3, self.mp.k, 2.5)]
+
+
+class EnumChosen(Product):
+    """A where() between two fields that list the key's values in its order."""
+
+    model_point = ENUM_SCHEMA
+    assumption_tables = (BY_SEX,)
+
+    @var
+    def x(self, t: Int) -> Factor:
+        return self.tables.by_sex[where(t > 1, self.mp.sex2, self.mp.sex)] * 1.0
+
+
+@pytest.mark.parametrize(
+    ("model", "pattern"),
+    [
+        (EnumWhere, r"^mp\.band does not have the same enum values as key sex of table by_sex"),
+        (EnumOrder, r"^mp\.sex_rev lists the values of key sex of table by_sex in another order"),
+        (FloatKey, r"^unit mismatch: the branches of where\(\) are Int and number"),
+    ],
+    ids=["enum-where", "enum-order", "float-key"],
+)
+def test_a_key_the_table_cannot_be_read_at_is_a_build_error(
+    model: type[Product], pattern: str
+) -> None:
+    """A key the kernel would read outside the table (where() of an enum field with other
+    values), at the wrong row (a field in another order) or truncated (a float in an Int) is a
+    BuildError at the model line on both backends, not a value read past the array."""
+    errors = []
+    for backend in BACKEND_NAMES:
+        with pytest.raises(BuildError, match=pattern) as info:
+            build(model, backend=backend)
+        errors.append(info.value)
+    assert errors[0].loc == errors[1].loc
+    assert errors[0].loc is not None
+    assert errors[0].loc.function == f"{model.__qualname__}.x"
+    assert Path(errors[0].loc.file) == Path(__file__)
+
+
+def test_a_where_between_enum_fields(tmp_path: Path) -> None:
+    points = pa.table(
+        {
+            "policy_id": pa.array(["E0", "E1", "E2"], pa.string()),
+            "sex": pa.array(["M", "F", "M"], pa.string()),
+            "sex2": pa.array(["F", "F", "M"], pa.string()),
+            "band": pa.array(["A", "B", "C"], pa.string()),
+            "sex_rev": pa.array(["M", "F", "M"], pa.string()),
+            "rem_m": pa.array([3, 3, 3], pa.int32()),
+        }
+    )
+    by_sex = pa.table({"sex": pa.array(["M", "F"]), "v": pa.array([0.25, 0.75])})
+    res = on_both(
+        lambda backend: run(
+            built(EnumChosen, backend),
+            model_points=points,
+            tables={"by_sex": by_sex},
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / backend,
+        )
+    )
+    # months 1..3: sex at t = 1, sex2 after
+    assert res.lane("x", "E0").tolist() == [0.0, 0.25, 0.75, 0.75]
+    assert res.lane("x", "E1").tolist() == [0.0, 0.75, 0.75, 0.75]
+    assert res.lane("x", "E2").tolist() == [0.0, 0.25, 0.25, 0.25]
+
+
 def test_a_fixed_month_outside_the_horizon(tmp_path: Path) -> None:
     class Late(Growth):
         @var
@@ -1295,6 +1521,9 @@ def test_the_run_directory_and_manifest(tmp_path: Path) -> None:
     assert block["numpy"] == np.__version__
     assert block["using_svml"] == str(bool(numba.config.USING_SVML))
     assert "processor" in block
+    # the CPU LLVM compiles for, which platform.processor() does not name on Linux or macOS
+    assert (block["cpu_name"], block["cpu_features"]) == _numba_target()
+    assert {"processor", "cpu_name", "cpu_features"} <= set(VALUE_ENVIRONMENT)
     assert "platform" in block
     assert "pyarrow" in block
     assert set(numpy_run.manifest["backend"]) == {"name", "numpy", "pyarrow", "python", "platform"}
@@ -1313,31 +1542,72 @@ def test_the_run_directory_and_manifest(tmp_path: Path) -> None:
         assert np.array_equal(back.var(name), res.var(name)), name
 
 
+def _numba_target() -> tuple[str, str]:
+    """The CPU name and features Numba's own code generator hands LLVM."""
+    registry: Any = importlib.import_module("numba.core.registry")
+    codegen: Any = registry.cpu_target.target_context.codegen()
+    return str(codegen._get_host_cpu_name()), str(codegen._get_host_cpu_features())
+
+
+def test_the_manifest_names_the_cpu_numba_compiles_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``NUMBA_CPU_NAME`` and ``NUMBA_CPU_FEATURES`` (``numba.config``) choose the target LLVM
+    compiles for instead of the host, and the backend block records what Numba uses: the
+    name ``generic`` with no features (Numba's default features for it) too."""
+    numba: Any = importlib.import_module("numba")
+    assert numba_backend.target_cpu() == _numba_target()
+    for name, features in (("generic", "+sse2"), ("generic", "")):
+        monkeypatch.setattr(numba.config, "CPU_NAME", name)
+        monkeypatch.setattr(numba.config, "CPU_FEATURES", features)
+        versions = BACKENDS["numba"].versions()
+        assert (versions["cpu_name"], versions["cpu_features"]) == (name, features)
+        assert numba_backend.target_cpu() == _numba_target() == (name, features)
+
+
 def test_the_generated_module_and_its_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The module is written to ``HALLEY_NUMBA_CACHE / <ir_hash>.py`` (the source exactly) and
-    compiled there; Numba's cache files land beside it, and compiling the same source again
-    neither rewrites the file nor recompiles."""
+    """The module is written to ``HALLEY_NUMBA_CACHE / <ir_hash>-<sha256 of its text>.py``
+    (the source exactly) and compiled there; Numba's cache files land beside it, and compiling
+    the same source again neither rewrites the file nor recompiles."""
 
     class Cached(Growth):
         pass
 
     monkeypatch.setenv(numba_backend.CACHE_ENV, str(tmp_path / "cache"))
     compiled = build(Cached, backend="numba")
-    path = tmp_path / "cache" / f"{compiled.ir_hash}.py"
+    digest = hashlib.sha256(compiled.source.encode()).hexdigest()
+    stem = f"{compiled.ir_hash}-{digest[:16]}"
+    path = tmp_path / "cache" / f"{stem}.py"
     assert path.read_text(encoding="utf-8") == compiled.source
     assert f"IR_SHA256 = {compiled.ir_hash!r}" in compiled.source
-    cached = list((tmp_path / "cache" / "__pycache__").glob(f"{compiled.ir_hash}.k_*.nbi"))
+    cached = list((tmp_path / "cache" / "__pycache__").glob(f"{stem}.k_*.nbi"))
     assert len(cached) == len(compiled.schedule.components)
     stamp = path.stat().st_mtime_ns
     numba_backend._LOADED.clear()  # as a fresh process would: the file is there, the kernels too
     again = numba_backend.compile_source(compiled.source, compiled.name)
     assert path.stat().st_mtime_ns == stamp
-    module = numba_backend._LOADED[hashlib.sha256(compiled.source.encode()).hexdigest()]
+    module = numba_backend._LOADED[digest]
     for entry in module.KERNELS:
         assert getattr(module, entry[0]).stats.cache_hits, entry[0]
     assert again is module.run_batch
+    assert module.__file__ is not None
+    assert Path(module.__file__) == path
+    # another text of the same IR hash (the model's source in another checkout names other
+    # files in the messages) has a file of its own: neither overwrites the module another
+    # process may be importing, and each process runs its own text
+    other = compiled.source.replace(
+        "Generated by the Halley", "Generated (elsewhere) by the Halley"
+    )
+    assert other != compiled.source
+    numba_backend.compile_source(other, compiled.name)
+    there = numba_backend._LOADED[hashlib.sha256(other.encode()).hexdigest()]
+    assert there.__file__ is not None
+    assert Path(there.__file__) != path
+    assert Path(there.__file__).read_text(encoding="utf-8") == other
+    assert path.read_text(encoding="utf-8") == compiled.source
+    assert path.stat().st_mtime_ns == stamp
+    assert there.__name__ != module.__name__
+    assert sys.modules[module.__name__] is module
     # the generated code keeps the model's grouping and compiles with fast-math off
     assert 'fastmath=False, error_model="numpy"' in compiled.source
     assert "V_r[t, p, s] = ((V_r[t+1, p, 0] + V_cf[t+1, p, 0]) * 0.5)" in compiled.source
@@ -1356,7 +1626,7 @@ def test_the_default_cache_directory_is_the_users_own(
     directory = tmp_path / f"halley-numba-{user}"
     assert numba_backend.cache_dir() == directory
     path = numba_backend.store_module("0" * 64, "X = 1\n")
-    assert path == directory / f"{'0' * 64}.py"
+    assert path == directory / f"{'0' * 64}-{hashlib.sha256(b'X = 1\n').hexdigest()[:16]}.py"
     assert path.read_text(encoding="utf-8") == "X = 1\n"
     if hasattr(os, "getuid"):
         assert directory.stat().st_mode & 0o077 == 0
@@ -1402,7 +1672,7 @@ def test_a_kernel_numba_cannot_compile_is_a_build_error(
     ) as info:
         numba_backend.compile_source(edited, compiled.name)
     assert info.value.loc == compiled.graph.variables["cf"].loc
-    assert f"halley_numba_{'f' * 64}" not in sys.modules
+    assert not [name for name in sys.modules if name.startswith(f"halley_numba_{'f' * 64}")]
 
 
 def test_a_node_the_generator_cannot_emit_is_a_build_error() -> None:

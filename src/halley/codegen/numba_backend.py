@@ -27,8 +27,10 @@ first failing check in that order, naming the lanes the NumPy backend names
 outputs; the finiteness check runs at the end, as there.
 
 The module text is ``CompiledModel.source``. It is written to a real file, :func:`cache_dir`
-``/ <ir_hash>.py``, and imported from there, so that Numba's ``cache=True`` keeps the compiled
-kernels beside it between processes.
+``/ <ir_hash>-<sha256 of the text, 16 digits>.py`` (:func:`module_stem`), and imported from
+there, so that Numba's ``cache=True`` keeps the compiled kernels beside it between processes.
+The text names the model's source files for the messages, so two checkouts of one model have
+one IR hash and two texts: each text has its own file, and a process never runs another's.
 """
 
 from __future__ import annotations
@@ -629,7 +631,10 @@ class _Generator:
 
     def lookup(self, node: ir.TableLookup, ctx: _Ctx) -> str:
         """A table read: each integer key tested against its declared range first, in the
-        order the NumPy backend tests them; the read gives 0 if one failed."""
+        order the NumPy backend tests them; the read gives 0 if one failed. An enum key needs
+        no test: the checker admits a constant of the key, or the codes of model point fields
+        that list the key's values in its order (a field or a ``where()`` between fields), so
+        it is a position on the table's axis."""
         decl = self.graph.tables[node.table]
         parts: list[str] = []
         ok: list[str] = []
@@ -1027,17 +1032,26 @@ def _private(directory: Path) -> None:
         )
 
 
+def module_stem(ir_hash: str, source: str) -> str:
+    """The name of a generated module's file without ``.py``: the IR hash and the first 16
+    hex digits of the sha256 of the module's text. The text, not the IR hash alone, names the
+    file, so a file only ever holds one text: two texts of one IR hash (the model's source in
+    two checkouts, or another Halley) neither overwrite each other's file, which another process
+    may be importing, nor invalidate each other's cached kernels."""
+    return f"{ir_hash}-{hashlib.sha256(source.encode('utf-8')).hexdigest()[:16]}"
+
+
 def store_module(ir_hash: str, source: str) -> Path:
-    """Write the generated module to :func:`cache_dir` ``/ <ir_hash>.py`` and return its path.
-    The directory is created private to the user (mode 0o700 where modes apply), and the
-    default one must be the user's own (:func:`_private`). A directory that cannot be created
-    or written is a BuildError naming ``HALLEY_NUMBA_CACHE``."""
+    """Write the generated module to :func:`cache_dir` ``/`` :func:`module_stem` ``.py`` and
+    return its path. The directory is created private to the user (mode 0o700 where modes
+    apply), and the default one must be the user's own (:func:`_private`). A directory that
+    cannot be created or written is a BuildError naming ``HALLEY_NUMBA_CACHE``."""
     directory = cache_dir()
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not os.environ.get(CACHE_ENV):
             _private(directory)
-        path = directory / f"{ir_hash}.py"
+        path = directory / f"{module_stem(ir_hash, source)}.py"
         _write(path, source)
     except OSError as exc:
         raise BuildError(
@@ -1048,10 +1062,10 @@ def store_module(ir_hash: str, source: str) -> Path:
 
 
 def compile_source(source: str, model: str) -> BatchFn:
-    """Write the generated module to :func:`cache_dir` ``/ <ir_hash>.py``, import it and
-    compile its kernels for their signatures (or load them from Numba's cache); its
-    ``run_batch``. A kernel Numba cannot compile is a BuildError at the model line of the
-    component's first variable."""
+    """Write the generated module to its file (:func:`store_module`), import it and compile
+    its kernels for their signatures (or load them from Numba's cache); its ``run_batch``. A
+    kernel Numba cannot compile is a BuildError at the model line of the component's first
+    variable."""
     numba = _numba()
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     module = _LOADED.get(digest)
@@ -1061,7 +1075,7 @@ def compile_source(source: str, model: str) -> BatchFn:
             raise BuildError(f"the Numba backend's source for {model} names no IR_SHA256")
         ir_hash = found.group(1)
         path = store_module(ir_hash, source)
-        name = f"halley_numba_{ir_hash}"
+        name = f"halley_numba_{path.stem.replace('-', '_')}"
         spec = importlib.util.spec_from_file_location(name, path)
         if spec is None or spec.loader is None:  # pragma: no cover - a .py path always has one
             raise BuildError(f"cannot import the Numba backend's module for {model} from {path}")
@@ -1129,13 +1143,34 @@ class NumbaBackend:
     def versions(self) -> dict[str, str]:
         """What computes the values: NumPy (the wrapper's arrays and checks), Numba and
         llvmlite (the kernels), whether Numba uses Intel's SVML for vectorised maths, and the
-        processor LLVM compiled for."""
+        machine: ``processor`` is the operating system's name for it, ``cpu_name`` and
+        ``cpu_features`` the CPU and the instruction set extensions LLVM compiles the kernels
+        for (:func:`target_cpu`)."""
         numba = _numba()
         llvmlite = importlib.import_module("llvmlite")
+        cpu_name, cpu_features = target_cpu()
         return {
             "numpy": np.__version__,
             "numba": str(numba.__version__),
             "llvmlite": str(llvmlite.__version__),
             "using_svml": str(bool(numba.config.USING_SVML)),
             "processor": platform.processor(),
+            "cpu_name": cpu_name,
+            "cpu_features": cpu_features,
         }
+
+
+def target_cpu() -> tuple[str, str]:
+    """The CPU name and feature string LLVM compiles the kernels for, as Numba chooses them:
+    ``NUMBA_CPU_NAME`` and ``NUMBA_CPU_FEATURES`` when set, else the host's as LLVM detects it
+    (its AVX features off under ``NUMBA_DISABLE_AVX``). ``platform.processor()`` cannot tell an
+    AVX2 machine from an AVX-512 one, which can be given other vector code."""
+    numba = _numba()
+    codegen: Any = importlib.import_module("numba.core.codegen")
+    binding: Any = importlib.import_module("llvmlite.binding")
+    config: Any = numba.config
+    name = config.CPU_NAME if config.CPU_NAME is not None else binding.get_host_cpu_name()
+    features = (
+        config.CPU_FEATURES if config.CPU_FEATURES is not None else codegen.get_host_cpu_features()
+    )
+    return str(name), str(features)

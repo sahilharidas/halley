@@ -211,12 +211,27 @@ def test_where_literal_branch_takes_the_other_units_unit() -> None:
         u.where_unit(u.INT, u.MONEY, u.MONEY)
 
 
+def test_a_float_literal_does_not_take_an_ints_unit() -> None:
+    """An Int holds whole numbers, so a float literal beside one is a unit mistake (D11): as
+    a table key or an Int variable's value it would be truncated on one backend and an
+    IndexError on the other."""
+    for a, b in ((u.INT, u.NUMBER), (u.NUMBER, u.INT)):
+        with pytest.raises(UnitError, match=r"an Int holds whole numbers"):
+            u.where_unit(u.BOOL, a, b)
+        for fn in ("minimum", "maximum"):
+            with pytest.raises(UnitError, match=rf"the branches of {fn}\(\) are"):
+                u.call_unit(fn, (a, b))
+    assert u.call_unit("minimum", (u.INT, u.INTEGER)) == u.INT
+    assert u.where_unit(u.BOOL, u.NUMBER, u.FACTOR) == u.FACTOR
+
+
 def test_declared_unit_accepts_literals_only_as_adopted() -> None:
     assert u.declared_unit_ok(u.MONEY, u.MONEY)
     assert u.declared_unit_ok(u.MONEY, u.NUMBER)
     assert u.declared_unit_ok(u.INT, u.INTEGER)
     assert not u.declared_unit_ok(u.MONEY, u.COUNT)
     assert not u.declared_unit_ok(u.BOOL, u.NUMBER)
+    assert not u.declared_unit_ok(u.INT, u.NUMBER)
 
 
 def test_annotations_resolve_to_tags() -> None:

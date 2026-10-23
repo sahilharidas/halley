@@ -146,20 +146,15 @@ class _Checker:
                         f"({', '.join(key.enum)}); the lookup passes a {unit}",
                         loc,
                     )
-                if isinstance(key_node, ir.Const) and key_node.value not in key.enum:
-                    raise BuildError(
-                        f"{key_node.value!r} is not a value of key {key.name} of table "
-                        f"{node.table} ({', '.join(key.enum)})",
-                        loc,
-                    )
-                if isinstance(key_node, ir.MpField):
-                    f = self.graph.fields[key_node.name]
-                    if f.enum is None or set(f.enum) != set(key.enum):
+                if isinstance(key_node, ir.Const):
+                    if key_node.value not in key.enum:
                         raise BuildError(
-                            f"mp.{key_node.name} does not have the same enum values as key "
-                            f"{key.name} of table {node.table}",
+                            f"{key_node.value!r} is not a value of key {key.name} of table "
+                            f"{node.table} ({', '.join(key.enum)})",
                             loc,
                         )
+                else:
+                    self._enum_key(key, key_node, node.table, loc)
             elif unit not in units.INT_LIKE:
                 raise UnitError(
                     f"key {key.name} of table {node.table} is an Int in [{key.lo}, {key.hi}]; "
@@ -168,6 +163,39 @@ class _Checker:
                 )
         column = next(c for c in decl.columns if c.name == node.column)
         return column.unit
+
+    def _enum_key(self, key: ir.KeyDecl, key_node: ir.Node, table: str, loc: Loc | None) -> None:
+        """An enum key that is not a constant: a model point field whose enum lists the key's
+        values in the key's order, or a ``where()`` choosing between such fields. The generated
+        code reads the table at the field's code, its position in the field's enum, so another
+        order would read another row, and a field with other values (or a ``minimum()`` of two
+        codes) would read outside the table."""
+        if isinstance(key_node, ir.Where):
+            self._enum_key(key, key_node.a, table, loc)
+            self._enum_key(key, key_node.b, table, loc)
+            return
+        values = ", ".join(key.enum or ())
+        if not isinstance(key_node, ir.MpField):
+            raise BuildError(
+                f"key {key.name} of table {table} is an enum ({values}); pass one of its "
+                "values, a model point field with the same values in the same order, or a "
+                "where() between such fields",
+                loc,
+            )
+        f = self.graph.fields[key_node.name]
+        if f.enum is None or set(f.enum) != set(key.enum or ()):
+            raise BuildError(
+                f"mp.{key_node.name} does not have the same enum values as key "
+                f"{key.name} of table {table}",
+                loc,
+            )
+        if tuple(f.enum) != tuple(key.enum or ()):
+            raise BuildError(
+                f"mp.{key_node.name} lists the values of key {key.name} of table {table} in "
+                f"another order ({', '.join(f.enum)} against {values}); list them in the "
+                "key's order",
+                loc,
+            )
 
     # ------------------------------------------------------------------ dims per node
     def dims_of(self, node: ir.Node, dims: dict[str, Dims]) -> Dims:

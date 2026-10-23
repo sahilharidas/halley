@@ -3321,10 +3321,13 @@ VALUE_ENVIRONMENT: Final = (
     "llvmlite",
     "using_svml",
     "processor",
+    "cpu_name",
+    "cpu_features",
 )
 """The entries of a manifest's ``backend`` block that can change a run's values: the backend
 and NumPy compute them, the platform's libm computes the powers, and for the Numba backend
-Numba and llvmlite compile the kernels for the processor, with or without Intel's SVML. The
+Numba and llvmlite compile the kernels for the processor (the CPU and instruction set
+extensions LLVM targets, ``cpu_name`` and ``cpu_features``), with or without Intel's SVML. The
 output files' bytes depend on every entry (pyarrow writes its version into them and Python's
 runs the writer), so another pyarrow or Python can change a file's hash but never a value."""
 

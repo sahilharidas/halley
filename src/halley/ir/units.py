@@ -283,13 +283,21 @@ def unary_unit(op: str, a: Unit, loc: Loc | None = None) -> Unit:
 
 
 def branch_unit(a: Unit, b: Unit, loc: Loc | None, what: str) -> Unit:
-    """The unit of two alternatives: a literal takes the other branch's unit."""
+    """The unit of two alternatives: a literal takes the other branch's unit, except that a
+    float literal is not an Int (an Int holds whole numbers: a month, a key, a count of
+    months)."""
     if a == b:
         return a
     if is_literal(a) and is_literal(b):
         return _lit_result(a, b)
     if {a, b} == {INT, INTEGER}:
         return INT
+    if {a, b} == {INT, NUMBER}:
+        raise UnitError(
+            f"unit mismatch: the branches of {what} are {a} and {b}: an Int holds whole "
+            "numbers, so write the literal as an int",
+            loc,
+        )
     if is_literal(a) and b != BOOL:
         return b
     if is_literal(b) and a != BOOL:
@@ -368,10 +376,13 @@ def call_unit(fn: str, args: tuple[Unit, ...], loc: Loc | None = None) -> Unit:
 
 
 def declared_unit_ok(declared: Unit, inferred: Unit) -> bool:
-    """Whether a formula's inferred unit satisfies the declared return unit."""
+    """Whether a formula's inferred unit satisfies the declared return unit: a literal takes
+    the declared unit, except that a float literal is not an Int (:func:`branch_unit`)."""
     if declared == inferred:
         return True
     if is_literal(inferred):
+        if declared == INT:
+            return inferred == INTEGER
         return declared not in (BOOL, ENUM)
     return False
 
