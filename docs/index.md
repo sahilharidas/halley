@@ -6,15 +6,21 @@ A model is a Python class. Building it traces the formulas into a typed dependen
 units, time references and calculation order, then generates vectorised code that runs over every
 policy and scenario. Every run writes a manifest so any result can be reproduced exactly.
 
-**Status:** prototype. The engine core and both reference models are in. `TermAssurance`
-reconciles to the term assurance specification's number script under the specification's
+**Status:** prototype, not yet reviewed. The engine core, the reference models and the IFRS 17
+aggregation stage are in, each reconciled to its specification. `TermAssurance` reconciles to the
+[term assurance specification](spec/term-assurance.md)'s number script under the specification's
 tolerance, and the build errors the specification lists for the checker fire as it says.
 `BasicTerm` reconciles to lifelib's `BasicTerm_ME` from lifelib's own inputs: every policy's
 present values, the sampled policies' monthly flows and the portfolio totals agree under the same
-tolerance. The IFRS 17 measurement of an in-force annuity group over a reporting period is part of
-v1, not a later version: its [worked example](spec/in-force-group.md) is specified, and its
-spreadsheet, reviewer's check and engine stage are pending, as are the spreadsheet and the
-reviewer's check of reference case 1.
+tolerance. The annuities of the [annuity specification](spec/annuity.md) reconcile to its printed
+worked example, and the aggregation stage measures the CSM of one group new at the valuation date,
+with the revenue and IFIE lines, and the subsequent measurement of an in-force group over a
+reporting period, reconciled to the [in-force worked example](spec/in-force-group.md)'s number
+script and to its two reference workbooks. The workbooks of reference case 1 and of the in-force
+example are built from the specifications by hand and recalculated in Excel. No reviewer has yet
+checked a specification or a workbook, so every reconciliation is against the author's own
+specification and script. The Numba backend and the worker processes are in; the benchmarks are
+not.
 
 ## Install
 
