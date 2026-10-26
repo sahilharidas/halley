@@ -1,0 +1,171 @@
+# Release: pushing a tag vX.Y.Z checks the tagged commit the way the development checks do,
+# builds the sdist and the wheel, smoke-tests the wheel in a clean environment and uploads both
+# files to PyPI with trusted publishing. No API token exists anywhere: PyPI accepts GitHub's
+# signed statement that the upload comes from this workflow in the "pypi" environment.
+# docs/releasing.md has the release steps and the one-time setup on PyPI and GitHub.
+#
+# Every third-party action is pinned to a full commit SHA; the comment names its release.
+---
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+      - name: Install Python from .python-version
+        run: uv python install
+
+      - name: Check that the tag names the version in pyproject.toml
+        id: version
+        run: |
+          version="$(uv version --short)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not v${version}, the version in pyproject.toml"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: uv sync --locked
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run --locked ruff check .
+
+      - name: ruff format --check
+        run: uv run --locked ruff format --check .
+
+      - name: pyright
+        run: uv run --locked pyright
+
+      - name: pytest
+        run: uv run --locked pytest
+
+      - name: Build the sdist and the wheel
+        # --no-sources builds the way any other installer would, without [tool.uv.sources]
+        # overrides. uv builds the wheel from the sdist, so a file missing from the sdist fails
+        # here. The ls fails if either file is missing or carries another version.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          uv build --no-sources
+          ls dist/halley-"${VERSION}"-*.whl dist/halley-"${VERSION}".tar.gz
+          sha256sum dist/*
+
+      - name: Keep the built files for the smoke test and the upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke-test the wheel
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+      - name: Install Python from .python-version
+        run: uv python install
+
+      - name: Fetch the built files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install the wheel into a clean venv
+        # The runtime requirements come from uv.lock with their hashes, so the install matches
+        # what the checks ran against; the wheel goes in with --no-deps, and uv pip check then
+        # confirms that those requirements cover everything the wheel says it needs.
+        env:
+          WORK: ${{ runner.temp }}/smoke
+        run: |
+          mkdir -p "$WORK"
+          uv export --frozen --quiet --no-header --no-dev --no-emit-project \
+            --format requirements.txt -o "$WORK/requirements.txt"
+          uv export --frozen --quiet --no-header --only-group dev --no-emit-project \
+            --format requirements.txt -o "$WORK/test-requirements.txt"
+          uv venv --python "$(cat .python-version)" "$WORK/venv"
+          uv pip install --python "$WORK/venv/bin/python" -r "$WORK/requirements.txt"
+          uv pip install --python "$WORK/venv/bin/python" --no-deps dist/halley-*.whl
+          uv pip check --python "$WORK/venv/bin/python"
+          uv pip install --python "$WORK/venv/bin/python" -r "$WORK/test-requirements.txt"
+
+      - name: Run the test suite against the wheel
+        # From a copy outside the checkout that holds only pyproject.toml (pytest's settings),
+        # tests/ and docs/spec (the committed inputs and scripts the suite reads), with
+        # python -I, so the only halley importable is the installed wheel.
+        env:
+          WORK: ${{ runner.temp }}/smoke
+        run: |
+          mkdir -p "$WORK/suite/docs"
+          cp pyproject.toml "$WORK/suite/"
+          cp -r tests "$WORK/suite/tests"
+          cp -r docs/spec "$WORK/suite/docs/spec"
+          cd "$WORK/suite"
+          "$WORK/venv/bin/python" -I - <<'PY'
+          import sys
+          import halley
+          print("imported from", halley.__file__)
+          sys.exit(not halley.__file__.startswith(sys.prefix))
+          PY
+          "$WORK/venv/bin/python" -I -m pytest -p no:cacheprovider
+
+  publish:
+    name: Publish to PyPI
+    needs: [check, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/halley/${{ needs.check.outputs.version }}/
+    permissions:
+      # id-token: write lets the job mint the OIDC token that PyPI exchanges for a short-lived
+      # upload token of its own. Nothing is read from the repository here.
+      id-token: write
+      contents: read
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+
+      - name: Fetch the files that passed the smoke test
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Upload to PyPI
+        # The hashes are printed so the log can be compared with what PyPI shows for each file.
+        # --check-url skips a file the index already serves with the same hash, so a run that
+        # failed after some of the files went up can be repeated.
+        run: |
+          sha256sum dist/*
+          uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*

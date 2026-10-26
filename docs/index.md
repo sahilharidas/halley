@@ -56,3 +56,10 @@ spec/README
 spec/term-assurance
 spec/in-force-group
 ```
+
+```{toctree}
+:maxdepth: 1
+:caption: Development
+
+releasing
+```
