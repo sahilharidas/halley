@@ -9,8 +9,9 @@ C17) and each derived file says where it came from. Each helper here returns a `
 whose ``halley.*`` metadata names its sources by sha256 (or, for the expected in-force, by run
 id) and the helper that made it (``halley.helper``); the stage loader recomputes every file that
 carries ``halley.rebased_from`` or ``halley.derived_from`` with the recomputations registered at
-the end of this module (:func:`recompute_rebased`, :func:`recompute_derived`) and requires bit
-equality (:mod:`halley.aggregation.stage`, "Provenance verification").
+the end of this module (:func:`recompute_rebased`, :func:`recompute_derived`) and requires
+equality within the C library's last bits, bit for bit on one machine
+(:mod:`halley.aggregation.stage`, "Provenance verification").
 
 * :func:`expected_in_force`: the ``OLD`` run's model point file, the previous projection run's
   ``pols_if`` at month ``tau`` with the actual instalment at V;
@@ -22,7 +23,8 @@ equality (:mod:`halley.aggregation.stage`, "Provenance verification").
   recognition.
 
 Every value is formed in plain float64 scalars in the order the in-force spec writes it, so the
-files equal ``docs/spec/in_force_group_numbers.py`` bit for bit. pyarrow ships no type stubs, so
+files equal ``docs/spec/in_force_group_numbers.py`` bit for bit on the machine that runs both
+(another C library's ``exp`` may round a last bit). pyarrow ships no type stubs, so
 by the convention of the modules that build or read Arrow tables this one is checked in
 pyright's basic mode.
 """
@@ -431,7 +433,8 @@ def recompute_rebased(check: ProvenanceCheck) -> Any:
     the sources its metadata names by sha256 (found by ``check.find_file``), by the helper its
     ``halley.helper`` names, with the arguments its metadata and rows record (the expense
     table's tau from the two price bases, a curve's or a CPI path's horizon from its last
-    month). The stage loader compares the result with the file bit for bit."""
+    month). The stage loader compares the result with the file, bit for bit on one machine and
+    within the C library's last bits across machines (``LIBM_ULPS``)."""
     f = check.file
     made_by = f.metadata.get(HELPER)
     if made_by == "rebase_expense_table":
@@ -512,7 +515,7 @@ def recompute_derived(check: ProvenanceCheck) -> Any:
     model points at V. The file's own ``halley.tau`` is not taken on trust: it must be the
     period's length, ``mi(V) - mi(V_prev)`` with V the stage's valuation date and V_prev the
     named run's (in-force 3.4: the expected in-force at V), or a file built at another month
-    would rebuild bit for bit and pass."""
+    would rebuild from its own metadata and pass."""
     f = check.file
     made_by = f.metadata.get(HELPER)
     if made_by != "expected_in_force":

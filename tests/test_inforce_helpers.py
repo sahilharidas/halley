@@ -42,7 +42,9 @@ from halley.aggregation.inforce import recompute_derived, recompute_rebased
 from halley.aggregation.stage import ProvenanceCheck
 from halley.products import annuity_data as data
 from halley.runtime import within
-from halley.runtime.loader import ReadFile, file_difference, read_source
+from halley.runtime.loader import ReadFile, TableMatch, file_difference, file_match, read_source
+from halley.runtime.tolerance import LIBM_ULPS
+from libm import assert_generated, same_values
 
 IF_DIR = Path(__file__).resolve().parent.parent / "docs" / "spec" / "in-force-group"
 V_REC, V = data.IF_RECOGNITION_DATE, data.IF_VALUATION_DATE
@@ -61,13 +63,10 @@ CUR_TABLES = {**REC_TABLES, "mort_base": "mort_base_v2", "expense": "expense_v2"
 """The current-basis run's tables at V (version 2)."""
 
 
-def _bits(values: Any) -> np.ndarray:
-    return np.ascontiguousarray(np.asarray(values, dtype=np.float64)).view(np.uint64)
-
-
 def _same(got: Any, want: Any) -> bool:
-    """Equal bit for bit, as 64-bit patterns."""
-    return bool(np.array_equal(_bits(got), _bits(want)))
+    """Equal bit for bit on the laptop that wrote the files, where the script and the files
+    share one C library; within 1e-12 relative on another machine (:mod:`libm`)."""
+    return same_values(got, want)
 
 
 def _sha(path: Path) -> str:
@@ -150,14 +149,12 @@ def rec_runs(
 def test_the_committed_files_are_the_generated_tables(files: dict[str, Any]) -> None:
     """``docs/spec/in_force_group_inputs.py`` wrote exactly these tables, from the bytes the
     loader hashes for an in-memory table. A pyarrow upgrade may change the bytes without a
-    value: rerun the script then."""
+    value: rerun the script then. Off the laptop that wrote them, another C library's ``exp``
+    and ``pow`` move last bits, and the values are held to 1e-12 relative (:mod:`libm`)."""
     on_disk = {p.stem for p in IF_DIR.glob("*.parquet")}
     assert on_disk == set(files)
     for name, table in files.items():
-        read = pq.read_table(_file(name))
-        assert read.equals(table), name
-        assert read.schema.metadata == table.schema.metadata, name
-        assert _sha(_file(name)) == data.sha256(table), name
+        assert_generated(_file(name), table, name)
 
 
 def test_the_curves_equal_the_script_bit_for_bit(inforce_oracle: ModuleType) -> None:
@@ -587,9 +584,11 @@ def _check(f: ReadFile, key: str, find_file: Any, **kw: Any) -> ProvenanceCheck:
 
 
 def test_the_recomputations_are_registered_and_reproduce_every_derived_file() -> None:
-    """Each helper's file is made again from the sources its metadata names, bit for bit, by
-    the recomputation registered for ``halley.rebased_from``; a value changed in the file, or a
-    helper the module does not know, is a LoadError for the loader to report."""
+    """Each helper's file is made again from the sources its metadata names by the
+    recomputation registered for ``halley.rebased_from``: bit for bit on the laptop that wrote
+    it, within ``LIBM_ULPS`` on a machine whose C library rounds ``exp`` the other way (the
+    loader's rule); a value changed in the file, or a helper the module does not know, is a
+    LoadError for the loader to report."""
     assert {
         "rebased_from": recompute_rebased,
         "derived_from": recompute_derived,
@@ -599,7 +598,9 @@ def test_the_recomputations_are_registered_and_reproduce_every_derived_file() ->
     derived = ("expense_old", "p_rec", "p_l", "cpi_locked", "df_cur")
     for name in derived:
         f = files[name]
-        assert file_difference(f, recompute_rebased(_check(f, "rebased_from", find))) is None
+        match = file_match(f, recompute_rebased(_check(f, "rebased_from", find)), ulps=LIBM_ULPS)
+        assert match.difference is None, (name, match)
+        assert match.ulps <= 4, (name, match)  # the envelope's derivation: four at most
     marked = {n for n, f in files.items() if "rebased_from" in f.metadata}
     assert marked == set(derived)
     p_l = files["p_l"]
@@ -610,6 +611,23 @@ def test_the_recomputations_are_registered_and_reproduce_every_derived_file() ->
     assert file_difference(f, recompute_rebased(_check(f, "rebased_from", find))) == (
         f"column rf_df, row 5: {values[5]!r} against {p_l.table.column('rf_df')[5].as_py()!r}"
     )
+    # another machine's exp may round a last bit the other way: within LIBM_ULPS the file is
+    # accepted and the distance recorded; beyond it the difference names the room allowed
+    original = p_l.table.column("rf_df").to_pylist()
+    nudged = list(original)
+    nudged[5] = float(np.nextafter(original[5], np.inf))
+    near = p_l.table.set_column(2, "rf_df", pa.array(nudged, pa.float64()))
+    f = read_source(near.replace_schema_metadata(p_l.table.schema.metadata), "nudged p_l")
+    recomputed = recompute_rebased(_check(f, "rebased_from", find))
+    assert file_difference(f, recomputed) is not None
+    assert file_match(f, recomputed, ulps=LIBM_ULPS) == TableMatch(None, 1)
+    off = [v * (1 + 1e-13) for v in original]
+    far = p_l.table.set_column(2, "rf_df", pa.array(off, pa.float64()))
+    f = read_source(far.replace_schema_metadata(p_l.table.schema.metadata), "far p_l")
+    difference = file_difference(f, recompute_rebased(_check(f, "rebased_from", find)), ulps=8)
+    assert difference is not None
+    assert difference.startswith(f"column rf_df, row 0: {off[0]!r} against {original[0]!r}, ")
+    assert difference.endswith(" ulps apart where 8 are allowed")
     # bit for bit is the values, the column types and the halley.* metadata: a file whose values
     # are the recomputation's but whose metadata carries one entry more, or whose month column
     # is another integer type, is not the recomputed file either

@@ -277,10 +277,15 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 - Provenance: an input that names its source in `halley.rebased_from` or `halley.derived_from`
   metadata (a basis run's copied input or the stage's own file) is recomputed by the helper
   registered for the key with `halley.aggregation.stage.register_provenance(key, helper, *,
-  replace=False)` and must equal it bit for bit; a file whose key has no helper is a LoadError,
-  since it cannot be verified. A key that has another helper already is a ValueError unless
-  `replace=True`, and each `provenance` entry of the manifest records the `helper` that
-  verified the file (its module and qualified name). A helper receives a `ProvenanceCheck` (the
+  replace=False)` and must equal it: bit for bit on the machine that built it, and within
+  `halley.runtime.tolerance.LIBM_ULPS` units in the last place (eight) on another, whose C
+  library's `exp` and `pow` may round a last bit the other way (a file built from another
+  source, at another month or with another ILP is off by orders of magnitude more); a file
+  whose key has no helper is a LoadError, since it cannot be verified. A key that has another
+  helper already is a ValueError unless `replace=True`, and each `provenance` entry of the
+  manifest records the `helper` that verified the file (its module and qualified name) and
+  `ulps`, the largest distance found (0 when bit for bit). A helper receives a
+  `ProvenanceCheck` (the
   file, the key and value, the bases, the previous run, and `find_file(sha256)` /
   `find_run(run_id)` over the stage's own inputs and the directories of the previous run, the
   runs it read and the bases, each run read from the bytes verified). The previous run's bases
@@ -653,17 +658,19 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
 ### Known limitations
 
 - `recompute` and `explain` evaluate a power with a non-literal array exponent (a model point
-  field, a scalar variable or a scenario value) as libm's pow, so where NumPy took its sqrt,
-  square or reciprocal fast path for an exponent of 0.5, 2 or -1 (in a batch of one policy, for
-  example) they agree with the stored value within 1e-12 relative, not bit for bit.
+  field, a scalar variable or a scenario value) through NumPy's power loop, so where NumPy took
+  its sqrt, square or reciprocal fast path for an exponent of 0.5, 2 or -1 (in a batch of one
+  policy, for example) they agree with the stored value within 1e-12 relative, not bit for bit.
 - Which non-literal power exponents take NumPy's fast path was measured on NumPy 2.5 (2.5.4 on
   Windows) only: another NumPy may choose differently, which can move the last bit of such a
   power between NumPy versions (within D5's 1e-12), and the documented shapes would need
   probing again.
 - For literal and 0-d exponents, `recompute` and `explain` mirror NumPy's fast path by raising
-  a one-element array, which assumes NumPy takes the same loop for one element as for a batch.
-  The tests check this on the platform they run on, and skip where its libm cannot tell the
-  two paths apart.
+  a one-element array, and for array exponents and for `exp`, `log`, `expm1`, `log1p` and
+  `sqrt` they call the NumPy loop on a one-element array, which assumes NumPy dispatches one
+  element as it does a batch: to the C library on Windows and on Linux without AVX-512, to its
+  own kernels on an AVX-512 Linux machine. The tests check this on the machine they run on, and
+  skip where its power loop cannot be told from the fast path.
 - A per-group month `self.series.x.at(self.group.k)` outside a series' months is a RunError
   naming the groups when the batch runs, not a LoadError; a constant `.at(k)` is checked at
   load, as `at()` and `self.scen.x.at()` are.
@@ -778,12 +785,13 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   exponent's value is 0.5, 2 or -1, because NumPy chooses its sqrt, square or reciprocal fast
   path from the shapes of the batch. Reruns with the same batching stay bit-identical (D19) and
   another batching agrees within 1e-12 relative (D5), which is what the annuity specification's
-  "Built-in invariants" promise. `recompute` and `explain` evaluate such a power as libm's pow,
-  so they agree with the stored value within the same tolerance, and bit for bit where the batch
-  took pow. A literal exponent (`x ** 0.5`, the mid-month `pv_month`) takes one path at every
-  batch size; the shipped products raise only to literals and to the month index (`v_m ** t`,
-  `(1 + i) ** (-t)`, the `-12 / t` of `ann_spot`), which took libm's pow at every batch shape
-  measured over a window of two or more months. Over a one-month window (H = 1 for a formula
+  "Built-in invariants" promise. `recompute` and `explain` evaluate such a power through
+  NumPy's power loop, so they agree with the stored value within the same tolerance, and bit
+  for bit where the batch took the loop. A literal exponent (`x ** 0.5`, the mid-month
+  `pv_month`) takes one path at every batch size; the shipped products raise only to literals
+  and to the month index (`v_m ** t`, `(1 + i) ** (-t)`, the `-12 / t` of `ann_spot`), which
+  took the loop at every batch shape measured over a window of two or more months. Over a
+  one-month window (H = 1 for a formula
   from t = 1) the month column is a size-one array and takes the fast path at every batch size,
   so `recompute` and `explain` differ from the stored value in the last place there; the shipped
   products' month exponents start at t = 0 or reach -1 only at t = 12, so they are unaffected.
@@ -807,3 +815,13 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   bit for bit at the same `batch_size` (tested with one and two workers on both backends:
   TermAssurance, a two-scenario CPI-linked annuity run in three batches and a stage over two
   groups).
+- Across machines the last bits move. NumPy's float64 `exp`, `log` and `pow` are the C
+  library's where NumPy has no vectorised kernel (Windows, Linux without AVX-512) and NumPy's
+  own on an AVX-512 Linux machine, and glibc and the Windows CRT round a last bit differently
+  on some inputs. A run's values, the input files the section 10 helpers build and the
+  committed reference files therefore agree with another machine's within those bits, not bit
+  for bit: the provenance check allows `LIBM_ULPS` and records the distance, the
+  reconciliations hold the specs' tolerances, and the tests that compare a committed file with
+  its generator, or scenario 0 of a two-scenario run with the one-scenario run, allow 1e-12
+  relative off the machine that wrote the files. D19's bit-identical reruns are a per-machine
+  statement.

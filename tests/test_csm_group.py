@@ -1566,6 +1566,7 @@ def test_the_aggregation_run_is_keyed_on_the_group_and_discloses(
             "key": "rebased_from",
             "value": rf_sha,
             "helper": "halley.aggregation.inforce.recompute_rebased",
+            "ulps": 0,  # written and recomputed on this machine: bit for bit
         }
         for name in ("p_l", "df_cur")
     ]

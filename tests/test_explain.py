@@ -171,17 +171,19 @@ class MidTimed(Product):
 
 def _fast_path_values(exponent: float, lo: float, hi: float, n: int = 3) -> list[float]:
     """Values in ``(lo, hi)`` for which NumPy's ``x ** exponent`` over an array (its fast path
-    for 0.5, 2 and -1) differs in the last bit from Python's ``x ** exponent`` (libm's pow);
-    about one value in a thousand does on this platform's libm. A libm whose pow is correctly
-    rounded for these exponents may offer none, in which case the mirror cannot be told from
-    pow here and the test is skipped."""
+    for 0.5, 2 and -1, which the power loop takes for a scalar exponent too) differs in the last
+    bit from the loop's pow for an array exponent (the C library's pow on this laptop and on
+    Linux without AVX-512, NumPy's own kernel on an AVX-512 Linux machine); about one value in
+    a thousand does. A machine whose pow agrees with the fast path on every value offers none,
+    in which case the mirror cannot be told from pow here and the test is skipped."""
     rng = np.random.default_rng(20261017)
     found: list[float] = []
     for _ in range(50):
         xs = rng.uniform(lo, hi, 20_000)
         fast = xs**exponent
-        for x, f in zip(xs.tolist(), fast.tolist(), strict=True):
-            if x**exponent != f:
+        loop = np.power(xs, np.full_like(xs, exponent))
+        for x, f, p in zip(xs.tolist(), fast.tolist(), loop.tolist(), strict=True):
+            if p != f:
                 found.append(x)
                 if len(found) == n:
                     return found
@@ -197,8 +199,15 @@ def _sqrt_fast_path_values(n: int = 3) -> list[float]:
 
 
 def _reciprocal_fast_path_values(n: int = 3) -> list[float]:
-    """Discount factors in (0.5, 1) whose ``** -1.0`` differs between 1 / x and pow."""
+    """Discount factors in (0.5, 1) whose ``** -1.0`` differs between 1 / x and the loop."""
     return _fast_path_values(-1.0, 0.5, 1.0, n)
+
+
+def _loop_pow(x: float, exponent: float) -> float:
+    """``x ** exponent`` as NumPy's power loop computes it for an array exponent, the path the
+    generated code takes for one: the C library's pow here, NumPy's own kernel on an AVX-512
+    Linux machine (a scalar exponent would take the loop's fast path instead)."""
+    return float(np.power(np.array([x]), np.array([exponent])).item())
 
 
 def _points(discs: list[float], rem_m: int = 6) -> Any:
@@ -448,11 +457,13 @@ class SpotByMonth(Product):
         return ann_spot(self.df(t), t)
 
 
-def test_recompute_takes_libm_pow_for_the_month_exponent_of_ann_spot(tmp_path: Path) -> None:
-    """A month-column exponent over a window of several months takes libm's pow at every batch
-    size, so ``ann_spot(df(t), t)`` at t = 12 is ``d ** -1.0 - 1``, not the reciprocal, and the
-    interpreter, which routes ``ann_spot``'s power by the kinds of both operands, agrees bit for
-    bit at every month."""
+def test_recompute_takes_the_power_loop_for_the_month_exponent_of_ann_spot(
+    tmp_path: Path,
+) -> None:
+    """A month-column exponent over a window of several months takes NumPy's power loop at
+    every batch size, so ``ann_spot(df(t), t)`` at t = 12 is ``np.power(d, -1.0) - 1``, not the
+    reciprocal, and the interpreter, which routes ``ann_spot``'s power by the kinds of both
+    operands, agrees bit for bit at every month."""
     discs = _reciprocal_fast_path_values()
     compiled = build(SpotByMonth)
     assert "** (-12 / _t[1:H+1])" in compiled.source
@@ -465,7 +476,7 @@ def test_recompute_takes_libm_pow_for_the_month_exponent_of_ann_spot(tmp_path: P
         )
         for pid, d in zip(res.ids, discs, strict=True):
             lane = res.lane("spot", pid)
-            assert lane[12] == (d**-1.0) - 1  # libm's pow
+            assert lane[12] == _loop_pow(d, -1.0) - 1  # the power loop
             assert lane[12] != (1.0 / d) - 1  # not the reciprocal fast path
             for t in range(res.H + 1):
                 assert recompute(res, pid, "spot", t) == lane[t], (batch_size, pid, t)
@@ -484,9 +495,10 @@ class InverseByMonth(Product):
 def test_a_month_exponent_over_one_month_takes_the_fast_path(tmp_path: Path) -> None:
     """The documented exception to the month-column rule: over a one-month window (H = 1 for a
     formula from t = 1) the month column is a size-one array and NumPy takes its reciprocal fast
-    path at every batch size, so the stored value is ``1 / d`` while ``recompute`` (libm's pow)
-    differs from it in the last place. Over two months the column takes pow and the two agree
-    bit for bit. A NumPy that chooses otherwise fails here, which flags the documented rule."""
+    path at every batch size, so the stored value is ``1 / d`` while ``recompute`` (the power
+    loop) differs from it in the last place. Over two months the column takes the loop and the
+    two agree bit for bit. A NumPy that chooses otherwise fails here, which flags the documented
+    rule."""
     discs = _reciprocal_fast_path_values()
     compiled = build(InverseByMonth)
     assert "(M_disc ** (-_t[1:H+1]))" in compiled.source
@@ -507,10 +519,10 @@ def test_a_month_exponent_over_one_month_takes_the_fast_path(tmp_path: Path) -> 
             stored = one.lane("inv", pid)[1]
             assert stored == 1.0 / d  # the reciprocal fast path
             again = recompute(one, pid, "inv", 1)
-            assert again == d**-1.0  # libm's pow
+            assert again == _loop_pow(d, -1.0)  # the power loop
             assert abs(again - stored) <= 1e-12 * abs(stored)
             lane = two.lane("inv", pid)
-            assert lane[1] == d**-1.0
+            assert lane[1] == _loop_pow(d, -1.0)
             assert lane[1] != 1.0 / d
             for t in range(two.H + 1):
                 assert recompute(two, pid, "inv", t) == lane[t], (batch_size, pid, t)

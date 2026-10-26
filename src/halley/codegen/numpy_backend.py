@@ -265,7 +265,8 @@ def value_kind(node: ir.Node, step: bool) -> str:
     value) is therefore on one path at every batch size. An array exponent whose value is 0.5, 2
     or -1 may not be: its results are bit-identical between reruns of the same batching (D19)
     and agree within 1e-12 relative with another batching (D5), which is what the annuity
-    specification's "Built-in invariants" promise. The interpreter takes libm's pow for every
+    specification's "Built-in invariants" promise. The interpreter takes NumPy's power loop
+    (``np.power`` on one-element arrays, the kernel the batch took on this machine) for every
     array exponent.
     """
     if isinstance(node, (ir.Const, ir.RunConst)):

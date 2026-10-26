@@ -157,7 +157,12 @@ class Lane:
             if node.op == "pow":
                 if float_power(node):
                     a = float(a)  # an integer literal to an Int power, raised as a float
-                return _pow(a, b, _array_power(node.a, node.b, step))
+                return _pow(
+                    a,
+                    b,
+                    _array_power(node.a, node.b, step),
+                    array_exponent=value_kind(node.b, step) == ARRAY,
+                )
             return _binary(node.op, a, b)
         if isinstance(node, ir.Where):
             a = self.eval(node.a, t, step)
@@ -175,15 +180,15 @@ def _array_power(base: ir.Node, exponent: ir.Node, step: bool) -> bool:
     exponent, which takes the fast paths: an array base (a 0-d one included) with a scalar or 0-d
     exponent, or a 0-d exponent against any base, a scalar one included
     (:func:`~halley.codegen.numpy_backend.value_kind`). A scalar base with a scalar exponent is
-    scalar power, libm's pow as Python's ``**`` is; an array exponent is taken as libm's pow too
-    (:func:`_pow` says when the batch's shapes make NumPy decide otherwise)."""
+    scalar power, libm's pow as Python's ``**`` is; an array exponent goes through NumPy's power
+    loop (:func:`_pow` says when the batch's shapes make NumPy decide otherwise)."""
     kb, ke = value_kind(base, step), value_kind(exponent, step)
     return ke != ARRAY and (kb != SCALAR or ke == ZERO_D)
 
 
 def _binary(op: str, a: Any, b: Any) -> Any:
     """A binary operator on two lane values in Python arithmetic, which agrees with NumPy's
-    element loops bit for bit except for the power fast paths :func:`_pow` mirrors."""
+    element loops bit for bit except for the powers :func:`_pow` routes through NumPy."""
     try:
         if op == "add":
             return a + b
@@ -220,45 +225,55 @@ def _binary(op: str, a: Any, b: Any) -> Any:
     raise HalleyError(f"unknown operator {op}")
 
 
-def _pow(a: Any, b: Any, array_power: bool) -> Any:
+def _pow(a: Any, b: Any, array_power: bool, array_exponent: bool = False) -> Any:
     """``a ** b`` through the path the generated code takes for this base and exponent.
 
     NumPy's power takes a fast path for ``** 0.5``, ``** 2`` and ``** -1`` (sqrt, square,
-    reciprocal) that differs from libm's pow in the last place for about one value in a
+    reciprocal) that differs from its power loop in the last place for about one value in a
     thousand. ``array_power`` (:func:`_array_power`) says that the generated code raises with a
     scalar-like exponent through NumPy: an array base with a scalar or 0-d exponent
     (``ndarray ** 0.5``, a keyless table's 0-d value as the base included) or a 0-d exponent
     against any base (``T_rates__f[0] ** T_power__e``); the array form is then run on a
     one-element array so NumPy decides the fast path from the exponent's value exactly as it
-    does for the batch. Otherwise the power is Python's ``**``, libm's pow: a scalar base with a
-    scalar exponent (``T_mort__q[0, 3] ** 0.5`` for a constant-key lookup, ``(t / 12) ** 0.5``
-    inside a recursive component), and every array exponent.
+    does for the batch. ``array_exponent`` says that the exponent is an array of the batch
+    (``v_m ** _t[1:H+1]``, ``x(t) ** M_k``), which NumPy raises in its power loop: the power is
+    then ``np.power`` on one-element arrays, which takes no fast path and runs the loop NumPy
+    dispatches to on this machine, the C library's pow where NumPy has no vectorised power
+    (Windows, Linux without AVX-512) and NumPy's own kernel where it has (an AVX-512 Linux
+    machine), so the interpreter and the batch take one kernel. Otherwise the power is Python's
+    ``**``, libm's pow, as the generated code's is for a scalar base with a scalar exponent
+    (``T_mort__q[0, 3] ** 0.5`` for a constant-key lookup, ``(t / 12) ** 0.5`` inside a
+    recursive component); an Int base to an Int exponent stays Python's exact integer power.
 
-    An array exponent is libm's pow in the generated code only when the batch's shapes do not
-    broadcast it into the power loop (:func:`~halley.codegen.numpy_backend.value_kind`). An
+    An array exponent is the power loop in the generated code only when the batch's shapes do
+    not take it to the fast path (:func:`~halley.codegen.numpy_backend.value_kind`). An
     exponent built from the month column alone (``v_m ** t``, ``-12 / _t[1:H+1]`` in a
-    whole-mode ``ann_spot``) is pow at every shape measured over a window of two or more months
-    (over a one-month window, H = 1 for a formula from t = 1, the month column is a size-one
-    array and takes the fast path at every batch size, so this interpreter differs from the
-    stored value in the last place there), but a model point field exponent
+    whole-mode ``ann_spot``) is the loop at every shape measured over a window of two or more
+    months (over a one-month window, H = 1 for a formula from t = 1, the month column is a
+    size-one array and takes the fast path at every batch size, so this interpreter differs
+    from the stored value in the last place there), but a model point field exponent
     (``x(t) ** self.mp.k``) whose value is 0.5, 2 or -1 takes the fast path in a batch of one
     policy and not in a batch of three, and a scalar variable read as an exponent
     (``x ** alpha()``) takes it at almost every shape. Not mirrored: such a result depends on
     the batch composition in the last place, two batchings agree within 1e-12 relative (D5),
     and this interpreter agrees with the backend to the same tolerance, bit for bit only with a
-    batch that took pow.
+    batch that took the loop.
     """
     if array_power:
         with np.errstate(all="ignore"):  # the generated code runs under the same errstate
             return (np.array([a]) ** b).item()
+    if array_exponent and (isinstance(a, float) or isinstance(b, float)):
+        with np.errstate(all="ignore"):
+            return np.power(np.array([a]), np.array([b])).item()
     return _binary("pow", a, b)
 
 
 def _ufunc(fn: str, x: Any) -> Any:
-    """``np.<fn>`` of one value through the same NumPy loop the generated code runs, so that
-    ``exp`` and friends agree with the backend bit for bit (the C library and NumPy's own
-    vector implementations may differ in the last place)."""
-    return getattr(np, fn)(np.float64(x)).item()
+    """``np.<fn>`` of one value through the same NumPy loop the generated code runs over the
+    batch's arrays, on a one-element contiguous array so that NumPy dispatches as it does for
+    the batch (its own vectorised ``exp`` and ``log`` where this machine has them, the C
+    library's otherwise), so that ``exp`` and friends agree with the backend bit for bit."""
+    return getattr(np, fn)(np.array([x], dtype=np.float64)).item()
 
 
 def _call(fn: str, args: list[Any], kinds: list[str]) -> Any:
@@ -286,7 +301,8 @@ def _call(fn: str, args: list[Any], kinds: list[str]) -> Any:
         if fn == "ann_fwd":
             return _pow(args[0] / args[1], 12, ARRAY in kinds[:2]) - 1
         if fn == "ann_spot":
-            return _pow(args[0], -12 / args[1], kinds[0] != SCALAR and kinds[1] != ARRAY) - 1
+            array_power = kinds[0] != SCALAR and kinds[1] != ARRAY
+            return _pow(args[0], -12 / args[1], array_power, kinds[1] == ARRAY) - 1
         if fn == "as_cu":
             return args[0]
         if fn in ("exp", "log", "expm1", "log1p", "sqrt"):

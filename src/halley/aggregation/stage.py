@@ -64,7 +64,7 @@ from halley.runtime.loader import (
     ReadFile,
     Source,
     column_type,
-    file_difference,
+    file_match,
     read_copy,
     read_series_copy,
     read_source,
@@ -84,6 +84,7 @@ from halley.runtime.run import (
     verified_run,
     write_manifest,
 )
+from halley.runtime.tolerance import LIBM_ULPS
 
 SCENARIO_TREATMENTS = ("mean", "each")
 """What a series does with its basis's scenarios: their mean (one scenario) or each of them."""
@@ -542,15 +543,15 @@ class Aggregation(Product):
     the scenario input ``p_l``, is the composed curve of the runs of the cur basis (annuity
     spec, "Locked-in rates": "P_L = P of the same run"). The loader requires ``p_l`` to say so
     in its metadata, built by ``locked_in_curve`` from the ``rf_df`` and ``ilp`` files those runs
-    read with ``tau0 = 0``, and recomputes it from them bit for bit
-    (:func:`_check_composed_curve`). :func:`~halley.runtime.run.run`, which reads no basis
-    run, refuses such a stage."""
+    read with ``tau0 = 0``, and recomputes it from them (:func:`_check_composed_curve`; bit for
+    bit on one machine, within the C library's last bits across machines).
+    :func:`~halley.runtime.run.run`, which reads no basis run, refuses such a stage."""
     discloses_current_curve: ClassVar[bool] = False
     """True for a stage whose scenario input ``df_cur`` is the composed current curve of the
     runs of the cur basis, the curve their BEL and RA unwind on, whose forward rates the stage
     reads and whose file its manifest discloses as the para 120 curve (design section 9). The
     loader requires ``df_cur`` to say so in its metadata, built by ``composed_curve`` from the
-    ``rf_df`` and ``ilp`` files those runs read, recomputes it from them bit for bit
+    ``rf_df`` and ``ilp`` files those runs read, recomputes it from them
     (:func:`_check_composed_curve`) and records the files under the disclosures'
     ``para_120_curve_verified``. :func:`~halley.runtime.run.run` makes no such check; a stage
     run there discloses nothing (``CsmRollForward``'s M1 still checks the curve's values on
@@ -559,7 +560,7 @@ class Aggregation(Product):
     """True for a stage whose locked-in runs (bases old and new) and locked-in files are built
     by the section 10 helpers from the previous run and the basis its groups lock in by hash
     (in-force 3.3, 3.4, 5.5, B72(b)), so that the loader holds each to what it was built from;
-    a file built from the wrong source rebuilds bit for bit from its own metadata, and no
+    a file built from the wrong source rebuilds from its own metadata and passes, and no
     invariant sees it (the accretion is on both sides of I11, K1 and M1; delta_FCF_L is what the
     runs say it is). Beside the hashes the loader always checks (:func:`_check_locked_in`):
 
@@ -1199,7 +1200,7 @@ CURVE_ROLES: Final = {
     "which the period close accretes the opening CSM",
 }
 """What each curve ``locked_in_curve`` writes is (its ``halley.curve``), for a message: a file
-read as the other one passes every hash and rebuilds bit for bit."""
+read as the other one passes every hash and rebuilds from its metadata."""
 
 CONFIDENCE_LEVEL: Final = ("ra_param", "alpha")
 """The table and column of the cur basis's runs that hold the disclosed confidence level (para
@@ -2184,11 +2185,11 @@ def _check_locked_in(
     ``tau0``, given for a stage that rebuilds its locked-in files
     (:attr:`Aggregation.rebuilds_locked_in`), is the group's months from its recognition date
     to the valuation date: each of these inputs must then also name its source
-    (``halley.rebased_from``), so that the provenance check rebuilds it bit for bit from the
-    files the hashes name, and carry ``halley.tau0`` equal to it, the month the curve is re-based
+    (``halley.rebased_from``), so that the provenance check rebuilds it from the files the
+    hashes name, and carry ``halley.tau0`` equal to it, the month the curve is re-based
     at and the CPI path spliced at (in-force 5.1, 5.2). Each curve must then also be the curve
     it is read as (``halley.curve``, :data:`CURVE_ROLES`): ``p_rec`` read as ``p_l`` carries the
-    group's hashes and ``tau0``, rebuilds bit for bit and has ``P_rec(0) = 1``, so nothing else
+    group's hashes and ``tau0``, rebuilds from them and has ``P_rec(0) = 1``, so nothing else
     would tell the two apart. The old and new runs discount on the stage's own ``p_l`` file,
     the group's one locked-in curve (in-force 5.5), and read an ILP table of 0.0
     (:func:`_check_no_premium`), since the premium is inside ``P_L`` already (C17). Returns the
@@ -2318,7 +2319,7 @@ def _check_actual_cpi(
     (:data:`ACTUAL_CPI_METADATA`: the locked-in CPI path, a rebased expense table) names the
     stage's own table :data:`ACTUAL_CPI`, the history the run directory copies with its estimate
     flag (in-force 3.6, 5.2, 5.4; C9). Otherwise a path spliced, or a table rebased, on another
-    history (a previous period's, say) rebuilds bit for bit from a file the provenance check
+    history (a previous period's, say) rebuilds from a file the provenance check
     finds elsewhere, while the stage records a history nothing was built from. The cur runs'
     CPI path, which names no history, is held to the table by its rows
     (:func:`_check_current_history`). A LoadError names the input."""
@@ -2579,7 +2580,7 @@ def _check_composed_curve(
     file must say so in its metadata: ``source_sha256`` and ``ilp_sha256`` are the ``rf_df`` and
     ``ilp`` files every cur run read, from their verified copies, ``rebased_from`` names its
     source, so that the provenance check rebuilds it from those files with the section 10
-    helper and requires bit equality, and ``tau0``, which a locked-in curve must carry, is 0. A
+    helper (:func:`_verify_provenance`), and ``tau0``, which a locked-in curve must carry, is 0. A
     curve without that metadata, such as a bare discount file without its illiquidity premium,
     one composed from another discount or ILP file, or one re-based at another month, is a
     LoadError naming the scenario input; so is a cur basis whose runs composed their curves from
@@ -2688,7 +2689,8 @@ class ProvenanceCheck:
     ``file`` is an input that names its source in ``halley.<key> = value``
     (:data:`PROVENANCE_KEYS`): a hash for ``rebased_from``, a run id for ``derived_from``. The
     helper recomputes the file from that source and returns the ``pyarrow.Table`` it must equal
-    bit for bit. It finds a file by sha256 with ``find_file`` (among the stage's own inputs and
+    within :data:`~halley.runtime.tolerance.LIBM_ULPS` (bit for bit on the machine that built
+    it). It finds a file by sha256 with ``find_file`` (among the stage's own inputs and
     in the directories of the previous run, the runs it read and the stage's bases, verified on
     read) and a run by id with ``find_run``; ``bases`` are the stage's runs by basis,
     ``previous`` the previous aggregation run (``None`` at recognition)."""
@@ -2862,14 +2864,17 @@ def _verify_provenance(
     valuation_date: dt.date,
     runs: Mapping[str, Sequence[_BasisRun]],
     prev: _Previous | None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Each file that names its source is recomputed by the helper registered for its key and
-    must equal what it gives bit for bit (design section 9, "Provenance verification"); a file
-    whose key has no helper is a LoadError too, since it cannot be verified. Returns what the
-    manifest records of each."""
+    must equal what it gives (design section 9, "Provenance verification"): bit for bit on the
+    machine that built it, and within :data:`~halley.runtime.tolerance.LIBM_ULPS` units in the
+    last place on another, whose C library's ``exp`` and ``pow`` may round a last bit the other
+    way (:func:`~halley.runtime.loader.file_match`). A file whose key has no helper is a
+    LoadError too, since it cannot be verified. Returns what the manifest records of each, with
+    ``ulps``, the largest distance found (0 when bit for bit)."""
     bases = {b: [r.result for r in rs] for b, rs in runs.items()}
     previous = None if prev is None else prev.result
-    record: list[dict[str, str]] = []
+    record: list[dict[str, Any]] = []
     for f in files:
         for key in PROVENANCE_KEYS:
             value = f.metadata.get(key)
@@ -2901,12 +2906,13 @@ def _verify_provenance(
                     f"{f.where}: recomputing it from halley.{key} = {value} raised "
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
-            difference = file_difference(f, table)
-            if difference is not None:
+            match = file_match(f, table, ulps=LIBM_ULPS)
+            if match.difference is not None:
                 raise LoadError(
                     f"{f.where}: it is not what its source (halley.{key} = {value}) gives: "
-                    f"{difference}; a file that names its source equals the recomputed file bit "
-                    "for bit"
+                    f"{match.difference}; a file that names its source equals the recomputed "
+                    f"file, bit for bit or within {LIBM_ULPS} ulps where another machine's C "
+                    "library computed it"
                 )
             record.append(
                 {
@@ -2915,6 +2921,7 @@ def _verify_provenance(
                     "key": key,
                     "value": value,
                     "helper": helper_name(helper),  # how the file was verified (D21)
+                    "ulps": match.ulps,  # 0 when bit for bit; else another libm's last bits
                 }
             )
     return record

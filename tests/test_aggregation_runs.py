@@ -1083,8 +1083,9 @@ def test_provenance_is_recomputed_bit_for_bit(
     chain: Chain, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A file that names its source (halley.rebased_from, halley.derived_from) is recomputed by
-    the helper registered for its key and must equal it bit for bit; with no helper it cannot
-    be verified, a LoadError too. The helper finds the source by hash in the previous run's
+    the helper registered for its key and must equal it, bit for bit on one machine and within
+    LIBM_ULPS where another machine's C library computed it; with no helper it cannot be
+    verified, a LoadError too. The helper finds the source by hash in the previous run's
     bases and a run by id; the manifest records each file verified."""
     monkeypatch.setattr(stage_module, "PROVENANCE_HELPERS", {})
     source = chain.hashes["rf_rec"]
@@ -1112,6 +1113,7 @@ def test_provenance_is_recomputed_bit_for_bit(
             "value": source,
             # how the file was verified (D21): the helper's module and qualified name
             "helper": f"{__name__}.{REBASE}",
+            "ulps": 0,  # bit for bit: written and recomputed on this machine
         }
     ]
     # found in the directory of a basis run of the previous run
@@ -1136,6 +1138,19 @@ def test_provenance_is_recomputed_bit_for_bit(
     register_provenance("rebased_from", lambda check: 1 / 0, replace=True)
     with pytest.raises(LoadError, match="raised ZeroDivisionError"):
         chain.roll(out, scenarios={"p_l": p_l})
+
+    def nudged(check: ProvenanceCheck) -> Any:
+        """The recomputation one ulp off at one month, as another machine's exp rounds it."""
+        table = curve(0.041, meta=check.file.metadata)
+        values = table.column("rf_df").to_numpy().copy()
+        values[5] = np.nextafter(values[5], np.inf)
+        index = table.schema.get_field_index("rf_df")
+        return table.set_column(index, "rf_df", pa.array(values, pa.float64()))
+
+    register_provenance("rebased_from", nudged, replace=True)
+    near = chain.roll(tmp_path / "near", scenarios={"p_l": p_l})
+    assert near.manifest["provenance"][0]["ulps"] == 1  # within LIBM_ULPS: accepted, recorded
+    assert near.run_id == verified.run_id  # the provenance record is outside the run id
     with pytest.raises(ValueError, match="a provenance key is one of"):
         register_provenance("copied_from", rebase)
 

@@ -34,6 +34,7 @@ from halley.products.annuity import (
     LevelAnnuity,
 )
 from halley.runtime import recompute, within
+from libm import assert_generated, same_values
 
 SPEC = Path(__file__).resolve().parent.parent / "docs" / "spec" / "annuity"
 TABLE_NAMES = ("mort_base", "mort_cif", "expense", "inv_expense", "ilp", "ra_param")
@@ -541,8 +542,10 @@ def test_two_scenarios_share_the_history_and_split_the_path(
 ) -> None:
     """A stochastic run (D4): two CPI scenarios with identical history rows, 2.5% a year in the
     first and 3.5% in the second, the discount curve the same in both. Every invariant passes
-    (I9 per scenario through ``a.scen``), scenario 0 is the deterministic run bit for bit,
-    ``onerous`` is per policy and scenario, and the monthly file carries both scenario ids."""
+    (I9 per scenario through ``a.scen``), scenario 0 is the deterministic run (bit for bit on
+    this laptop; within D5's 1e-12 relative where NumPy's kernels choose a path by the batch's
+    shapes, as on an AVX-512 machine), ``onerous`` is per policy and scenario, and the monthly
+    file carries both scenario ids."""
 
     def cpi(s: int, u: int) -> float:
         if u <= 0 or s == 0:
@@ -566,7 +569,7 @@ def test_two_scenarios_share_the_history_and_split_the_path(
     assert all(r.passed for r in res.invariants)
     assert [r.name for r in res.invariants] == [r.name for r in run_cpi_alone.invariants]
     for name in OUTPUTS:
-        assert np.array_equal(res.var(name)[:, :, :1], run_cpi_alone.var(name)), name
+        assert same_values(res.var(name)[:, :, :1], run_cpi_alone.var(name)), name
     bel = res.var("bel")
     assert bel.shape == (res.H + 1, 1, 2)
     assert bel[0, 0, 0] != bel[0, 0, 1]  # the faster CPI path raises the liability
@@ -766,6 +769,8 @@ def test_the_derived_constants_equal_the_script_bit_for_bit(
 
 
 def test_the_committed_files_are_the_generated_tables() -> None:
+    """Bit for bit on the laptop that wrote them; within 1e-12 relative on a machine whose C
+    library rounds the last bit of ``exp`` and ``pow`` the other way (:mod:`libm`)."""
     generated = {
         **data.example_model_points(),
         **data.reference_tables(),
@@ -774,11 +779,7 @@ def test_the_committed_files_are_the_generated_tables() -> None:
         "cpi": data.reference_scenarios()["cpi"],
     }
     for name, table in generated.items():
-        on_disk = pq.read_table(SPEC / f"{name}.parquet")
-        assert on_disk.equals(table), name
-        assert hashlib.sha256((SPEC / f"{name}.parquet").read_bytes()).hexdigest() == data.sha256(
-            table
-        ), name
+        assert_generated(SPEC / f"{name}.parquet", table, name)
 
 
 def test_female_rows_are_the_male_rows_four_years_younger() -> None:

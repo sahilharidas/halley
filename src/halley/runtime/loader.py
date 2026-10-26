@@ -40,6 +40,7 @@ from halley.authoring.contracts import (
 )
 from halley.errors import LoadError
 from halley.ir import units
+from halley.runtime.tolerance import ulps_apart
 
 Source = str | Path | Any
 """A Parquet file path, an in-memory ``pyarrow.Table`` or a :class:`ReadFile` already read (an
@@ -228,39 +229,75 @@ def _arrow_array(values: NDArray[Any]) -> Any:
     return pa.array(values.astype(np.float64), pa.float64())
 
 
-def table_difference(a: Any, b: Any) -> str | None:
-    """``None`` when two ``pyarrow.Table`` objects are equal bit for bit (column names and
-    types, every value, floats compared as their 64-bit patterns so ``-0.0`` and ``0.0``
-    differ, and the ``halley.*`` and ``version`` schema metadata); otherwise the first
-    difference, for a message."""
+@dataclass(frozen=True, slots=True)
+class TableMatch:
+    """How two tables compare (:func:`compare_tables`)."""
+
+    difference: str | None
+    """``None`` when the two agree; otherwise the first difference, for a message."""
+    ulps: int
+    """The largest distance, in units in the last place, between two float values that agree
+    without being the same bits (:func:`~halley.runtime.tolerance.ulps_apart`): 0 when every
+    value is bit for bit, or when only the sign of a zero differs."""
+
+
+def compare_tables(a: Any, b: Any, *, ulps: int = 0) -> TableMatch:
+    """Two ``pyarrow.Table`` objects compared: the column names and types, every value, and the
+    ``halley.*`` and ``version`` schema metadata. Floats are compared as their 64-bit patterns
+    (so ``-0.0`` and ``0.0`` differ) and, where ``ulps`` allows, within that many units in the
+    last place of the larger magnitude, the room another machine's C library takes in ``exp``
+    and ``pow`` (:data:`~halley.runtime.tolerance.LIBM_ULPS`); every other column and the
+    metadata exactly."""
     if a.column_names != b.column_names:
-        return f"columns {a.column_names} against {b.column_names}"
+        return TableMatch(f"columns {a.column_names} against {b.column_names}", 0)
     if a.num_rows != b.num_rows:
-        return f"{a.num_rows} rows against {b.num_rows}"
+        return TableMatch(f"{a.num_rows} rows against {b.num_rows}", 0)
+    worst = 0.0
     for name in a.column_names:
         x, y = a.column(name), b.column(name)
         if x.type != y.type:
-            return f"column {name} is {x.type} against {y.type}"
+            return TableMatch(f"column {name} is {x.type} against {y.type}", 0)
         if pa.types.is_floating(x.type):
-            xs = np.asarray(x.to_numpy(), dtype=np.float64).view(np.uint64)
-            ys = np.asarray(y.to_numpy(), dtype=np.float64).view(np.uint64)
-            bad = np.flatnonzero(xs != ys)
+            xs = np.asarray(x.to_numpy(), dtype=np.float64)
+            ys = np.asarray(y.to_numpy(), dtype=np.float64)
+            bad = np.flatnonzero(xs.view(np.uint64) != ys.view(np.uint64))
             if bad.size:
-                i = int(bad[0])
-                return f"column {name}, row {i}: {x[i].as_py()!r} against {y[i].as_py()!r}"
+                apart = ulps_apart(xs[bad], ys[bad])
+                over = np.flatnonzero(apart > ulps)
+                if over.size:
+                    i = int(bad[over[0]])
+                    room = f", {apart[over[0]]:.0f} ulps apart where {ulps} are allowed"
+                    return TableMatch(
+                        f"column {name}, row {i}: {x[i].as_py()!r} against {y[i].as_py()!r}"
+                        f"{room if ulps else ''}",
+                        0,
+                    )
+                worst = max(worst, float(apart.max()))
         elif not x.equals(y):
-            return f"column {name} differs"
+            return TableMatch(f"column {name} differs", 0)
     if _schema_metadata(a) != _schema_metadata(b):
-        return f"metadata {_schema_metadata(a)} against {_schema_metadata(b)}"
-    return None
+        return TableMatch(f"metadata {_schema_metadata(a)} against {_schema_metadata(b)}", 0)
+    return TableMatch(None, int(np.ceil(worst)))
 
 
-def file_difference(f: ReadFile, table: Any) -> str | None:
-    """:func:`table_difference` between a file as read and a ``pyarrow.Table``: ``None`` when
-    the table holds the file's values bit for bit."""
+def table_difference(a: Any, b: Any) -> str | None:
+    """``None`` when two ``pyarrow.Table`` objects are equal bit for bit
+    (:func:`compare_tables` with no room); otherwise the first difference, for a message."""
+    return compare_tables(a, b).difference
+
+
+def file_match(f: ReadFile, table: Any, *, ulps: int = 0) -> TableMatch:
+    """:func:`compare_tables` between a file as read and a ``pyarrow.Table`` recomputed from
+    its sources, with ``ulps`` of room for the last bits of another machine's C library."""
     if not isinstance(table, pa.Table):
-        return f"a {type(table).__name__}, not a pyarrow.Table"
-    return table_difference(f.table, table)
+        return TableMatch(f"a {type(table).__name__}, not a pyarrow.Table", 0)
+    return compare_tables(f.table, table, ulps=ulps)
+
+
+def file_difference(f: ReadFile, table: Any, *, ulps: int = 0) -> str | None:
+    """:func:`file_match`'s difference: ``None`` when the table holds the file's values, bit
+    for bit by default."""
+    return file_match(f, table, ulps=ulps).difference
 
 
 def table_of(f: ReadFile) -> Any:
