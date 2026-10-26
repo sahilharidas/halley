@@ -1,0 +1,58 @@
+# CI: every pull request to main and every push to main runs the development checks on GitHub:
+# ruff check, ruff format --check, pyright and pytest, with the dependencies uv.lock records
+# (--locked fails the run if the lock is out of date rather than rewriting it). A pull request
+# is checked as the merge of its branch into main that GitHub prepares; a push is checked as
+# pushed. The release workflow (release.yml) runs the same checks on the tagged commit before it
+# builds anything.
+#
+# Every third-party action is pinned to a full commit SHA; the comment names its release.
+---
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        # The cache keeps uv's package cache between runs, keyed on pyproject.toml and uv.lock,
+        # so uv sync copies packages rather than downloads them when the lock has not changed.
+        # The release workflow leaves it off: setup-uv's default is off for a tag push.
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Install Python from .python-version
+        run: uv python install
+
+      - name: uv sync --locked
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run --locked ruff check .
+
+      - name: ruff format --check
+        run: uv run --locked ruff format --check .
+
+      - name: pyright
+        run: uv run --locked pyright
+
+      - name: pytest
+        run: uv run --locked pytest
