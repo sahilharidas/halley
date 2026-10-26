@@ -628,21 +628,24 @@ def test_the_recomputations_are_registered_and_reproduce_every_derived_file() ->
     assert difference is not None
     assert difference.startswith(f"column rf_df, row 0: {off[0]!r} against {original[0]!r}, ")
     assert difference.endswith(" ulps apart where 8 are allowed")
-    # bit for bit is the values, the column types and the halley.* metadata: a file whose values
-    # are the recomputation's but whose metadata carries one entry more, or whose month column
-    # is another integer type, is not the recomputed file either
+    # the match is the values, the column types and the halley.* metadata: a file whose values
+    # are the recomputation's (within the envelope, so that another machine's last bits do not
+    # pre-empt the finding) but whose metadata carries one entry more, or whose month column is
+    # another integer type, is not the recomputed file either
     noted = dict(p_l.table.schema.metadata)
     noted[b"halley.note"] = b"typed by hand"
     f = read_source(p_l.table.replace_schema_metadata(noted), "noted p_l")
-    difference = file_difference(f, recompute_rebased(_check(f, "rebased_from", find)))
+    difference = file_difference(
+        f, recompute_rebased(_check(f, "rebased_from", find)), ulps=LIBM_ULPS
+    )
     assert difference is not None
     assert difference.startswith("metadata {")
     assert "typed by hand" in difference
     wide = p_l.table.set_column(1, "t", p_l.table.column("t").cast(pa.int64()))
     f = read_source(wide.replace_schema_metadata(p_l.table.schema.metadata), "wide p_l")
-    assert file_difference(f, recompute_rebased(_check(f, "rebased_from", find))) == (
-        "column t is int64 against int32"
-    )
+    assert file_difference(
+        f, recompute_rebased(_check(f, "rebased_from", find)), ulps=LIBM_ULPS
+    ) == ("column t is int64 against int32")
     by_hand = dict(p_l.table.schema.metadata)
     by_hand[b"halley.helper"] = b"by_hand"
     f = read_source(p_l.table.replace_schema_metadata(by_hand), "by hand")

@@ -16,6 +16,7 @@ the modules that read Arrow tables this one is checked in pyright's basic mode.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -44,20 +45,42 @@ def same_values(got: Any, want: Any) -> bool:
     return bool((np.abs(a[~zero] - b[~zero]) <= bound).all())
 
 
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_sha256(value: Any) -> bool:
+    """Whether a column value or metadata entry is a sha256 hex digest."""
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    return isinstance(value, str) and _SHA256.match(value) is not None
+
+
 def assert_generated(path: Path, table: Any, name: str) -> None:
     """The committed file at ``path`` is what its generator writes, ``table``: bit for bit on
     the machine that wrote it, where its bytes then hash as the generator's table does (a
-    pyarrow upgrade may change the bytes without a value: rerun the script then); on another
-    machine its float columns within :data:`RELATIVE`, every other column and the schema
-    metadata exactly."""
+    pyarrow upgrade may change the bytes without a value: rerun the script then). On another
+    machine its float columns are within :data:`RELATIVE`, and a sha256 in a string column or
+    a metadata entry may differ, since it is the hash of another generated file, whose bytes
+    moved with its last bits (the tests that read such a file hold the hash to the committed
+    file); every other column and metadata entry is exact."""
     on_disk = pq.read_table(path)
     if on_disk.equals(table, check_metadata=True):
         assert hashlib.sha256(path.read_bytes()).hexdigest() == data.sha256(table), name
         return
-    assert on_disk.schema.equals(table.schema, check_metadata=True), name
+    assert on_disk.schema.equals(table.schema, check_metadata=False), name
+    got, want = on_disk.schema.metadata or {}, table.schema.metadata or {}
+    assert got.keys() == want.keys(), name
+    for key in want:
+        assert got[key] == want[key] or (_is_sha256(got[key]) and _is_sha256(want[key])), (
+            name,
+            key,
+        )
     for column in table.column_names:
         x, y = on_disk.column(column), table.column(column)
         if pa.types.is_floating(x.type):
             assert same_values(x.to_numpy(), y.to_numpy()), (name, column)
+        elif pa.types.is_string(x.type) or pa.types.is_large_string(x.type):
+            for a, b in zip(x.to_pylist(), y.to_pylist(), strict=True):
+                assert a == b or (_is_sha256(a) and _is_sha256(b)), (name, column)
         else:
             assert x.equals(y), (name, column)

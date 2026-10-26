@@ -579,16 +579,18 @@ def test_the_close_and_the_months_reconcile(
     ``delta``, ``n``, ``close`` and ``roll``, with P_g the scale of every amount; the closing
     balances open the months, and LRC(0) is FCF_g^cur(0) + CSM(0). D19: the close is also equal
     bit for bit to its recomputation from the run's own copies in the design's grouping, which
-    the other groupings of the same formulas miss in the last bit on these figures."""
+    the other groupings of the same formulas miss in the last bit on these figures (both of
+    them on the laptop; another C library's rounding can put one onto the stored value, as
+    glibc does for r_per, so what is asserted is that the two do not both coincide)."""
     v, chain = inforce_variants[k], chains[k]
     p_g = _p_g(v)
     _assert_close_exact(chain.stage)
     if k == "P":
         p_rec = pq.read_table(_file("p_rec")).column("rf_df").to_pylist()
         csm_prev, cu_act = chain.lane("csm_open_per", 0), chain.lane("cu_act_per", 0)
-        assert csm_prev * (p_rec[0] / p_rec[TAU]) != chain.lane("csm_acc", 0)
+        acc_other = csm_prev * (p_rec[0] / p_rec[TAU])
         r_other = (chain.lane("csm_adj", 0) * cu_act) / chain.lane("u_per", 0)
-        assert r_other != chain.lane("r_per", 0)
+        assert acc_other != chain.lane("csm_acc", 0) or r_other != chain.lane("r_per", 0)
     _agree(chain.lane("delta_fcf_l", 0), v["delta"], p_g)
     _agree(chain.lane("cu_next"), v["n"], p_g)
     _agree(chain.lane("n_0", 0), v["n"][0], p_g)
