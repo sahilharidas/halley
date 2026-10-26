@@ -169,26 +169,32 @@ class MidTimed(Product):
         return (self.pv(t + 1) * self.v(t + 1)) + pv_month(self.cf, t + 1, self.v)
 
 
-def _fast_path_values(exponent: float, lo: float, hi: float, n: int = 3) -> list[float]:
+def _fast_path_values(
+    exponent: float, lo: float, hi: float, n: int = 3, *, loop: bool = False
+) -> list[float]:
     """Values in ``(lo, hi)`` for which NumPy's ``x ** exponent`` over an array (its fast path
     for 0.5, 2 and -1, which the power loop takes for a scalar exponent too) differs in the last
-    bit from the loop's pow for an array exponent (the C library's pow on this laptop and on
-    Linux without AVX-512, NumPy's own kernel on an AVX-512 Linux machine); about one value in
-    a thousand does. A machine whose pow agrees with the fast path on every value offers none,
-    in which case the mirror cannot be told from pow here and the test is skipped."""
+    bit from pow: by default Python's ``**``, the C library's pow, the path a scalar base takes
+    in the generated code; with ``loop``, NumPy's power loop for an array exponent, the path an
+    array exponent takes (the C library's pow on this laptop and on Linux without AVX-512,
+    NumPy's own kernel on an AVX-512 Linux machine, where the two differ). About one value in a
+    thousand does. A machine whose pow agrees with the fast path on every value offers none, in
+    which case the mirror cannot be told from pow here and the test is skipped."""
     rng = np.random.default_rng(20261017)
     found: list[float] = []
     for _ in range(50):
         xs = rng.uniform(lo, hi, 20_000)
         fast = xs**exponent
-        loop = np.power(xs, np.full_like(xs, exponent))
-        for x, f, p in zip(xs.tolist(), fast.tolist(), loop.tolist(), strict=True):
-            if p != f:
-                found.append(x)
-                if len(found) == n:
-                    return found
+        if loop:
+            hits = xs[np.power(xs, np.full_like(xs, exponent)) != fast].tolist()
+        else:
+            hits = [x for x, f in zip(xs.tolist(), fast.tolist(), strict=True) if x**exponent != f]
+        found.extend(hits)
+        if len(found) >= n:
+            return found[:n]
+    where = "NumPy's power loop" if loop else "the C library"
     pytest.skip(
-        f"this libm's pow(x, {exponent}) equals NumPy's fast path on every probed value; the "
+        f"pow(x, {exponent}) in {where} equals NumPy's fast path on every probed value; the "
         "fast-path mirror cannot be distinguished here"
     )
 
@@ -198,9 +204,10 @@ def _sqrt_fast_path_values(n: int = 3) -> list[float]:
     return _fast_path_values(0.5, 0.9, 1.0, n)
 
 
-def _reciprocal_fast_path_values(n: int = 3) -> list[float]:
-    """Discount factors in (0.5, 1) whose ``** -1.0`` differs between 1 / x and the loop."""
-    return _fast_path_values(-1.0, 0.5, 1.0, n)
+def _reciprocal_fast_path_values(n: int = 3, *, loop: bool = False) -> list[float]:
+    """Discount factors in (0.5, 1) whose ``** -1.0`` differs between 1 / x and pow (the C
+    library's, or with ``loop`` NumPy's power loop's)."""
+    return _fast_path_values(-1.0, 0.5, 1.0, n, loop=loop)
 
 
 def _loop_pow(x: float, exponent: float) -> float:
@@ -464,7 +471,7 @@ def test_recompute_takes_the_power_loop_for_the_month_exponent_of_ann_spot(
     every batch size, so ``ann_spot(df(t), t)`` at t = 12 is ``np.power(d, -1.0) - 1``, not the
     reciprocal, and the interpreter, which routes ``ann_spot``'s power by the kinds of both
     operands, agrees bit for bit at every month."""
-    discs = _reciprocal_fast_path_values()
+    discs = _reciprocal_fast_path_values(loop=True)
     compiled = build(SpotByMonth)
     assert "** (-12 / _t[1:H+1])" in compiled.source
     for batch_size in (1, 3):
@@ -499,7 +506,7 @@ def test_a_month_exponent_over_one_month_takes_the_fast_path(tmp_path: Path) -> 
     loop) differs from it in the last place. Over two months the column takes the loop and the
     two agree bit for bit. A NumPy that chooses otherwise fails here, which flags the documented
     rule."""
-    discs = _reciprocal_fast_path_values()
+    discs = _reciprocal_fast_path_values(loop=True)
     compiled = build(InverseByMonth)
     assert "(M_disc ** (-_t[1:H+1]))" in compiled.source
     for batch_size in (1, 3):
