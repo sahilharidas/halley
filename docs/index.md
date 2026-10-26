@@ -57,3 +57,10 @@ spec/term-assurance
 spec/annuity
 spec/in-force-group
 ```
+
+```{toctree}
+:maxdepth: 1
+:caption: Development
+
+releasing
+```

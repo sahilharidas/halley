@@ -110,6 +110,9 @@ while editing; it is not the run a change passes before it is committed.
 `docs/spec/term_assurance_inputs.py` regenerates the reference Parquet inputs from the spec's
 formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spec prints.
 
+A release is a tag: pushing `vX.Y.Z` runs the same checks on GitHub, builds and smoke-tests the
+wheel and uploads it to PyPI. `docs/releasing.md` has the steps.
+
 ## Layout
 
 | Path | Role |
