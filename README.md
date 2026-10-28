@@ -25,6 +25,8 @@ yet checked a spec or a workbook, so every reconciliation is against the author'
 script. The Numba backend and the worker processes of M6 are in; its benchmarks are not.
 
 Documentation: <https://halley.kndra.co.za>. Install with `pip install halley` (Python 3.12+).
+The site's tutorial starts from that install and ends with a model of your own, your own data
+and a run over scenarios; every code block on it is run by the test suite.
 
 ## Example
 
