@@ -35,24 +35,32 @@ Python 3.12 or later. Licensed under Apache 2.0.
 ```python
 from halley import RunSettings, build, run
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
+from halley.products.term_assurance_data import reference_model_points, reference_tables
 
 compiled = build(TermAssurance)
 result = run(
     compiled,
-    model_points="docs/spec/term-assurance/model_points.parquet",
-    tables={
-        name: f"docs/spec/term-assurance/{name}.parquet"
-        for name in ("mort_table", "lapse_table", "comm_table", "rates", "expenses")
-    },
+    model_points=reference_model_points(),
+    tables=reference_tables(),
     settings=RunSettings(valuation_date=VALUATION_DATE),
     run_dir="runs/term-reference",
 )
-print(result.lane("reserve", "P05")[0])   # 537.9608658387098
+print(round(float(result.lane("reserve", "P05")[0]), 2))   # 537.96
 ```
 
-The run directory holds the manifest, a copy of every input, the generated backend source, the
-outputs keyed on `policy_id`, and the invariant results. `halley.explain(result, "P05",
-"reserve", 13)` shows the value, the formula and every input it read.
+The inputs are the specification's reference case, built from its formulas by the package, so
+this works from `pip install halley` alone. The run directory holds the manifest, a copy of every
+input, the generated backend source, the outputs keyed on `policy_id`, and the invariant results.
+`halley.explain(result, "P05", "reserve", 13)` shows the value, the formula and every input it
+read. The [tutorial](tutorial/index.md) continues from here: reading a run, writing a model,
+loading your own data and running scenarios.
+
+```{toctree}
+:maxdepth: 2
+:caption: Tutorial
+
+tutorial/index
+```
 
 ```{toctree}
 :maxdepth: 2
