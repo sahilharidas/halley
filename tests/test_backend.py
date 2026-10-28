@@ -6,13 +6,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from halley import (
+    BuildError,
+    Column,
     Count,
     Factor,
     Int,
@@ -22,7 +28,10 @@ from halley import (
     Prob,
     Product,
     RunError,
+    RunResult,
     RunSettings,
+    Static,
+    Table,
     at,
     build,
     load_run,
@@ -31,12 +40,23 @@ from halley import (
 )
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
 from halley.runtime import recompute, within
+from halley.runtime.run import backend_identity
 from models import (
+    POWER_DEN,
     SIMPLE_SCHEMA,
     VAL,
+    Expensed,
     Growth,
     Indexed,
+    IntPowers,
+    Inverted,
+    Margin,
+    Powered,
+    closed_form_expensed,
     closed_form_growth,
+    int_powers_expected,
+    margin_table,
+    powered_model_points,
     run_growth,
     scenario_file,
     simple_model_points,
@@ -97,6 +117,58 @@ def test_batches_do_not_change_results(tmp_path: Path) -> None:
         assert within(single.var(name), whole.var(name), 1.0).all(), name
 
 
+def _power_offset(k: int, lo: int, horizon: int = 12) -> int:
+    """The first offset ``j >= lo`` for which a month value ``(t + j) / POWER_DEN``, t in
+    ``1..horizon``, raised to ``k`` differs in the last place between NumPy's fast path and
+    libm's pow; skips when this libm offers none."""
+    for j in range(lo, lo + 200_000):
+        for t in range(1, horizon + 1):
+            x = (t + j) / POWER_DEN
+            if (np.array([x]) ** float(k)).item() != x ** float(k):
+                return j
+    pytest.skip(f"this libm's pow(x, {k}) equals NumPy's fast path on every probed month value")
+
+
+def test_a_non_literal_exponent_agrees_across_batchings_d5(tmp_path: Path) -> None:
+    """``x(t) ** self.mp.k`` with k = -1 and 2, outside a recursive component and inside one.
+    NumPy decides its fast path for an array exponent from the shapes of the batch (see
+    ``value_kind``), so a batch of one policy and a batch of three may differ in the last place.
+    Each of those policies has a month value on which the fast path and libm's pow differ, so
+    the comparison is not vacuous. The rule is the annuity specification's: reruns of the same
+    batching are bit-identical (D19), another batching agrees within 1e-12 relative (D5)."""
+    ks = [-1, 2, 3]
+    js = [_power_offset(-1, 60_000), _power_offset(2, 70_000), 80_000]
+    compiled = build(Powered)
+    assert "(V_x[1:H+1] ** M_k)" in compiled.source
+    assert "(V_x[t] ** m_k)" in compiled.source
+    runs: dict[tuple[int, int], Any] = {}
+    for batch_size in (1, 3):
+        for rerun in (0, 1):
+            runs[batch_size, rerun] = run(
+                compiled,
+                model_points=powered_model_points(js, ks),
+                settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+                run_dir=tmp_path / f"batch-{batch_size}-{rerun}",
+            )
+    for batch_size in (1, 3):
+        a, b = runs[batch_size, 0], runs[batch_size, 1]
+        assert a.run_id == b.run_id
+        assert a.manifest["outputs"]["monthly_sha256"] == b.manifest["outputs"]["monthly_sha256"]
+        for name in a.arrays:
+            assert np.array_equal(a.arrays[name], b.arrays[name]), (batch_size, name)
+    one, three = runs[1, 0], runs[3, 0]
+    assert set(one.arrays) == {"x", "whole", "acc", "term"}
+    for name in one.arrays:
+        np.testing.assert_allclose(one.var(name), three.var(name), rtol=1e-12, atol=0, err_msg=name)
+    # the batch of three takes libm's pow for the array exponent, and so does the interpreter:
+    # mirroring the fast path for an array exponent would break the agreement on K0 and K1
+    for pid in ("K0", "K1"):
+        for name in ("whole", "term"):
+            lane = three.lane(name, pid)
+            for t in range(1, three.H + 1):
+                assert recompute(three, pid, name, t) == lane[t], (pid, name, t)
+
+
 def test_run_directory_holds_inputs_code_outputs_and_manifest(tmp_path: Path) -> None:
     res = run_growth(tmp_path)
     d = res.run_dir
@@ -115,7 +187,21 @@ def test_run_directory_holds_inputs_code_outputs_and_manifest(tmp_path: Path) ->
     assert manifest["ir_sha256"] == res.compiled.ir_hash  # type: ignore[union-attr]
     copied = hashlib.sha256((d / "inputs/model_points.parquet").read_bytes()).hexdigest()
     assert manifest["inputs"]["model_points"]["sha256"] == copied
+    assert manifest["inputs"]["model_points"]["path"] is None  # given in memory
+    assert manifest["inputs"]["model_points"]["metadata"] == {}
     assert manifest["dimensions"] == {"policies": 3, "scenarios": 1, "months": 13, "horizon": 12}
+    assert manifest["outputs"]["kind"] == "projection"
+    assert manifest["outputs"]["id_field"] == "policy_id"
+    assert manifest["outputs"]["variables"]["x"] == {
+        "time": True,
+        "unit": "Count",
+        "start": 0,
+        "role": "in_force",
+    }
+    assert manifest["outputs"]["variables"]["cf"]["start"] == 1
+    for name in ("monthly", "scalars"):
+        digest = hashlib.sha256((d / f"outputs/{name}.parquet").read_bytes()).hexdigest()
+        assert manifest["outputs"][f"{name}_sha256"] == digest
     assert "def run_batch(inp, H):" in (d / "generated/numpy_backend.py").read_text()
     back = load_run(d)
     assert back.run_id == res.run_id
@@ -245,6 +331,160 @@ def test_fixed_month_outside_the_horizon_fails(tmp_path: Path) -> None:
         )
 
 
+def test_a_table_named_path_stays_in_the_run_identity(tmp_path: Path) -> None:
+    """The run identity drops each input's own ``path`` string and nothing else (D21: a run is
+    addressed by what it read): a table named ``path`` keeps its hash in the identity, so
+    different bytes give different run ids and the same bytes at two paths give one."""
+    share = Table("path", keys=(), columns=(Column("share", "Factor", ge=0, le=1),))
+
+    class Pathed(Growth):
+        assumption_tables = (share,)
+
+        @var
+        def shared(self) -> Money:
+            return self.total() * self.tables.path.share
+
+    compiled = build(Pathed)
+
+    def go(name: str, value: float, where: str = "a") -> Any:
+        d = tmp_path / where
+        d.mkdir(exist_ok=True)
+        pq.write_table(pa.table({"share": pa.array([value], pa.float64())}), d / f"{name}.parquet")
+        return run(
+            compiled,
+            model_points=simple_model_points(),
+            tables={"path": d / f"{name}.parquet"},
+            settings=RunSettings(valuation_date=VAL),
+            run_dir=tmp_path / f"run-{name}-{where}",
+        )
+
+    half, seventy = go("half", 0.5), go("seventy", 0.7)
+    assert half.run_id != seventy.run_id
+    assert (
+        half.manifest["inputs"]["tables"]["path"]["sha256"]
+        != seventy.manifest["inputs"]["tables"]["path"]["sha256"]
+    )
+    moved = go("half", 0.5, where="b")
+    assert moved.run_id == half.run_id
+    assert (
+        moved.manifest["inputs"]["tables"]["path"]["path"]
+        != half.manifest["inputs"]["tables"]["path"]["path"]
+    )
+
+
+def test_run_constants_come_from_the_valuation_date_and_horizon(tmp_path: Path) -> None:
+    class Dated(Growth):
+        @var
+        def cal_year(self, t: Int) -> Int:
+            return (self.run.m_val + t) // 12
+
+        @var
+        def m_val(self) -> Int:
+            return self.run.m_val
+
+        @var
+        def months(self) -> Int:
+            return self.run.horizon
+
+    compiled = build(Dated)
+    assert "R_m_val = inp['run.m_val']" in compiled.source
+    assert "R_horizon = H" in compiled.source
+    assert "V_cal_year[1:H+1] = ((R_m_val + _t[1:H+1]) // 12)" in compiled.source
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),  # 2027-01-01
+        run_dir=tmp_path / "dated",
+    )
+    assert res.arrays["m_val"].shape == (1, 1, 1)
+    assert res.lane("m_val", "S00")[0] == 12 * 2027 + 1 - 1
+    assert res.lane("months", "S00")[0] == 12
+    assert list(res.lane("cal_year", "S00")[1:]) == [2027] * 11 + [2028]
+    assert res.arrays["cal_year"].dtype == np.int64
+    longer = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL.replace(month=11), horizon=20),
+        run_dir=tmp_path / "longer",
+    )
+    assert longer.lane("m_val", "S00")[0] == 12 * 2027 + 11 - 1
+    assert longer.lane("months", "S00")[0] == 20
+    assert longer.run_id != res.run_id
+
+
+def test_a_backward_component_of_two_members_steps_from_the_horizon(tmp_path: Path) -> None:
+    """The annuity's {bel, inv_exp} (design section 4): the member without a terminal is
+    evaluated at t = H before the loop, in same-period order after the terminal it reads, and
+    both members then step back together with the existing start guards."""
+    compiled = build(Expensed)
+    source = compiled.source
+    terminal = source.index("V_bel[H] = (M_pols_if_init * M_premium)")
+    pre = source.index("V_inv_exp[H] = (V_ie_m[0] * V_bel[t])")
+    loop = source.index("for t in range(H - 1, -1, -1):")
+    assert terminal < pre < loop
+    assert "t = H\n" in source[terminal:pre]
+    assert (
+        "V_bel[t] = ((V_cf[t+1] + (V_inv_exp[t+1] * V_v[t+1])) + (V_v[t+1] * V_bel[t+1]))"
+        in source[loop:]
+    )
+    assert "if t >= 1:\n                V_inv_exp[t] = (V_ie_m[0] * V_bel[t])" in source[loop:]
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "expensed",
+    )
+    for i, pid in enumerate(res.ids):
+        want = closed_form_expensed(1.0 + i, 10.0 * (i + 1), res.H)
+        bel, inv_exp, cf = res.lane("bel", pid), res.lane("inv_exp", pid), res.lane("cf", pid)
+        ie, v = res.lane("ie_m", pid)[0], res.lane("v", pid)[res.H]
+        np.testing.assert_allclose(bel, want["bel"], rtol=1e-12, atol=0)
+        np.testing.assert_allclose(inv_exp, want["inv_exp"], rtol=1e-12, atol=0)
+        assert bel[res.H] == (1.0 + i) * (10.0 * (i + 1))  # the terminal: a year's premium
+        assert inv_exp[res.H] == ie * bel[res.H] != 0.0  # the formula at H, on the terminal
+        # the pre-loop value feeds the last step; had it not run, bel(H-1) would be cf + v bel
+        assert bel[res.H - 1] == (cf[res.H] + inv_exp[res.H] * v) + v * bel[res.H]
+        assert bel[res.H - 1] != cf[res.H] + v * bel[res.H]
+        assert inv_exp[0] == 0.0  # a month quantity
+        assert inv_exp[1] == ie * bel[1]
+        for name in ("bel", "inv_exp"):
+            for t in range(res.H + 1):
+                assert recompute(res, pid, name, t) == res.lane(name, pid)[t], (name, t)
+
+
+def test_boundary_values_from_variables_are_computed_before_the_recursion(
+    tmp_path: Path,
+) -> None:
+    """``csm`` starts at the scalar ``csm_0`` and ``lc`` at ``at(fcf, 0)`` (design section 5):
+    the generated code assigns both inits after the variables they read and before the loops."""
+    compiled = build(Margin)
+    source = compiled.source
+    fcf_loop = source.index("for t in range(H - 1, -1, -1):")
+    csm_0 = source.index("V_csm_0[...] = ((V_premium_total - _at(V_fcf, 0, H, 0, 'fcf', 'csm_0'")
+    csm_init = source.index("V_csm[0] = V_csm_0")
+    lc_init = source.index("V_lc[0] = _at(V_fcf, 0, H, 0, 'fcf', 'lc', 'Margin.<lambda>")
+    assert fcf_loop < csm_0 < csm_init
+    assert fcf_loop < lc_init
+    res = run(
+        compiled,
+        model_points=simple_model_points(),
+        tables={"margin": margin_table(0.5)},
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "margin",
+    )
+    for i, pid in enumerate(res.ids):
+        fcf0 = res.lane("fcf", pid)[0]
+        want_csm_0 = ((1.0 + i) * (10.0 * (i + 1)) - fcf0) * 0.5
+        assert res.lane("csm_0", pid)[0] == want_csm_0
+        assert res.lane("csm", pid)[0] == want_csm_0
+        assert res.lane("csm", pid)[1] == want_csm_0 * 0.95
+        assert res.lane("lc", pid)[0] == fcf0
+        assert res.lane("lc", pid)[1] == fcf0 * 0.9
+        assert recompute(res, pid, "csm", 0) == want_csm_0
+        assert recompute(res, pid, "lc", 0) == fcf0
+    assert res.arrays["csm_0"].shape == (1, 3, 1)
+
+
 def test_the_interpreter_agrees_with_the_generated_code(tmp_path: Path) -> None:
     res = run_growth(tmp_path)
     for pid in res.ids:
@@ -255,9 +495,150 @@ def test_the_interpreter_agrees_with_the_generated_code(tmp_path: Path) -> None:
             assert recompute(res, pid, name, 0) == res.lane(name, pid)[0], (pid, name)
 
 
+def test_not_is_logical_whatever_the_generated_code_holds(tmp_path: Path) -> None:
+    """``~`` of a Bool is logical not: inside a recursion ``t > 9`` and ``self.run.horizon <
+    t`` are Python bools, as is ``self.run.horizon > 5`` in a variable without a time
+    dimension, and Python's ``~True`` is -2, which ``where`` takes as true. The interpreter
+    agrees with every stored value."""
+    res = run(
+        build(Inverted),
+        model_points=simple_model_points(),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "run",
+    )
+    early = [0.0] + [1.0 if t <= 9 else 0.0 for t in range(1, 13)]  # 0.0 at t = 0: the init
+    assert list(res.lane("stepped", "S00")) == early  # and a domain from t = 1
+    assert list(res.lane("whole", "S00")) == early
+    assert res.lane("short", "S00")[0] == 0.0
+    for pid in res.ids:
+        for t in range(13):
+            for name in ("stepped", "whole"):
+                assert recompute(res, pid, name, t) == res.lane(name, pid)[t], (pid, name, t)
+        assert recompute(res, pid, "short", 0) == res.lane("short", pid)[0]
+
+
+def test_an_integer_literal_to_an_int_power_is_a_float_power(tmp_path: Path) -> None:
+    """``2 ** t`` is a Factor, raised as a float: NumPy's int64 power wrapped past 2**63
+    (``2 ** 63`` was -9.2e18 and ``2 ** 64`` 0.0 over the month column) and refused a negative
+    exponent, and ``-2 ** t``, as the generated code spelled ``(-2) ** t``, was ``-(2 ** t)``.
+    Whole mode, a recursion, a base of literals and a variable without a time dimension; the
+    interpreter agrees with every stored value."""
+    res = run(
+        build(IntPowers),
+        model_points=simple_model_points(rem_m=70),
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "run",
+    )
+    graph = res.graph
+    assert graph is not None
+    names = ("whole", "stepped", "halves", "signs", "chosen", "chosen_stepped")
+    for pid in res.ids:
+        for name in names:
+            lane = res.lane(name, pid)
+            for t in range(graph.variables[name].formula_range[0], 71):
+                assert lane[t] == pytest.approx(int_powers_expected(name, t), rel=1e-15)
+                assert recompute(res, pid, name, t) == lane[t], (pid, name, t)
+        assert res.lane("scalar", pid)[0] == 2.0**70 == recompute(res, pid, "scalar", 0)
+    assert res.lane("whole", "S00")[63:65].tolist() == [2.0**63, 2.0**64]
+    assert res.lane("signs", "S00")[63] == -(2.0**63)
+
+
 def test_outputs_can_be_restricted_at_run_time(tmp_path: Path) -> None:
     res = run_growth(tmp_path, outputs=("r", "total"))
     assert set(res.manifest["outputs"]["variables"]) == {"r", "total"}
     back = load_run(res.run_dir)
     assert set(back.arrays) == {"r", "total"}
     assert set(res.arrays) > {"r", "total"}  # the session keeps every variable for explain
+
+
+class Ahead(Growth):
+    """``at(x, t + 1)`` reaches month H + 1 at t = H for every policy: the failing mask has a
+    month axis and no policy axis."""
+
+    @var
+    def ahead(self, t: Int) -> Count:
+        return at(self.x, t + 1)
+
+
+def test_an_at_that_fails_for_every_lane_names_every_lane(tmp_path: Path) -> None:
+    """The message names the failing policies at every batch size, not only in a batch of one,
+    where the mask's single lane happened to match the batch."""
+    compiled = build(Ahead)
+    for batch_size, named in ((1, "S00"), (2, "S00, S01"), (3, "S00, S01, S02")):
+        with pytest.raises(
+            RunError,
+            match=rf"at\(x, \.\.\.\) reads a month outside the domain of x, months 0\.\.12; "
+            rf"policies {named}\n  at Ahead\.ahead",
+        ):
+            run(
+                compiled,
+                model_points=simple_model_points(),
+                settings=RunSettings(valuation_date=VAL, batch_size=batch_size),
+                run_dir=tmp_path / f"ahead-{batch_size}",
+            )
+
+
+# ------------------------------------------------------------------------------ backends
+
+PINNED_RUN_ID = "e3424e4c0b6f252f"
+"""The reference case's run id (the ``term_run`` fixture) on NumPy 2.5.4, recorded before
+backends could be chosen (M6 D1)."""
+
+
+def test_the_numpy_backends_run_ids_do_not_move(term_run: RunResult) -> None:
+    """A NumPy run's identity names the backend and the NumPy version, as before the Numba
+    backend existed, so run ids made before it stay valid; the reference case's id is pinned
+    at the NumPy version it was recorded with."""
+    backend = term_run.manifest["backend"]
+    assert backend["name"] == "numpy"
+    assert backend_identity("numpy", backend) == {"name": "numpy", "numpy": np.__version__}
+    if np.__version__ != "2.5.4":
+        pytest.skip(f"the pinned run id was recorded with NumPy 2.5.4, not {np.__version__}")
+    assert term_run.run_id == PINNED_RUN_ID
+
+
+def test_the_default_test_run_holds_the_numba_backend_to_this_one() -> None:
+    """D16: every backend is tested against the NumPy one, so the default ``pytest`` run, the
+    gate a change passes, selects the Numba backend's differentials; ``-m "not numba"`` leaves
+    them out only when asked."""
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    options = tomllib.loads(pyproject.read_text(encoding="utf-8"))["tool"]["pytest"]
+    assert "numba" not in options["ini_options"]["addopts"]
+    assert any(m.startswith("numba:") for m in options["ini_options"]["markers"])
+
+
+def test_an_unknown_backend_is_a_build_error() -> None:
+    with pytest.raises(
+        BuildError, match=r"^there is no backend 'jax'; the backends are: numba, numpy$"
+    ):
+        build(Growth, backend="jax")
+
+
+def test_the_numba_backend_without_numba_says_how_to_install_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "numba", None)  # import numba now raises ImportError
+    with pytest.raises(
+        BuildError,
+        match=r"^the Numba backend needs numba, which is not installed: "
+        r"pip install halley\[numba\]$",
+    ):
+        build(Growth, backend="numba")
+
+
+def test_a_build_time_parameter_may_not_be_named_backend() -> None:
+    """``backend`` is build()'s own argument, so a ``Static`` of that name could never be set:
+    a BuildError at the class, as a variable named like an accessor is."""
+
+    class Switched(Growth):
+        backend: Static[str] = "fast"
+
+    with pytest.raises(
+        BuildError,
+        match=r"Switched\.backend is a build-time parameter, but backend is build\(\)'s own "
+        r"argument",
+    ) as info:
+        build(Switched)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Switched")
+    assert Path(info.value.loc.file) == Path(__file__)

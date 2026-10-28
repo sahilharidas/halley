@@ -6,17 +6,23 @@ A model is a Python class. Building it traces the formulas into a typed dependen
 units, time references and calculation order, then generates vectorised code that runs over every
 policy and scenario. Every run writes a manifest so any result can be reproduced exactly.
 
-Status: prototype. The engine core (milestone M2) and both reference models are in.
-`TermAssurance` (M3) reconciles to the term assurance spec's number script, column for column and
-scalar for scalar, under the spec's tolerance, and every deliberate mistake the spec lists for the
-checker fails the build the way the spec says. `BasicTerm` (M4) reconciles to lifelib's
-`BasicTerm_ME` from lifelib's own inputs: every policy's present values, the sampled policies'
-monthly flows and counts, and the portfolio totals agree under the same tolerance. The IFRS 17
-measurement of an in-force annuity group over a reporting period is part of v1, not a later
-version: its worked example (M10) is specified in `docs/spec/in-force-group.md`, and its
-spreadsheet, reviewer's check and engine milestones (M9, M11) are pending. The spreadsheet and the
-reviewer's check of reference case 1 (M1) are also still pending, so that reconciliation is
-against the spec's own script, not yet against a reviewed spreadsheet.
+Status: prototype, not yet reviewed. The engine core (milestone M2), the reference models and the
+IFRS 17 aggregation stage are in, each reconciled to its specification. `TermAssurance` (M3)
+reconciles to the term assurance spec's number script, column for column and scalar for scalar,
+under the spec's tolerance, and every deliberate mistake the spec lists for the checker fails the
+build the way the spec says. `BasicTerm` (M4) reconciles to lifelib's `BasicTerm_ME` from
+lifelib's own inputs: every policy's present values, the sampled policies' monthly flows and
+counts, and the portfolio totals agree under the same tolerance. The annuities of the annuity spec
+(M5: level, fixed escalation and CPI-linked) reconcile to its printed worked example and to the
+in-force spec's number script, which restates the annuity model. The aggregation stage measures
+the CSM of one group new at the valuation date (M7), with the revenue and IFIE lines and the
+scenario mean of M12, and the subsequent measurement of an in-force group over a reporting period
+(M9, M11), reconciled to the in-force spec's number script and to its two reference workbooks.
+The workbooks of reference case 1 and of the in-force example (M1, M10) are built from the specs
+by hand and recalculated in Excel; the term workbook agrees with its number script value for
+value, and the engine's own reconciliation of the term product is to that script. No reviewer has
+yet checked a spec or a workbook, so every reconciliation is against the author's own spec and
+script. The Numba backend and the worker processes of M6 are in; its benchmarks are not.
 
 Documentation: <https://halley.kndra.co.za>. Install with `pip install halley` (Python 3.12+).
 
@@ -46,6 +52,20 @@ version of every input, backend versions, settings), a copy of every input, the 
 source, the outputs keyed on `policy_id` with a versioned schema, and the invariant results.
 `halley.explain` shows any policy's value at any month with its formula and inputs; `halley.diff`
 compares two runs; `halley.load_run` reads a run back without the model.
+
+`build(TermAssurance, backend="numba")` generates the Numba backend instead (`pip install
+halley[numba]`): compiled loops from the same IR, held to the NumPy reference within 1e-9 relative
+and bit-identical between its own reruns. Its first build compiles every kernel, which takes a
+while for a product; Numba caches them beside the generated module, so later builds load them.
+The cache is `halley-numba-<user>` in the system's temporary directory, one per user and private
+to them, since Numba loads the compiled kernels it finds there and on Linux and macOS that
+directory is shared; `HALLEY_NUMBA_CACHE` names another.
+
+`RunSettings(workers=4)` spreads the batches (`batch_size` policies each) over four processes on
+either backend, with the same results bit for bit as one process at the same batch size: the
+same run id, outputs, invariant results and errors. The workers are started with the spawn
+method and import the model's class from its module, so define it at the top level of a module
+and guard a script's entry point with `if __name__ == "__main__":`.
 
 A model is written like this (an excerpt of `TermAssurance`):
 
@@ -86,6 +106,13 @@ uv run ruff check .
 uv run pyright
 ```
 
+The default `pytest` run includes the Numba backend's differentials (`tests/test_numba.py`,
+marked `numba`), which hold it to the NumPy reference (D16). On a cold kernel cache they take
+about two and a half minutes, nearly all of it compiling every product's kernels, and about a
+minute once Numba's cache holds them, so keep the cache directory (`HALLEY_NUMBA_CACHE`)
+between CI runs if you can. `uv run pytest -m "not numba"` leaves them out for a quicker loop
+while editing; it is not the run a change passes before it is committed.
+
 `docs/spec/term_assurance_inputs.py` regenerates the reference Parquet inputs from the spec's
 formulas; `docs/spec/term_assurance_numbers.py` regenerates every number the spec prints.
 
@@ -101,11 +128,12 @@ wheel and uploads it to PyPI. `docs/releasing.md` has the steps.
 | `src/halley/ir` | typed graph: variables, time offsets, dimensions, source locations; the unit rule table |
 | `src/halley/checker` | units, time references and domains, recursion direction, cycles |
 | `src/halley/scheduler` | orders strongly connected components, assigns time direction |
-| `src/halley/codegen` | NumPy reference backend by code generation, then Numba |
+| `src/halley/codegen` | the backends, generated from the IR: the NumPy reference and Numba |
 | `src/halley/runtime` | data contracts at load, batches, outputs, run manifest, invariants, explain and diff |
-| `src/halley/aggregation` | group-level stage: portfolio totals now, the IFRS 17 CSM roll-forward next |
-| `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib) |
+| `src/halley/aggregation` | aggregation stages over group series: portfolio totals and the IFRS 17 CSM roll-forward (NewGroup, InForceGroup) |
+| `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib), the annuities `LevelAnnuity`, `FixedEscalationAnnuity` and `CPILinkedAnnuity` (the annuity spec) and their reference inputs |
 | `docs/spec` | product specifications, their number scripts and the reference inputs |
+| `benchmarks` | the Spec's workloads W1 and W2 on each backend (the harness and results come with M6's benchmark stage) |
 | `tests/data/lifelib` | lifelib's `BasicTerm_ME` inputs and results (MIT), the oracle for reference case 2 |
 
 ## Licence

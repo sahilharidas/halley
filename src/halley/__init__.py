@@ -12,16 +12,23 @@ Typical use::
 
 from __future__ import annotations
 
+from halley.aggregation import Aggregation, Basis, GroupSum
 from halley.authoring import (
     Annual,
     Bool,
     Column,
+    Continuous,
     Count,
+    CoverageUnits,
     Derived,
+    Effective,
     Factor,
     Field,
     Fraction,
+    Index,
+    InputRule,
     Int,
+    Invariant,
     Key,
     Money,
     MoneyPerPolicy,
@@ -32,12 +39,22 @@ from halley.authoring import (
     Rate,
     Rule,
     ScenarioInput,
+    ScenarioRule,
     Schema,
     Static,
     Table,
+    TableRule,
+    ann_fwd,
+    ann_spot,
+    annual_step,
+    as_cu,
     at,
+    cc_discount,
+    fwd_rate,
+    pv_month,
     sum_t,
     to_monthly,
+    to_monthly_cf,
     to_monthly_prob,
     var,
     where,
@@ -49,30 +66,43 @@ from halley.errors import BuildError, BuildWarning, HalleyError, LoadError, RunE
 from halley.runtime import RunResult, RunSettings, diff, explain, load_run, run
 from halley.tracing.tracer import trace
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
-def build(model: type[_Product], **statics: object) -> CompiledModel:
-    """Trace, check, schedule and compile a model with the given build-time settings."""
+def build(model: type[_Product], *, backend: str = "numpy", **statics: object) -> CompiledModel:
+    """Trace, check, schedule and compile a model with the given build-time settings for the
+    named backend: ``"numpy"``, the reference (D16), or ``"numba"`` (``pip install
+    halley[numba]``). A class that sets ``abstract = True`` is refused; build one of its
+    subclasses. ``backend`` is build()'s own argument, so no build-time parameter may take its
+    name."""
     graph = trace(model, statics)
     check(graph)
-    return compile_model(graph, model)
+    return compile_model(graph, model, backend)
 
 
 __all__ = [
+    "Aggregation",
     "Annual",
+    "Basis",
     "Bool",
     "BuildError",
     "BuildWarning",
     "Column",
     "CompiledModel",
+    "Continuous",
     "Count",
+    "CoverageUnits",
     "Derived",
+    "Effective",
     "Factor",
     "Field",
     "Fraction",
+    "GroupSum",
     "HalleyError",
+    "Index",
+    "InputRule",
     "Int",
+    "Invariant",
     "Key",
     "LoadError",
     "Money",
@@ -87,19 +117,29 @@ __all__ = [
     "RunResult",
     "RunSettings",
     "ScenarioInput",
+    "ScenarioRule",
     "Schema",
     "Static",
     "Table",
+    "TableRule",
     "UnitError",
+    "ann_fwd",
+    "ann_spot",
+    "annual_step",
+    "as_cu",
     "at",
     "build",
+    "cc_discount",
     "check",
     "diff",
     "explain",
+    "fwd_rate",
     "load_run",
+    "pv_month",
     "run",
     "sum_t",
     "to_monthly",
+    "to_monthly_cf",
     "to_monthly_prob",
     "trace",
     "var",

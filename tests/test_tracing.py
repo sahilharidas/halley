@@ -2,13 +2,41 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import pytest
 
-from halley import BuildError, Count, Int, Money, Product, Static, build, trace, var, where
-from halley.ir import MpField, VarRead, graph_hash, render
+from halley import (
+    BuildError,
+    Count,
+    InputRule,
+    Int,
+    Invariant,
+    Money,
+    Product,
+    Static,
+    build,
+    trace,
+    var,
+    where,
+)
+from halley.aggregation import NewGroup
+from halley.ir import MpField, RunConst, VarRead, graph_hash, render, walk
+from halley.products.annuity import CPILinkedAnnuity, LevelAnnuity
+from halley.products.lifelib_basic_term import BasicTerm
+from halley.products.term_assurance import TermAssurance
 from models import SIMPLE_SCHEMA, Growth
+
+TERM_ASSURANCE_HASH = "33e332cf057ec6340f79c6d88e0750a82d3b641608ce4a1c86d83e83d3bb5a14"
+BASIC_TERM_HASH = "acc1e97143421b336d55ebb3c10b4a1fc17405a3e5a3992ff71f0929f383e1c0"
+
+
+def test_reference_model_graph_hashes_are_pinned() -> None:
+    """The graphs of the two reference models (D22, D23) do not change under engine work: a
+    different hash here means every existing run of them gets a new run id (D21)."""
+    assert graph_hash(trace(TermAssurance)) == TERM_ASSURANCE_HASH
+    assert graph_hash(trace(BasicTerm)) == BASIC_TERM_HASH
 
 
 def test_graph_captures_variables_offsets_and_boundaries() -> None:
@@ -51,6 +79,48 @@ def test_static_branches_disappear_from_the_graph() -> None:
     assert plain.statics == {"has_loading": False}
     with pytest.raises(BuildError, match="no build-time parameter 'has_waiver'"):
         trace(Switched, {"has_waiver": True})
+
+
+def test_a_build_time_parameter_holds_its_declared_type() -> None:
+    """``Static[T]`` is checked against the value build() is given and the class's default: the
+    string "False" is truthy and would build the other branch with the manifest recording a
+    string, and a float or a bool where a month count is declared fails far from the
+    parameter. A BuildError at the class names the parameter, its type and the value."""
+    cases: tuple[tuple[type[Product], str, object, str], ...] = (
+        (NewGroup, "discount_coverage_units", "False", "True or False"),
+        (LevelAnnuity, "include_inv_exp", "False", "True or False"),
+        (CPILinkedAnnuity, "cpi_lag_m", 3.0, "an integer"),
+        (CPILinkedAnnuity, "cpi_lag_m", True, "an integer"),
+        (CPILinkedAnnuity, "cpi_lag_m", np.int64(4), "an integer"),  # not a graph constant
+    )
+    for model, name, value, wanted in cases:
+        kind = "bool" if wanted == "True or False" else "int"
+        with pytest.raises(BuildError) as info:
+            build(model, **cast(dict[str, Any], {name: value}))  # Any: build() also takes backend
+        assert info.value.message == (
+            f"build({model.__qualname__}, {name}=...): {name} is a build-time parameter declared "
+            f"Static[{kind}], so its value is {wanted}, not {value!r} ({type(value).__name__})"
+        )
+        assert info.value.loc is not None
+        assert info.value.loc.function == model.__qualname__
+    assert build(CPILinkedAnnuity, cpi_lag_m=4).graph.statics["cpi_lag_m"] == 4
+
+    class Defaulted(Product):
+        model_point = SIMPLE_SCHEMA
+        has_loading: Static[bool] = cast(Any, "no")
+
+        @var
+        def premium(self, t: Int) -> Money:
+            return self.mp.premium * (1.1 if self.has_loading else 1.0)
+
+    with pytest.raises(BuildError) as info:
+        trace(Defaulted)
+    assert info.value.message == (
+        "test_a_build_time_parameter_holds_its_declared_type.<locals>.Defaulted.has_loading: "
+        "has_loading is a build-time parameter declared Static[bool], so its value is True or "
+        "False, not 'no' (str)"
+    )
+    assert trace(Defaulted, {"has_loading": True}).statics == {"has_loading": True}
 
 
 def test_python_if_on_symbolic_value_names_where() -> None:
@@ -102,6 +172,205 @@ def test_time_offsets_must_be_constants() -> None:
 
     with pytest.raises(BuildError, match=r"at\(x, 5\)"):
         trace(Absolute)
+
+
+def _offsets(model: type[Product], name: str) -> list[int]:
+    return [n.offset for n in walk(trace(model).variables[name].expr) if isinstance(n, VarRead)]
+
+
+def test_time_offsets_fold_add_and_sub_trees() -> None:
+    """An add/sub tree over one ``t`` and integer constants is one constant offset."""
+    lag_m = 3
+
+    class Folded(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+        @var
+        def y(self, t: Int) -> Money:
+            return (
+                self.x((t - 3) - 12)
+                + self.x(t - (lag_m + 12))
+                + self.x(t + 1 - 1)
+                + self.x(1 + t)
+                + self.x((2 + t) - 1)
+                + self.x(t - 3 + 1 - 1)
+            )
+
+    assert _offsets(Folded, "y") == [-15, -15, 0, 1, 1, -3]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["t * 1", "t - (t - 1)", "t + 0.5", "t - mp.k", "-t + 2 * t"],
+)
+def test_time_offsets_that_are_not_one_t_plus_a_constant_are_rejected(case: str) -> None:
+    class Bad(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+        @var
+        def y(self, t: Int) -> Money:
+            if case == "t * 1":
+                return self.x(t * 1)
+            if case == "t - (t - 1)":
+                return self.x(t - (t - 1))
+            if case == "t + 0.5":
+                return self.x(t + 0.5)  # type: ignore[operator]
+            if case == "t - mp.k":
+                return self.x(t - self.mp.k)
+            return self.x(-t + 2 * t)
+
+    with pytest.raises(BuildError, match="the time offset of x must be a constant") as info:
+        trace(Bad)
+    assert "lag()" in str(info.value)
+    assert "at(x, k)" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Bad.y")
+
+
+def test_run_constants_are_read_as_self_run() -> None:
+    class Dated(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def cal_year(self, t: Int) -> Int:
+            return (self.run.m_val + t) // 12
+
+        @var
+        def months(self) -> Int:
+            return self.run.horizon
+
+    g = trace(Dated)
+    assert render(g.variables["cal_year"].expr) == "((run.m_val + t) // 12)"
+    assert isinstance(g.variables["months"].expr, RunConst)
+    assert graph_hash(g) != graph_hash(trace(Growth))
+
+    class Unknown(Product):
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self) -> Int:
+            return self.run.valuation_year
+
+    with pytest.raises(BuildError, match="the run has no constant 'valuation_year'") as info:
+        trace(Unknown)
+    assert "m_val, horizon" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("Unknown.x")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mp",
+        "tables",
+        "scen",
+        "run",
+        "model_point",
+        "assumption_tables",
+        "scenario_inputs",
+        "input_rules",
+        "outputs",
+        "tolerance_scales",
+        "invariants",
+        "abstract",
+    ],
+)
+def test_a_variable_may_not_take_an_accessor_or_class_attribute_name(name: str) -> None:
+    """The tracer sets ``self.mp``, ``self.tables``, ``self.scen`` and ``self.run`` on the
+    instance, where they would silently shadow a ``@var`` of the same name (``VarDef`` is a
+    non-data descriptor), and ``Product`` reads ``outputs`` and its other class attributes by
+    name; a variable so named is a build error at its definition. ``abstract`` too: the flag is
+    tested with ``is True``, so a ``@var`` of that name is not mistaken for an abstract class."""
+
+    @var
+    def shadow(self: Product, t: Int) -> Int:
+        return t + 1
+
+    bad = cast(type[Product], type("Bad", (Product,), {"model_point": SIMPLE_SCHEMA, name: shadow}))
+    with pytest.raises(BuildError, match=f"{name} is .*; rename the variable") as info:
+        trace(bad)
+    assert f"self.{name}" in str(info.value)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("shadow")
+    assert info.value.loc.file.endswith("test_tracing.py")
+
+
+def test_abstract_classes_are_refused_and_the_flag_is_not_inherited() -> None:
+    class Base(Product):
+        abstract = True
+        model_point = SIMPLE_SCHEMA
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    class Concrete(Base):
+        pass
+
+    class AbstractAgain(Concrete):
+        abstract = True
+
+    with pytest.raises(BuildError, match="Base is abstract") as info:
+        build(Base)
+    assert info.value.loc is not None  # the error points at the class itself
+    assert info.value.loc.file.endswith("test_tracing.py")
+    assert info.value.loc.function.endswith("Base")
+    assert render(build(Concrete).graph.variables["x"].expr) == "(mp.premium * mp.pols_if_init)"
+    with pytest.raises(BuildError, match="AbstractAgain is abstract"):
+        trace(AbstractAgain)
+
+
+def test_invariants_and_input_rules_are_tuples_of_their_class() -> None:
+    """A one-element tuple written without its comma arrives as the element itself; the build
+    says so at the class rather than failing with a TypeError at the first iteration."""
+
+    class NoComma(Product):
+        model_point = SIMPLE_SCHEMA
+        invariants = Invariant("x is x", lambda a: a.var("x"))  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(
+        BuildError,
+        match=r"NoComma\.invariants must be a tuple of Invariant \(a one-element tuple needs a "
+        r"trailing comma\)",
+    ) as info:
+        trace(NoComma)
+    assert info.value.loc is not None
+    assert info.value.loc.file.endswith("test_tracing.py")
+    assert info.value.loc.function.endswith("NoComma")
+
+    class NoCommaRule(Product):
+        model_point = SIMPLE_SCHEMA
+        input_rules = InputRule("a horizon", lambda v: v.horizon > 0)  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(BuildError, match=r"NoCommaRule\.input_rules must be a tuple of InputRule"):
+        trace(NoCommaRule)
+
+    class WrongClass(Product):
+        model_point = SIMPLE_SCHEMA
+        invariants = (InputRule("a horizon", lambda v: v.horizon > 0),)  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(BuildError, match=r"WrongClass\.invariants must be a tuple of Invariant"):
+        trace(WrongClass)
 
 
 def test_unknown_and_unreadable_fields() -> None:

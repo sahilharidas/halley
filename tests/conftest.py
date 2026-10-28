@@ -1,9 +1,10 @@
-"""Shared fixtures: the spec's number script as the oracle, the reference inputs, one run."""
+"""Shared fixtures: the specs' number scripts as oracles, the reference inputs, one run."""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import warnings
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -11,23 +12,26 @@ from typing import Any
 import pytest
 
 from halley import CompiledModel, RunResult, RunSettings, build, run
+from halley.aggregation import InForceGroup, NewGroup
+from halley.products.annuity import (
+    CPILinkedAnnuity,
+    FixedEscalationAnnuity,
+    LevelAnnuity,
+)
 from halley.products.term_assurance import VALUATION_DATE, TermAssurance
 from halley.products.term_assurance_data import reference_model_points, reference_tables
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC_DIR = ROOT / "docs" / "spec"
 REFERENCE_INPUTS = SPEC_DIR / "term-assurance"
+ANNUITY_INPUTS = SPEC_DIR / "annuity"
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 
-@pytest.fixture(scope="session")
-def oracle() -> ModuleType:
-    """``docs/spec/term_assurance_numbers.py``: the spec's formulas in plain float64 scalars.
-    Not the reference (the spreadsheet is), but the best check available before it exists."""
-    spec = importlib.util.spec_from_file_location(
-        "term_assurance_numbers", SPEC_DIR / "term_assurance_numbers.py"
-    )
+def _spec_module(name: str) -> ModuleType:
+    """A number script under ``docs/spec``, loaded by path (it is not a package)."""
+    spec = importlib.util.spec_from_file_location(name, SPEC_DIR / f"{name}.py")
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -36,8 +40,57 @@ def oracle() -> ModuleType:
 
 
 @pytest.fixture(scope="session")
+def oracle() -> ModuleType:
+    """``docs/spec/term_assurance_numbers.py``: the spec's formulas in plain float64 scalars.
+    Not the reference (the spreadsheet is), but the best check available before it exists."""
+    return _spec_module("term_assurance_numbers")
+
+
+@pytest.fixture(scope="session")
+def inforce_oracle() -> ModuleType:
+    """``docs/spec/in_force_group_numbers.py``: the in-force group spec's formulas, whose
+    projection of one policy (``project``) restates the annuity spec's model and reproduces its
+    worked example. The annuity's oracle until its spreadsheet exists."""
+    return _spec_module("in_force_group_numbers")
+
+
+@pytest.fixture(scope="session")
 def compiled_term() -> CompiledModel:
     return build(TermAssurance)
+
+
+@pytest.fixture(scope="session")
+def compiled_annuity() -> dict[str, CompiledModel]:
+    """The three annuity classes, built with every build warning an error (no variable of the
+    reference model is unused)."""
+    classes = {"level": LevelAnnuity, "fixed": FixedEscalationAnnuity, "cpi": CPILinkedAnnuity}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return {name: build(cls) for name, cls in classes.items()}
+
+
+@pytest.fixture(scope="session")
+def compiled_new_group() -> dict[bool, CompiledModel]:
+    """The recognition stage ``NewGroup`` by its ``discount_coverage_units`` switch (True, the
+    default, and False), built with every build warning an error."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return {switch: build(NewGroup, discount_coverage_units=switch) for switch in (True, False)}
+
+
+@pytest.fixture(scope="session")
+def compiled_in_force_group() -> CompiledModel:
+    """The in-force stage ``InForceGroup``, built with every build warning an error."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return build(InForceGroup)
+
+
+@pytest.fixture(scope="session")
+def inforce_variants(inforce_oracle: ModuleType) -> dict[str, dict[str, Any]]:
+    """The in-force spec's two variants (``build_variant("P")``, ``build_variant("O")``): every
+    run, policy and figure of its sections 5 to 10 and 14, from the script."""
+    return {k: inforce_oracle.build_variant(k) for k in ("P", "O")}
 
 
 @pytest.fixture(scope="session")

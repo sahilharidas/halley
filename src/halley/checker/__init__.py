@@ -1,13 +1,15 @@
 """Checker: units, dimensions, time references, domains, recursion direction and cycles.
 
-Every rule here is a build error (Spec, Checker rules), except an unused variable, which is a
-warning. Errors point at the model source through the nodes' recorded locations.
+Every rule here is a build error (Spec, Checker rules), except an unused variable and a group
+series no formula reads, which are warnings. Errors point at the model source through the nodes'
+recorded locations.
 
 Domains. A variable with a time dimension is a *state*, defined from ``t = 0``, when it has an
 init or terminal value, declares ``domain="state"``, or when another formula needs its value at
 ``t = 0`` (reads it at ``t-1`` from month 1, or at ``t`` from a state, or with ``at(x, 0)``).
 Every other variable is a *month quantity*, defined from ``t = 1`` and stored as 0 at ``t = 0``.
-A read outside a variable's domain is an error.
+A read outside a variable's domain is an error. The group series an aggregation stage reads are
+inputs whose domain the declaration fixes; a read outside it is an error in the same way.
 """
 
 from __future__ import annotations
@@ -56,10 +58,10 @@ class _Checker:
             return self._var(node.name, loc).declared_unit
         if isinstance(node, ir.SumT):
             unit = self._var(node.name, loc).declared_unit
-            if unit not in (units.MONEY, units.MONEY_PP, units.COUNT, units.FACTOR):
+            if unit not in units.SUMMABLE:
                 raise UnitError(
-                    f"sum_t({node.name}) sums a {unit}; only Money, MoneyPerPolicy, Count and "
-                    "Factor are summed over time",
+                    f"sum_t({node.name}) sums a {unit}; only Money, MoneyPerPolicy, Count, "
+                    "Factor and CoverageUnits are summed over time",
                     loc,
                 )
             return unit
@@ -75,6 +77,33 @@ class _Checker:
         if isinstance(node, ir.ScenAt):
             self._int_index(node.index, loc, f"scen.{node.name}.at(...)")
             return self.graph.scenarios[node.name].unit
+        if isinstance(node, ir.SeriesRead):
+            decl = self._series(node.name, loc)
+            if not decl.has_time and node.offset is not None:
+                raise BuildError(
+                    f"series {node.name} has no time dimension; read it as "
+                    f"self.series.{node.name}()",
+                    loc,
+                )
+            if decl.has_time and node.offset is None:
+                raise BuildError(
+                    f"series {node.name} has a time dimension; read it at a month, as "
+                    f"self.series.{node.name}(t)",
+                    loc,
+                )
+            return decl.unit
+        if isinstance(node, ir.SeriesAt):
+            decl = self._series(node.name, loc)
+            if not decl.has_time:
+                raise BuildError(
+                    f"series {node.name} has no time dimension; read it as "
+                    f"self.series.{node.name}(), not at a month",
+                    loc,
+                )
+            self._int_index(node.index, loc, f"series.{node.name}.at(...)")
+            return decl.unit
+        if isinstance(node, ir.RunConst):
+            return units.INT
         if isinstance(node, ir.Unary):
             return units.unary_unit(node.op, self.unit_of(node.a), loc)
         if isinstance(node, ir.Binary):
@@ -85,16 +114,6 @@ class _Checker:
             )
         if isinstance(node, ir.Call):
             args = tuple(self.unit_of(a) for a in node.args)
-            if node.fn == "to_monthly":
-                (a,) = args
-                if a == units.RATE_ANNUAL or units.is_literal(a):
-                    return units.RATE_MONTHLY
-                raise UnitError(f"to_monthly() converts a Rate[Annual], not a {a}", loc)
-            if node.fn == "to_monthly_prob":
-                (a,) = args
-                if a == units.PROB_ANNUAL or units.is_literal(a):
-                    return units.PROB_MONTHLY
-                raise UnitError(f"to_monthly_prob() converts a Prob[Annual], not a {a}", loc)
             return units.call_unit(node.fn, args, loc)
         raise BuildError(f"unknown node {type(node).__name__}", loc)
 
@@ -103,6 +122,12 @@ class _Checker:
             return self.vars[name]
         except KeyError:
             raise BuildError(f"no variable {name!r}", loc) from None
+
+    def _series(self, name: str, loc: Loc | None) -> ir.SeriesDecl:
+        try:
+            return self.graph.series[name]
+        except KeyError:
+            raise BuildError(f"no series {name!r}", loc) from None
 
     def _int_index(self, index: ir.Node, loc: Loc | None, what: str) -> None:
         unit = self.unit_of(index)
@@ -121,20 +146,15 @@ class _Checker:
                         f"({', '.join(key.enum)}); the lookup passes a {unit}",
                         loc,
                     )
-                if isinstance(key_node, ir.Const) and key_node.value not in key.enum:
-                    raise BuildError(
-                        f"{key_node.value!r} is not a value of key {key.name} of table "
-                        f"{node.table} ({', '.join(key.enum)})",
-                        loc,
-                    )
-                if isinstance(key_node, ir.MpField):
-                    f = self.graph.fields[key_node.name]
-                    if f.enum is None or set(f.enum) != set(key.enum):
+                if isinstance(key_node, ir.Const):
+                    if key_node.value not in key.enum:
                         raise BuildError(
-                            f"mp.{key_node.name} does not have the same enum values as key "
-                            f"{key.name} of table {node.table}",
+                            f"{key_node.value!r} is not a value of key {key.name} of table "
+                            f"{node.table} ({', '.join(key.enum)})",
                             loc,
                         )
+                else:
+                    self._enum_key(key, key_node, node.table, loc)
             elif unit not in units.INT_LIKE:
                 raise UnitError(
                     f"key {key.name} of table {node.table} is an Int in [{key.lo}, {key.hi}]; "
@@ -143,6 +163,39 @@ class _Checker:
                 )
         column = next(c for c in decl.columns if c.name == node.column)
         return column.unit
+
+    def _enum_key(self, key: ir.KeyDecl, key_node: ir.Node, table: str, loc: Loc | None) -> None:
+        """An enum key that is not a constant: a model point field whose enum lists the key's
+        values in the key's order, or a ``where()`` choosing between such fields. The generated
+        code reads the table at the field's code, its position in the field's enum, so another
+        order would read another row, and a field with other values (or a ``minimum()`` of two
+        codes) would read outside the table."""
+        if isinstance(key_node, ir.Where):
+            self._enum_key(key, key_node.a, table, loc)
+            self._enum_key(key, key_node.b, table, loc)
+            return
+        values = ", ".join(key.enum or ())
+        if not isinstance(key_node, ir.MpField):
+            raise BuildError(
+                f"key {key.name} of table {table} is an enum ({values}); pass one of its "
+                "values, a model point field with the same values in the same order, or a "
+                "where() between such fields",
+                loc,
+            )
+        f = self.graph.fields[key_node.name]
+        if f.enum is None or set(f.enum) != set(key.enum or ()):
+            raise BuildError(
+                f"mp.{key_node.name} does not have the same enum values as key "
+                f"{key.name} of table {table}",
+                loc,
+            )
+        if tuple(f.enum) != tuple(key.enum or ()):
+            raise BuildError(
+                f"mp.{key_node.name} lists the values of key {key.name} of table {table} in "
+                f"another order ({', '.join(f.enum)} against {values}); list them in the "
+                "key's order",
+                loc,
+            )
 
     # ------------------------------------------------------------------ dims per node
     def dims_of(self, node: ir.Node, dims: dict[str, Dims]) -> Dims:
@@ -172,6 +225,15 @@ class _Checker:
             return frozenset({ir.SCENARIO, ir.TIME})
         if isinstance(node, ir.ScenAt):
             return frozenset({ir.SCENARIO}) | self.dims_of(node.index, dims)
+        if isinstance(node, ir.SeriesRead):
+            # fixed by the declaration, never by J: the scenario axis is there after a mean too;
+            # the units pass has made the offset agree with the declaration's time dimension
+            group = frozenset({ir.POLICY, ir.SCENARIO})
+            return group if node.offset is None else group | {ir.TIME}
+        if isinstance(node, ir.SeriesAt):
+            return frozenset({ir.POLICY, ir.SCENARIO}) | self.dims_of(node.index, dims)
+        if isinstance(node, ir.RunConst):
+            return frozenset()
         out = frozenset()
         for child in node.children():
             out = out | self.dims_of(child, dims)
@@ -238,7 +300,7 @@ def _tarjan(names: list[str], succ: dict[str, list[str]]) -> list[list[str]]:
 
 def check(graph: ir.Graph) -> ir.Graph:
     """Check the graph in place and return it. Raises :class:`BuildError` on the first rule
-    broken; warns :class:`BuildWarning` for unused variables."""
+    broken; warns :class:`BuildWarning` for unused variables and unread group series."""
     chk = _Checker(graph)
     variables = graph.variables
     order = list(variables)
@@ -248,6 +310,7 @@ def check(graph: ir.Graph) -> ir.Graph:
     _check_dims(chk, variables)
     edges: list[_Edge] = _edges(graph)
     _check_domains(variables, edges)
+    _check_series_domains(graph)
 
     # strongly connected components, direction and cycles
     succ: dict[str, list[str]] = {name: [] for name in order}
@@ -287,6 +350,7 @@ def check(graph: ir.Graph) -> ir.Graph:
             raise BuildError("internal error: the component graph has a cycle")
 
     _warn_unused(graph)
+    _warn_unread_series(graph)
     return graph
 
 
@@ -307,12 +371,43 @@ def _check_units(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
                     f"the {what} value of {v.name} is {bunit}, not {v.declared_unit}", v.loc
                 )
             for n in ir.walk(node):
-                if isinstance(n, (ir.TimeIndex, ir.VarRead, ir.ScenRead)):
+                if _relative_to_time(n, variables):
                     raise BuildError(
-                        f"the {what} value of {v.name} reads {ir.render(n)}; a boundary value "
-                        "depends only on the model point, tables and fixed months",
+                        f"the {what} value of {v.name} reads {ir.render(n)}; a boundary value is "
+                        "fixed before the months run, from the model point, tables, run "
+                        "constants, variables without a time dimension and fixed months "
+                        "(at(x, k), scen.x.at(k), series.x.at(k) with a constant k)",
                         v.loc,
                     )
+
+
+def _relative_to_time(node: ir.Node, variables: dict[str, ir.Variable]) -> bool:
+    """Whether a node may not form a boundary value because its value moves with ``t``. An
+    allow-list: fields, tables, run constants, constants, ``sum_t``, arithmetic, ``where`` and
+    calls are fixed; a variable read is fixed when the variable has no time dimension; ``at``,
+    ``scen.x.at`` and ``series.x.at`` are fixed when their month is a constant. Everything
+    else, ``t`` itself, a relative read of a scenario input or of a group series, and any node
+    kind added later, is rejected until it is admitted here on purpose."""
+    if isinstance(
+        node,
+        (
+            ir.Const,
+            ir.MpField,
+            ir.TableLookup,
+            ir.RunConst,
+            ir.SumT,
+            ir.Unary,
+            ir.Binary,
+            ir.Where,
+            ir.Call,
+        ),
+    ):
+        return False
+    if isinstance(node, ir.VarRead):
+        return variables[node.name].has_time
+    if isinstance(node, (ir.VarAt, ir.ScenAt, ir.SeriesAt)):
+        return not isinstance(node.index, ir.Const)
+    return True
 
 
 def _check_roles(graph: ir.Graph) -> None:
@@ -358,7 +453,7 @@ def _check_dims(chk: _Checker, variables: dict[str, ir.Variable]) -> None:
             culprit = next(
                 ir.render(n)
                 for n in ir.walk(v.expr)
-                if isinstance(n, (ir.VarRead, ir.ScenRead, ir.TimeIndex))
+                if isinstance(n, (ir.VarRead, ir.ScenRead, ir.SeriesRead, ir.TimeIndex))
                 and ir.TIME in (n.dims or frozenset())
             )
             raise BuildError(
@@ -483,6 +578,69 @@ def _check_domains(variables: dict[str, ir.Variable], edges: list[_Edge]) -> Non
             )
 
 
+def _check_series_domains(graph: ir.Graph) -> None:
+    """Group series reads stay inside the series' domain, as variable reads do: with ``(first,
+    last)`` the reader's formula range, a relative read needs ``first + offset >= start`` and
+    ``offset <= 0`` (``1`` from a formula that stops at ``H - 1``, a backward recursion's), and a
+    fixed month ``at(k)`` needs ``k >= start``. A series is an input, so a read before its start
+    is an error rather than a demand that lowers it: a sum of states declares ``start=0`` on its
+    ``GroupSum``. Months beyond the horizon of a fixed read are checked when the run loads."""
+    for v in graph.variables.values():
+        for expr in (v.expr, v.init, v.terminal):
+            if expr is None:
+                continue
+            for node in ir.walk(expr):
+                if isinstance(node, ir.SeriesRead):
+                    if node.offset is not None and v.has_time and expr is v.expr:
+                        _check_series_offset(v, node, node.offset, graph.series[node.name])
+                elif (
+                    isinstance(node, ir.SeriesAt)
+                    and isinstance(node.index, ir.Const)
+                    and not isinstance(node.index.value, bool)
+                ):
+                    k = int(node.index.value)
+                    decl = graph.series[node.name]
+                    if k < 0:
+                        raise BuildError(
+                            f"{v.name} reads {ir.render(node)}, which is before t = 0", node.loc
+                        )
+                    if k < decl.start:
+                        raise BuildError(
+                            f"{v.name} reads {ir.render(node)}, which is before the start of "
+                            f"series {node.name} at t = {decl.start}; a sum of states declares "
+                            "GroupSum(..., start=0)",
+                            node.loc,
+                        )
+
+
+def _check_series_offset(
+    v: ir.Variable, node: ir.SeriesRead, offset: int, decl: ir.SeriesDecl
+) -> None:
+    first, last = v.formula_range
+    need = first + offset
+    if need < decl.start:
+        if need < 0:
+            raise BuildError(
+                f"{v.name} reads {ir.render(node)}, which is before t = 0 at t = {first}; a "
+                "series starts at t = 0 at the earliest",
+                node.loc,
+            )
+        raise BuildError(
+            f"{v.name} reads {ir.render(node)}, which is outside the domain of series "
+            f"{node.name} at t = {first}: the series starts at t = {decl.start}; a sum of states "
+            "declares GroupSum(..., start=0)",
+            node.loc,
+        )
+    max_offset = 0 if last == "H" else 1
+    if offset > max_offset:
+        raise BuildError(
+            f"{v.name} reads {ir.render(node)}, which is outside the domain of series "
+            f"{node.name} at t = {last}; a variable that reads a later month is backward "
+            "recursive and declares a terminal value",
+            node.loc,
+        )
+
+
 def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
     recursive = len(scc.members) > 1 or any(e.reader == e.target for e in scc.edges)
     if not recursive:
@@ -490,6 +648,16 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
     complete = [e for e in scc.edges if e.offset is None]
     if complete:
         e = complete[0]
+        boundary = _boundary_of(variables[e.reader], e.node)
+        if boundary is not None:
+            # conservative: at(y, 0) of a member of the same component is rejected even when
+            # y(0) would be computable, because the boundary is written before the loop runs
+            raise BuildError(
+                f"the {boundary} value of {e.reader} reads {ir.render(e.node)}, and {e.target} "
+                f"depends on {e.reader}: compute the boundary from a variable outside the "
+                "component",
+                e.node.loc,
+            )
         raise BuildError(
             f"{e.reader} reads all of {e.target} ({ir.render(e.node)}), and {e.target} depends "
             f"on {e.reader}: a complete read cannot be part of a recursion",
@@ -530,18 +698,16 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
                 e.node.loc,
             )
     scc.direction = ir.FORWARD if hi <= 0 else ir.BACKWARD
+    # A member read at +k needs no terminal of its own: _check_domains has placed every +k read
+    # at a month <= H inside the target's domain (its formula reaches H, or its terminal sits
+    # there), and the offset-0 acyclicity check above orders the members without a terminal so
+    # that the backend evaluates them at t = H before the loop (the annuity's {bel, inv_exp}).
     for e in scc.edges:
         target = variables[e.target]
         if e.offset is not None and e.offset < 0 and target.init is None:
             raise BuildError(
                 f"{e.target} is forward recursive ({e.reader} reads {ir.render(e.node)}) and "
                 f"needs an init value: @var(init=...)",
-                target.loc,
-            )
-        if e.offset is not None and e.offset > 0 and target.terminal is None:
-            raise BuildError(
-                f"{e.target} is backward recursive ({e.reader} reads {ir.render(e.node)}) and "
-                f"needs a terminal value: @var(terminal=...)",
                 target.loc,
             )
     for name in scc.members:
@@ -556,6 +722,15 @@ def _classify(scc: _Scc, variables: dict[str, ir.Variable]) -> None:
                 f"{name} has an init value but sits in the backward component {{{members}}}",
                 v.loc,
             )
+
+
+def _boundary_of(v: ir.Variable, node: ir.Node) -> str | None:
+    """``"init"`` or ``"terminal"`` when ``node`` sits in that boundary value of ``v``, else
+    ``None`` (it sits in the formula)."""
+    for what, expr in (("init", v.init), ("terminal", v.terminal)):
+        if expr is not None and any(n is node for n in ir.walk(expr)):
+            return what
+    return None
 
 
 def _same_period_order(scc: _Scc) -> list[str]:
@@ -577,9 +752,11 @@ def _same_period_order(scc: _Scc) -> list[str]:
 
 
 def needed_variables(graph: ir.Graph) -> set[str]:
-    """Outputs, role variables and everything they read, transitively."""
+    """Outputs, role variables, the variables the product's invariants read, and everything they
+    read, transitively."""
     wanted: set[str] = set(graph.outputs) if graph.outputs is not None else set(graph.variables)
     wanted |= {v.name for v in graph.variables.values() if v.role is not None}
+    wanted |= graph.invariant_reads
     stack = list(wanted)
     while stack:
         name = stack.pop()
@@ -598,6 +775,22 @@ def _warn_unused(graph: ir.Graph) -> None:
                 BuildWarning(
                     f"{name} is read by no other variable and is not an output; it is left out "
                     f"of the generated code ({v.loc})"
+                ),
+                stacklevel=3,
+            )
+
+
+def _warn_unread_series(graph: ir.Graph) -> None:
+    """A group series the stage declares and no formula reads. Its declaration is still the
+    stage's input contract, so the run asks for it; the warning says so, as for an unused
+    variable."""
+    read = {node.name for _v, node in graph.series_reads()}
+    for name, decl in graph.series.items():
+        if name not in read:
+            warnings.warn(
+                BuildWarning(
+                    f"series {name} is read by no formula; a run of the stage still needs it "
+                    f"given ({decl.loc})"
                 ),
                 stacklevel=3,
             )

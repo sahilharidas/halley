@@ -5,17 +5,30 @@ variables that pyright sees as ``Count``, ``Prob[Monthly]`` and so on; the opera
 below are the rule table of :mod:`halley.ir.units` written for the type checker, so a unit
 mistake shows in the editor before a build. At run time the tracer returns symbolic expressions
 in their place and the checker applies the rule table to the graph.
+
+``Rate`` carries a period and a compounding tag. The compounding tag defaults to ``Effective``
+(PEP 696), so ``Rate[Annual]`` and ``Rate[Annual, Effective]`` are the same annotation and the
+same unit; ``Rate[Annual, Continuous]`` is the continuously compounded rate. Python 3.12 needs
+``typing_extensions.TypeVar`` for the default because ``get_type_hints`` evaluates the annotation
+at build time. The default is filled into the annotation's ``__args__``, so ``Rate[Monthly]`` and
+``Rate[Monthly, Effective]`` are one and the same object at run time as well as for pyright: the
+monthly rate is effective by definition, and the explicit tag is a redundant spelling the unit
+resolver cannot tell apart, not an error. ``Rate[Monthly, Continuous]`` is.
 """
 
 from __future__ import annotations
 
-from typing import Any, overload
+from typing import Any, Generic, overload
+
+from typing_extensions import TypeVar
 
 from halley.errors import Loc, UnitError
 from halley.ir.units import (
     BOOL,
     COUNT,
+    COVERAGE_UNITS,
     FACTOR,
+    INDEX,
     INT,
     MONEY,
     MONEY_PP,
@@ -23,6 +36,7 @@ from halley.ir.units import (
     PROB_ANNUAL,
     PROB_MONTHLY,
     RATE_ANNUAL,
+    RATE_ANNUAL_CC,
     RATE_MONTHLY,
     Unit,
 )
@@ -38,6 +52,19 @@ class Annual:
 
 class Monthly:
     """Period tag: per month."""
+
+
+class Effective:
+    """Compounding tag: an effective rate, whose accumulation factor is ``1 + rate``."""
+
+
+class Continuous:
+    """Compounding tag: a continuously compounded rate (a force), which accumulates through
+    ``cc_discount()`` and never through ``1 + rate``."""
+
+
+_P = TypeVar("_P", Annual, Monthly)
+_C = TypeVar("_C", Effective, Continuous, default=Effective)
 
 
 class Bool:
@@ -89,6 +116,9 @@ class Int:
     def __neg__(self) -> Int:
         return _static()
 
+    def __abs__(self) -> Int:
+        return _static()
+
     def __lt__(self, other: Int | int | float) -> Bool:
         return _static()
 
@@ -134,6 +164,10 @@ class Factor:
     @overload
     def __mul__(self, other: Count) -> Count: ...
     @overload
+    def __mul__(self, other: Index) -> Index: ...
+    @overload
+    def __mul__(self, other: CoverageUnits) -> CoverageUnits: ...
+    @overload
     def __mul__[P: (Annual, Monthly)](self, other: Prob[P]) -> Prob[P]: ...
     @overload
     def __mul__[P: (Annual, Monthly)](self, other: Rate[P]) -> Rate[P]: ...
@@ -153,6 +187,9 @@ class Factor:
         return _static()
 
     def __neg__(self) -> Factor:
+        return _static()
+
+    def __abs__(self) -> Factor:
         return _static()
 
     def __lt__(self, other: Factor | float | int) -> Bool:
@@ -207,6 +244,9 @@ class Money:
     def __neg__(self) -> Money:
         return _static()
 
+    def __abs__(self) -> Money:
+        return _static()
+
     def __lt__(self, other: Money | float | int) -> Bool:
         return _static()
 
@@ -257,6 +297,9 @@ class MoneyPerPolicy:
         return _static()
 
     def __neg__(self) -> MoneyPerPolicy:
+        return _static()
+
+    def __abs__(self) -> MoneyPerPolicy:
         return _static()
 
     def __lt__(self, other: MoneyPerPolicy | float | int) -> Bool:
@@ -311,6 +354,9 @@ class Count:
     def __neg__(self) -> Count:
         return _static()
 
+    def __abs__(self) -> Count:
+        return _static()
+
     def __lt__(self, other: Count | float | int) -> Bool:
         return _static()
 
@@ -332,9 +378,111 @@ class Count:
     __hash__ = object.__hash__
 
 
+class Index:
+    """A price index level (CPI). Two levels divide to a :class:`Factor`; a level scales by a
+    factor or a number. Nothing else has a meaning: an index is not summed or compounded."""
+
+    def __add__(self, other: Index) -> Index:
+        return _static()
+
+    def __sub__(self, other: Index) -> Index:
+        return _static()
+
+    def __mul__(self, other: Factor | float | int) -> Index:
+        return _static()
+
+    def __rmul__(self, other: float | int) -> Index:
+        return _static()
+
+    @overload
+    def __truediv__(self, other: Index) -> Factor: ...
+    @overload
+    def __truediv__(self, other: Factor | float | int) -> Index: ...
+    def __truediv__(self, other: object) -> object:
+        return _static()
+
+    def __neg__(self) -> Index:
+        return _static()
+
+    def __abs__(self) -> Index:
+        return _static()
+
+    def __lt__(self, other: Index | float | int) -> Bool:
+        return _static()
+
+    def __le__(self, other: Index | float | int) -> Bool:
+        return _static()
+
+    def __gt__(self, other: Index | float | int) -> Bool:
+        return _static()
+
+    def __ge__(self, other: Index | float | int) -> Bool:
+        return _static()
+
+    def __eq__(self, other: object) -> Bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return _static()
+
+    def __ne__(self, other: object) -> Bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return _static()
+
+    __hash__ = object.__hash__
+
+
+class CoverageUnits:
+    """IFRS 17 coverage units: a quantity of service for the whole in-force count. Not money:
+    :func:`~halley.authoring.as_cu` converts an amount, and ``Money + CoverageUnits`` is an
+    error."""
+
+    def __add__(self, other: CoverageUnits) -> CoverageUnits:
+        return _static()
+
+    def __sub__(self, other: CoverageUnits) -> CoverageUnits:
+        return _static()
+
+    def __mul__(self, other: Factor | float | int) -> CoverageUnits:
+        return _static()
+
+    def __rmul__(self, other: float | int) -> CoverageUnits:
+        return _static()
+
+    @overload
+    def __truediv__(self, other: CoverageUnits) -> Factor: ...
+    @overload
+    def __truediv__(self, other: Factor | float | int) -> CoverageUnits: ...
+    def __truediv__(self, other: object) -> object:
+        return _static()
+
+    def __neg__(self) -> CoverageUnits:
+        return _static()
+
+    def __abs__(self) -> CoverageUnits:
+        return _static()
+
+    def __lt__(self, other: CoverageUnits | float | int) -> Bool:
+        return _static()
+
+    def __le__(self, other: CoverageUnits | float | int) -> Bool:
+        return _static()
+
+    def __gt__(self, other: CoverageUnits | float | int) -> Bool:
+        return _static()
+
+    def __ge__(self, other: CoverageUnits | float | int) -> Bool:
+        return _static()
+
+    def __eq__(self, other: object) -> Bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return _static()
+
+    def __ne__(self, other: object) -> Bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return _static()
+
+    __hash__ = object.__hash__
+
+
 class Prob[P: (Annual, Monthly)]:
     """A probability in [0, 1], checked at run time. ``Prob[Annual]`` and ``Prob[Monthly]``
-    carry the period; :func:`~halley.authoring.to_monthly_prob` converts between them."""
+    carry the period; :func:`~halley.authoring.to_monthly_prob` and
+    :func:`~halley.authoring.to_monthly_cf` convert between them."""
 
     def __add__(self, other: Prob[P] | float | int) -> Prob[P]:
         return _static()
@@ -369,6 +517,9 @@ class Prob[P: (Annual, Monthly)]:
     def __neg__(self) -> Prob[P]:
         return _static()
 
+    def __abs__(self) -> Prob[P]:
+        return _static()
+
     def __lt__(self, other: Prob[P] | float | int) -> Bool:
         return _static()
 
@@ -390,21 +541,29 @@ class Prob[P: (Annual, Monthly)]:
     __hash__ = object.__hash__
 
 
-class Rate[P: (Annual, Monthly)]:
-    """An effective interest or inflation rate per year or per month. ``1 + rate`` is a
-    :class:`Factor`; :func:`~halley.authoring.to_monthly` converts between periods."""
+class Rate(Generic[_P, _C]):
+    """An interest or inflation rate per year or per month, effective unless the second tag says
+    ``Continuous``. ``1 + rate`` is a :class:`Factor` for an effective rate only;
+    :func:`~halley.authoring.to_monthly` and :func:`~halley.authoring.annual_step` take the
+    effective annual rate, :func:`~halley.authoring.cc_discount` the continuous one.
+    ``Rate[Monthly]`` is effective by definition."""
 
-    def __add__(self, other: Rate[P]) -> Rate[P]:
+    def __add__(self, other: Rate[_P, _C]) -> Rate[_P, _C]:
         return _static()
 
-    def __radd__(self, other: float | int) -> Factor:
+    def __radd__(self: Rate[_P, Effective], other: float | int) -> Factor:
         return _static()
 
-    def __sub__(self, other: Rate[P]) -> Rate[P]:
+    def __sub__(self, other: Rate[_P, _C]) -> Rate[_P, _C]:
+        return _static()
+
+    def __rsub__(self: Rate[_P, Effective], other: float | int) -> Factor:
         return _static()
 
     @overload
-    def __mul__(self, other: Factor | float | int) -> Rate[P]: ...
+    def __mul__(self, other: float | int) -> Rate[_P, _C]: ...
+    @overload
+    def __mul__(self: Rate[_P, Effective], other: Factor) -> Rate[_P, Effective]: ...
     @overload
     def __mul__(self: Rate[Monthly], other: Money) -> Money: ...
     @overload
@@ -412,25 +571,28 @@ class Rate[P: (Annual, Monthly)]:
     def __mul__(self, other: object) -> object:
         return _static()
 
-    def __rmul__(self, other: float | int) -> Rate[P]:
+    def __rmul__(self, other: float | int) -> Rate[_P, _C]:
         return _static()
 
-    def __truediv__(self, other: Factor | float | int) -> Rate[P]:
+    def __truediv__(self, other: Factor | float | int) -> Rate[_P, _C]:
         return _static()
 
-    def __neg__(self) -> Rate[P]:
+    def __neg__(self) -> Rate[_P, _C]:
         return _static()
 
-    def __lt__(self, other: Rate[P] | float | int) -> Bool:
+    def __abs__(self) -> Rate[_P, _C]:
         return _static()
 
-    def __le__(self, other: Rate[P] | float | int) -> Bool:
+    def __lt__(self, other: Rate[_P, _C] | float | int) -> Bool:
         return _static()
 
-    def __gt__(self, other: Rate[P] | float | int) -> Bool:
+    def __le__(self, other: Rate[_P, _C] | float | int) -> Bool:
         return _static()
 
-    def __ge__(self, other: Rate[P] | float | int) -> Bool:
+    def __gt__(self, other: Rate[_P, _C] | float | int) -> Bool:
+        return _static()
+
+    def __ge__(self, other: Rate[_P, _C] | float | int) -> Bool:
         return _static()
 
     def __eq__(self, other: object) -> Bool:  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -457,30 +619,53 @@ _SIMPLE: dict[object, Unit] = {
     Count: COUNT,
     Prob: PROB,
     Factor: FACTOR,
+    Index: INDEX,
+    CoverageUnits: COVERAGE_UNITS,
     Int: INT,
     Bool: BOOL,
 }
+
+_LEGAL = (
+    "Money, MoneyPerPolicy, Count, Prob[Annual], Prob[Monthly], Rate[Annual], "
+    "Rate[Annual, Continuous], Rate[Monthly], Factor, Index, CoverageUnits, Int or Bool"
+)
+
+
+def _rate_unit(args: tuple[object, ...], loc: Loc | None) -> Unit:
+    # ``args`` already carries the PEP 696 default: ``Rate[Monthly].__args__`` is
+    # ``(Monthly, Effective)``, the same as the explicit spelling.
+    period = args[0] if args else None
+    compounding = args[1] if len(args) > 1 else Effective
+    if period is not Annual and period is not Monthly:
+        raise UnitError(f"Rate takes Annual or Monthly, not {period!r}", loc)
+    if compounding is Effective:
+        return RATE_ANNUAL if period is Annual else RATE_MONTHLY
+    if compounding is Continuous:
+        if period is Monthly:
+            raise UnitError(
+                "Rate[Monthly] is effective by definition and takes no compounding tag", loc
+            )
+        return RATE_ANNUAL_CC
+    raise UnitError(
+        f"Rate takes Effective or Continuous as its second tag, not {compounding!r}", loc
+    )
 
 
 def unit_from_annotation(annotation: object, loc: Loc | None = None) -> Unit:
     """Resolve a return annotation (a class above, possibly parameterised) to its tag."""
     origin = getattr(annotation, "__origin__", None)
     args: tuple[object, ...] = getattr(annotation, "__args__", ())
-    if origin is Prob or origin is Rate:
+    if origin is Rate:
+        return _rate_unit(args, loc)
+    if origin is Prob:
         period = args[0] if args else None
-        tags = (PROB_ANNUAL, PROB_MONTHLY) if origin is Prob else (RATE_ANNUAL, RATE_MONTHLY)
         if period is Annual:
-            return tags[0]
+            return PROB_ANNUAL
         if period is Monthly:
-            return tags[1]
-        name = "Prob" if origin is Prob else "Rate"
-        raise UnitError(f"{name} takes Annual or Monthly, not {period!r}", loc)
+            return PROB_MONTHLY
+        raise UnitError(f"Prob takes Annual or Monthly, not {period!r}", loc)
     if annotation in _SIMPLE:
         return _SIMPLE[annotation]
     if annotation is Rate:
         raise UnitError("Rate needs a period: Rate[Annual] or Rate[Monthly]", loc)
-    raise UnitError(
-        f"{annotation!r} is not a Halley unit; use Money, MoneyPerPolicy, Count, "
-        "Prob[Annual], Prob[Monthly], Rate[Annual], Rate[Monthly], Factor, Int or Bool",
-        loc,
-    )
+    raise UnitError(f"{annotation!r} is not a Halley unit; use {_LEGAL}", loc)
