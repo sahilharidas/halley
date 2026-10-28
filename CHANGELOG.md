@@ -4,7 +4,7 @@ Changes that a user of Halley's runs, run directories or authoring API can see. 
 decisions and their reasons live in the design documents; this file records what changed and
 when.
 
-## Unreleased
+## 0.2.0 (unreleased)
 
 ### Run ids of existing runs change
 

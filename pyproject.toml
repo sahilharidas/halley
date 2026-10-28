@@ -1,6 +1,6 @@
 [project]
 name = "halley"
-version = "0.1.0"
+version = "0.2.0"
 description = "Actuarial projection engine in Python: models are checked before they run and compiled when they do."
 readme = "README.md"
 license = "Apache-2.0"
