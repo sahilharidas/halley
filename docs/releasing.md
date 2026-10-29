@@ -34,8 +34,8 @@ the next version.
 - **smoke**: a clean virtual environment gets the runtime dependencies exported from `uv.lock`
   with their hashes, then the wheel with `--no-deps`, and `uv pip check` confirms that the wheel's
   requirements are met. The test suite then runs under `python -I` from a copy that holds only
-  `pyproject.toml`, `tests/` and `docs/spec`, so the only `halley` it can import is the installed
-  wheel.
+  `pyproject.toml`, `tests/`, `docs/spec` and `docs/tutorial`, so the only `halley` it can import
+  is the installed wheel.
 - **publish**: `uv publish --trusted-publishing always` uploads the files the smoke test ran
   against. The job runs in the `pypi` environment, and its log prints the SHA-256 hash of each
   file, which PyPI shows on the release's file list.

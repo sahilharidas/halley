@@ -121,8 +121,9 @@ jobs:
 
       - name: Run the test suite against the wheel
         # From a copy outside the checkout that holds only pyproject.toml (pytest's settings),
-        # tests/ and docs/spec (the committed inputs and scripts the suite reads), with
-        # python -I, so the only halley importable is the installed wheel.
+        # tests/, docs/spec (the committed inputs and scripts the suite reads) and docs/tutorial
+        # (the pages whose code blocks the suite runs), with python -I, so the only halley
+        # importable is the installed wheel.
         env:
           WORK: ${{ runner.temp }}/smoke
         run: |
@@ -130,6 +131,7 @@ jobs:
           cp pyproject.toml "$WORK/suite/"
           cp -r tests "$WORK/suite/tests"
           cp -r docs/spec "$WORK/suite/docs/spec"
+          cp -r docs/tutorial "$WORK/suite/docs/tutorial"
           cd "$WORK/suite"
           "$WORK/venv/bin/python" -I - <<'PY'
           import sys
