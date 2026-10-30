@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any, cast
 
 from halley import ir
-from halley.authoring.contracts import InputRule, Invariant
+from halley.authoring.contracts import InputRule, Invariant, ScenarioInput, Table
 from halley.authoring.product import (
     BoundaryScope,
     ModelPoint,
@@ -54,6 +54,8 @@ def trace(model: type[Product], statics: dict[str, object] | None = None) -> ir.
     if schema is None:
         raise BuildError(f"{model.__qualname__} declares no model_point schema")
     fields = schema.decls()
+    _require_tuple_of(model, "assumption_tables", Table)
+    _require_tuple_of(model, "scenario_inputs", ScenarioInput)
     tables = {t.name: t.decl() for t in model.assumption_tables}
     scenarios = {s.name: s.decl() for s in model.scenario_inputs}
     series = model.series_declarations()  # None for a projection: it has no self.series

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Halley</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/models" aria-label="Halley, models">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="16.5" cy="7.5" r="3.5" fill="currentColor" />
+          <path d="M13.9 10.1 3 21" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity="0.55" />
+          <path d="M14.6 11.6 7.5 18.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity="0.35" />
+          <path d="M12.4 9.4 5.3 16.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity="0.35" />
+        </svg>
+        Halley
+      </a>
+      <nav class="nav" aria-label="Sections">
+        <a href="#/models" data-section="models">Models</a>
+        <a href="#/runs" data-section="runs">Runs</a>
+        <a href="#/compare" data-section="compare">Compare</a>
+      </nav>
+      <div class="topbar-end">
+        <span id="announce" class="visually-hidden" role="status" aria-live="polite"></span>
+        <button id="theme" class="icon-button" type="button" title="Colour theme">Theme: auto</button>
+      </div>
+    </header>
+    <main id="main"><p class="empty">Loading.</p></main>
+    <div id="tray" class="tray">
+      <span id="job" class="job-chip" role="status" hidden></span>
+      <div id="ended" class="ended" role="group" aria-label="Jobs that ended" hidden>
+        <div id="chips" class="chips"></div>
+        <button id="chips-clear" class="chips-clear" type="button">Clear</button>
+      </div>
+    </div>
+    <noscript><p class="empty">Halley's GUI needs JavaScript.</p></noscript>
+  </body>
+</html>

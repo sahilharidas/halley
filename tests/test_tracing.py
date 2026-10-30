@@ -9,13 +9,16 @@ import pytest
 
 from halley import (
     BuildError,
+    Column,
     Count,
     InputRule,
     Int,
     Invariant,
     Money,
     Product,
+    ScenarioInput,
     Static,
+    Table,
     build,
     trace,
     var,
@@ -371,6 +374,41 @@ def test_invariants_and_input_rules_are_tuples_of_their_class() -> None:
 
     with pytest.raises(BuildError, match=r"WrongClass\.invariants must be a tuple of Invariant"):
         trace(WrongClass)
+
+
+def test_tables_and_scenario_inputs_are_tuples_of_their_class() -> None:
+    """The same slip in the inputs a model declares: one table or scenario input without its
+    comma is refused at the class, not as a TypeError with no place."""
+
+    class OneTable(Product):
+        model_point = SIMPLE_SCHEMA
+        assumption_tables = Table("t", keys=(), columns=(Column("c", "Factor"),))  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(
+        BuildError, match=r"OneTable\.assumption_tables must be a tuple of Table"
+    ) as info:
+        trace(OneTable)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("OneTable")
+
+    class OneScenario(Product):
+        model_point = SIMPLE_SCHEMA
+        scenario_inputs = ScenarioInput("shock", "Factor")  # type: ignore[assignment]
+
+        @var
+        def x(self, t: Int) -> Money:
+            return self.mp.premium * self.mp.pols_if_init
+
+    with pytest.raises(
+        BuildError, match=r"OneScenario\.scenario_inputs must be a tuple of ScenarioInput"
+    ) as info:
+        trace(OneScenario)
+    assert info.value.loc is not None
+    assert info.value.loc.function.endswith("OneScenario")
 
 
 def test_unknown_and_unreadable_fields() -> None:

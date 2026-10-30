@@ -27,6 +27,12 @@ two scenarios. What the rest of the site holds:
   workers must be defined at the top level of an importable module, and a script needs its run
   under `if __name__ == "__main__":`. The README states both guarantees and says how the Numba
   backend is held to the reference.
+- **The GUI.** `python -m halley.gui` opens the same work in your browser. The GUI imports a
+  model file and runs its top-level code, so save the model alone in a file of its own: say
+  `term.py`, holding the imports, `SCHEMA`, `MORT`, `V_M` and `Term` from the third page, and
+  not the runs. Load it on the Models page, build `Term`, run it on the `model_points.csv` and
+  `mort.parquet` the tutorial wrote in this folder, explain a reserve by clicking down through
+  its inputs, and compare two runs. [The GUI](../gui.md) says what each page does.
 - **The source.** Halley is Apache 2.0 licensed, at [github.com/sahilharidas/halley](https://github.com/sahilharidas/halley).
   The README's layout table says which package does what.
 

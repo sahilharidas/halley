@@ -1,0 +1,1274 @@
+/* Halley's GUI. Colours are tokens defined once per theme; the chart colours are the
+   validated categorical palette (eight slots in a fixed order), each assigned to an entity and
+   kept by it. Dark mode is its own set of steps, not an inversion. */
+
+:root {
+  color-scheme: light;
+  --plane: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #6f6d68;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+  --border-strong: rgba(11, 11, 11, 0.2);
+  --accent: #256abf;
+  --accent-ink: #ffffff;
+  --link: #256abf;
+  --focus: #2a78d6;
+  --good: #0ca30c;
+  --good-text: #006300;
+  --critical: #d03b3b;
+  --critical-text: #b42f2f;
+  --critical-wash: rgba(208, 59, 59, 0.07);
+  --warning: #fab219;
+  --warning-wash: rgba(250, 178, 25, 0.12);
+  --highlight: rgba(42, 120, 214, 0.1);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #6250d6;
+  --series-8: #e34948;
+  --shadow: 0 6px 24px rgba(11, 11, 11, 0.12);
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --plane: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #222220;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #b0aea4;
+    --grid: #2c2c2a;
+    --axis: #45453f;
+    --border: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.2);
+    --accent: #1c5cab;
+    --accent-ink: #ffffff;
+    --link: #9ec5f4;
+    --focus: #3987e5;
+    --good: #0ca30c;
+    --good-text: #6fd16f;
+    --critical: #d03b3b;
+    --critical-text: #f4a0a0;
+    --critical-wash: rgba(230, 103, 103, 0.1);
+    --warning: #fab219;
+    --warning-wash: rgba(250, 178, 25, 0.1);
+    --highlight: rgba(57, 135, 229, 0.16);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --plane: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #222220;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #b0aea4;
+  --grid: #2c2c2a;
+  --axis: #45453f;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --accent: #1c5cab;
+  --accent-ink: #ffffff;
+  --link: #9ec5f4;
+  --focus: #3987e5;
+  --good: #0ca30c;
+  --good-text: #6fd16f;
+  --critical: #d03b3b;
+  --critical-text: #f4a0a0;
+  --critical-wash: rgba(230, 103, 103, 0.1);
+  --warning: #fab219;
+  --warning-wash: rgba(250, 178, 25, 0.1);
+  --highlight: rgba(57, 135, 229, 0.16);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* a scroll to the focused control stops short of the top bar and of the tray (see app.js); the
+   page's scroll bar keeps its room whether or not the page scrolls, so the tray, at the window's
+   edge, does not move when the room the page keeps for it makes the page scroll */
+html {
+  scroll-padding-top: var(--bar-room, 0px);
+  scroll-padding-bottom: var(--tray-now, 0px);
+  scrollbar-gutter: stable;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------------ top bar */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 24px;
+  padding: 10px 16px;
+  min-height: 52px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+  font-size: 16px;
+  color: var(--text-primary);
+}
+
+.brand:hover {
+  text-decoration: none;
+}
+
+.brand svg {
+  width: 20px;
+  height: 20px;
+}
+
+.nav {
+  display: flex;
+  gap: 4px;
+}
+
+.nav a {
+  padding: 6px 10px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+}
+
+.nav a:hover {
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.nav a.on {
+  color: var(--text-primary);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.brand,
+.nav,
+.topbar-end > button {
+  flex-shrink: 0;
+}
+
+.topbar-end {
+  margin-left: auto;
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* the jobs: the one running, and those that ended on a page no longer showing them, in a tray
+   in the bottom corner, over the page, which keeps room for it at its end (see app.js), so the
+   tray never moves the page nor keeps anything under it; each chip is shown whole or cut, with
+   its full text as its title, and a long list scrolls inside the tray */
+.tray {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: min(28rem, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.tray > * {
+  pointer-events: auto;
+}
+
+/* the jobs that ended: a box whose chips lie in a list that scrolls, the newest at its top, and
+   whose Clear lies beneath the list, where it stays */
+.ended {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+
+.ended[hidden] {
+  display: none;
+}
+
+/* the list keeps its place itself as chips come (see app.js), and keeps its scroll bar's room
+   whether or not it scrolls, so the chips do not move aside when it starts to */
+.chips {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  max-height: 40vh;
+  overflow-y: auto;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
+  padding: 4px;
+  scroll-padding: 4px; /* a chip the keyboard reaches is shown with the list's padding round it */
+}
+
+/* its edges shade, over the chips, where more of it lies beyond them (see app.js), since a
+   phone's scroll bar shows only while it scrolls; the shades take no room of the list's */
+.chips::before,
+.chips::after {
+  content: "";
+  position: sticky;
+  z-index: 1;
+  flex: none;
+  align-self: stretch;
+  height: 10px;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.chips::before {
+  top: 0;
+  margin-bottom: -16px;
+  background: radial-gradient(farthest-side at 50% 0, var(--border-strong), transparent);
+}
+
+.chips::after {
+  bottom: 0;
+  margin-top: -16px;
+  background: radial-gradient(farthest-side at 50% 100%, var(--border-strong), transparent);
+}
+
+.chips.more-above::before,
+.chips.more-below::after {
+  opacity: 1;
+}
+
+@media (max-width: 600px) {
+  .tray {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    max-width: none;
+    align-items: stretch;
+  }
+
+  .ended,
+  .chips {
+    align-items: stretch;
+  }
+
+  .chips {
+    max-height: 30vh;
+  }
+}
+
+.chips-clear {
+  align-self: flex-end;
+  margin: 0 6px 2px;
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* a chip keeps its height, and the tray scrolls, however many there are */
+.chips > * {
+  flex-shrink: 0;
+}
+
+.chips .job-chip {
+  display: block;
+  max-width: 100%;
+  text-align: start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* a report opened from its chip, which stays so it can be opened again: its text and focus
+   ring at full strength, only its fill gone; in forced colours, which draw neither, a dashed
+   line inside it */
+.chips .job-chip.read {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+@media (forced-colors: active) {
+  .chips .job-chip.read {
+    outline: 1px dashed CanvasText;
+    outline-offset: -3px;
+  }
+
+  /* the focus ring over the dashed line, as every control has it */
+  .chips .job-chip.read:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+}
+
+/* a button that reads as a link, inside a line of text */
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--link);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* the running job's label is cut rather than widening the tray */
+#job {
+  max-width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+#job > .spinner {
+  flex: none;
+}
+
+#job > span:not(.spinner) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* a reload's error, under the row of its button */
+.reload-status:empty {
+  display: none;
+}
+
+.job-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+button.job-chip {
+  border: 0;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+a.job-chip:hover,
+button.job-chip:hover {
+  color: var(--text-primary);
+}
+
+/* text for a screen reader only: a job that ended, said in the live region of the top bar */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* what a job that ended on another page said: a dialog over the page until it is closed */
+.report {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  box-shadow: var(--shadow);
+}
+
+.report::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.report > .report-body {
+  padding: 16px;
+}
+
+.report h2 {
+  margin-top: 0;
+}
+
+.report h2:focus {
+  outline: none;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--focus);
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 3s;
+  }
+}
+
+.icon-button {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+/* ------------------------------------------------------------------ layout */
+
+main {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 20px 16px calc(48px + var(--tray-room, 0px));
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+h1 {
+  font-size: 22px;
+  font-weight: 650;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+/* a model's name, a file's path or a module's: one long word, which breaks rather than widen
+   the page past a phone's screen */
+h1,
+h2,
+.sub,
+.side-list a,
+.group-label {
+  overflow-wrap: anywhere;
+}
+
+h2 {
+  font-size: 16px;
+  font-weight: 650;
+  margin: 0 0 10px;
+}
+
+h3 {
+  font-size: 13px;
+  font-weight: 650;
+  margin: 16px 0 8px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+p {
+  margin: 0 0 10px;
+}
+
+.sub {
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+  min-width: 0;
+}
+
+.card > :last-child {
+  margin-bottom: 0;
+}
+
+.stack > * + * {
+  margin-top: 12px;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.grow {
+  flex: 1 1 auto;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 0;
+}
+
+.kv dt {
+  color: var(--text-secondary);
+}
+
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ side list */
+
+.side-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.side-list li + li {
+  margin-top: 2px;
+}
+
+.side-list a {
+  display: block;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--text-primary);
+}
+
+.side-list a:hover {
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.side-list a.on {
+  background: var(--highlight);
+}
+
+.side-list .name {
+  font-weight: 600;
+}
+
+.side-list .what {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.group-label {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 16px 10px 6px;
+}
+
+.group-label:first-child {
+  margin-top: 0;
+}
+
+/* ------------------------------------------------------------------ tabs */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+  overflow-x: auto;
+}
+
+.tabs a {
+  padding: 8px 12px;
+  color: var(--text-secondary);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+
+.tabs a:hover {
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.tabs a.on {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ forms */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.field > span {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px 16px;
+}
+
+.field.wide {
+  grid-column: 1 / -1;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="date"],
+select,
+textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-1);
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+select[multiple] {
+  min-height: 140px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-1);
+  cursor: pointer;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.button:hover {
+  background: var(--surface-2);
+}
+
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.button.primary:hover {
+  filter: brightness(1.08);
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.hint {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+/* a paragraph of hint, or where a variable is defined, may hold a long path, which breaks rather
+   than widen the page past a phone's screen */
+p.hint,
+.defined {
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ tables */
+
+.table-wrap {
+  overflow: auto;
+  max-height: 560px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+table.data {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+table.data th,
+table.data td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--grid);
+  text-align: left;
+  vertical-align: top;
+}
+
+table.data thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  z-index: 1;
+}
+
+table.data tbody tr:hover {
+  background: var(--highlight);
+}
+
+table.data tr.clickable {
+  cursor: pointer;
+}
+
+table.data .num,
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+table.data td.code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+th.sortable {
+  cursor: pointer;
+}
+
+th.sortable::after {
+  content: "";
+  margin-left: 4px;
+}
+
+th.sortable[aria-sort="ascending"]::after {
+  content: "\25B2";
+  font-size: 9px;
+}
+
+th.sortable[aria-sort="descending"]::after {
+  content: "\25BC";
+  font-size: 9px;
+}
+
+/* ------------------------------------------------------------------ chips and status */
+
+.chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chip.mono {
+  font-family: var(--mono);
+}
+
+/* a status wraps on a narrow screen, its mark beside its first line; in a table's cell it stays
+   whole, a word unbroken, and the table scrolls instead */
+.status {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+td .status {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.status::before {
+  flex: none;
+  margin-top: 0.15em;
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-size: 11px;
+  color: #ffffff;
+  line-height: 1;
+}
+
+.status.good {
+  color: var(--good-text);
+}
+
+.status.good::before {
+  content: "\2713";
+  background: var(--good);
+}
+
+.status.bad {
+  color: var(--critical-text);
+}
+
+.status.bad::before {
+  content: "\2715";
+  background: var(--critical);
+}
+
+/* ------------------------------------------------------------------ code and errors */
+
+pre.code {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: 8px;
+  font: 12.5px/1.5 var(--mono);
+  overflow: auto;
+  white-space: pre;
+  tab-size: 4;
+}
+
+pre.code.tall {
+  max-height: 640px;
+}
+
+pre.code .hl {
+  display: inline-block;
+  min-width: 100%;
+  background: var(--critical-wash);
+  box-shadow: inset 3px 0 var(--critical);
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.error {
+  border: 1px solid var(--critical);
+  border-left-width: 4px;
+  background: var(--critical-wash);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.error .title {
+  font-weight: 650;
+  color: var(--critical-text);
+  margin-bottom: 4px;
+}
+
+.error .message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.error .where {
+  margin: 8px 0;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.error details {
+  margin-top: 8px;
+}
+
+.warning {
+  border: 1px solid var(--warning);
+  border-left-width: 4px;
+  background: var(--warning-wash);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.notice {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.empty {
+  color: var(--text-muted);
+  padding: 24px 0;
+  text-align: center;
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ explain */
+
+.explain-value {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.crumbs .sep {
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------------ charts */
+
+figure.chart {
+  margin: 0 0 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px 8px;
+  min-width: 0;
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.chart-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chart-unit {
+  font-weight: 400;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+  flex: none;
+}
+
+.segmented .seg {
+  border: 0;
+  background: transparent;
+  padding: 3px 10px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.segmented .seg.on {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-bottom: 4px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.legend-item:hover {
+  background: var(--surface-2);
+}
+
+.legend-item.off {
+  opacity: 0.45;
+}
+
+.legend-item.off span:last-child {
+  text-decoration: line-through;
+}
+
+.key {
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  border-radius: 1px;
+  flex: none;
+}
+
+.chart-plot {
+  position: relative;
+}
+
+.chart-plot svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.chart-table {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.grid line {
+  stroke: var(--grid);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.grid line.baseline,
+.grid line.axis {
+  stroke: var(--axis);
+}
+
+.tick {
+  fill: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.dot {
+  stroke: var(--surface-1);
+  stroke-width: 2;
+}
+
+.crosshair line {
+  stroke: var(--axis);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.hit {
+  fill: transparent;
+  pointer-events: all;
+  cursor: crosshair;
+}
+
+.tooltip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 8px 10px;
+  font-size: 12.5px;
+  min-width: 140px;
+  max-width: 360px;
+}
+
+.tooltip-head {
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.tooltip-row {
+  display: grid;
+  grid-template-columns: 14px auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.tooltip-row strong {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.line.s1 { stroke: var(--series-1); }
+.line.s2 { stroke: var(--series-2); }
+.line.s3 { stroke: var(--series-3); }
+.line.s4 { stroke: var(--series-4); }
+.line.s5 { stroke: var(--series-5); }
+.line.s6 { stroke: var(--series-6); }
+.line.s7 { stroke: var(--series-7); }
+.line.s8 { stroke: var(--series-8); }
+.dot.s1 { fill: var(--series-1); }
+.dot.s2 { fill: var(--series-2); }
+.dot.s3 { fill: var(--series-3); }
+.dot.s4 { fill: var(--series-4); }
+.dot.s5 { fill: var(--series-5); }
+.dot.s6 { fill: var(--series-6); }
+.dot.s7 { fill: var(--series-7); }
+.dot.s8 { fill: var(--series-8); }
+.key.s1 { background: var(--series-1); }
+.key.s2 { background: var(--series-2); }
+.key.s3 { background: var(--series-3); }
+.key.s4 { background: var(--series-4); }
+.key.s5 { background: var(--series-5); }
+.key.s6 { background: var(--series-6); }
+.key.s7 { background: var(--series-7); }
+.key.s8 { background: var(--series-8); }
+
+@media print {
+  .topbar,
+  .tray,
+  .report,
+  .segmented,
+  .button {
+    display: none !important;
+  }
+
+  main {
+    padding-bottom: 48px;
+  }
+}
+
+main:focus {
+  outline: none;
+}
