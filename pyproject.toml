@@ -32,6 +32,10 @@ dependencies = [
 # The multicore CPU backend (D16): pip install halley[numba].
 numba = ["numba>=0.61"]
 
+[project.scripts]
+# The local GUI, the same as python -m halley.gui. It needs nothing beyond the dependencies above.
+halley-gui = "halley.gui.__main__:main"
+
 [project.urls]
 Homepage = "https://halley.kndra.co.za"
 Documentation = "https://halley.kndra.co.za"

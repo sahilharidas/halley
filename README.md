@@ -97,6 +97,23 @@ Unit mismatches, data-dependent time offsets, missing boundary values, same-peri
 mixed forward/backward loops are build errors that point at the model's own source line. The
 unit classes carry typed operator overloads, so pyright flags most unit mistakes in the editor.
 
+## GUI
+
+```bash
+python -m halley.gui
+```
+
+starts a web server on this computer and opens the GUI in the browser (`halley-gui` does the
+same). It lists the reference products and imports a model file of your own; builds a model and
+shows its variables, what each reads and the code generated for it; runs it on a reference
+example or on Parquet or CSV files; reads any run directory; explains a value by its formula and
+inputs, down through the inputs' own formulas; reruns a run from its own directory and checks it
+bit for bit; and compares two runs entry by entry of their run ids and variable by variable. It
+calls the same `build`, `run`, `load_run`, `explain` and `diff`, so a run made in it is the run
+the same call makes in Python, with the same run id. It needs nothing beyond Halley's own
+dependencies, listens on the loopback interface only, and answers only the page that holds the
+token in the address it prints. `docs/gui.md` describes each page.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is pinned in `.python-version`.
@@ -134,6 +151,7 @@ wheel and uploads it to PyPI. `docs/releasing.md` has the steps.
 | `src/halley/runtime` | data contracts at load, batches, outputs, run manifest, invariants, explain and diff |
 | `src/halley/aggregation` | aggregation stages over group series: portfolio totals and the IFRS 17 CSM roll-forward (NewGroup, InForceGroup) |
 | `src/halley/products` | reference models: `TermAssurance` (reference case 1), `BasicTerm` (reference case 2, lifelib), the annuities `LevelAnnuity`, `FixedEscalationAnnuity` and `CPILinkedAnnuity` (the annuity spec) and their reference inputs |
+| `src/halley/gui` | the local GUI: the web server and its token check, the API over `build`, `run`, `load_run`, `explain` and `diff`, the model catalogue and the reference examples, and the pages under `static/` |
 | `docs/spec` | product specifications, their number scripts and the reference inputs |
 | `benchmarks` | the Spec's workloads W1 and W2 on each backend (the harness and results come with M6's benchmark stage) |
 | `tests/data/lifelib` | lifelib's `BasicTerm_ME` inputs and results (MIT), the oracle for reference case 2 |

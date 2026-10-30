@@ -37,7 +37,16 @@ from halley import (
 from halley.authoring import int_field
 from halley.products.term_assurance import VALUATION_DATE
 from halley.runtime import recompute, within
-from models import SIMPLE_SCHEMA, VAL, Expensed, Margin, margin_table, simple_model_points
+from models import (
+    SIMPLE_SCHEMA,
+    VAL,
+    Expensed,
+    Indexed,
+    Margin,
+    margin_table,
+    scenario_file,
+    simple_model_points,
+)
 from test_helpers import run_helpers
 
 
@@ -557,3 +566,27 @@ def test_diff_locates_the_largest_change(
     assert d["premium_income"].max_abs == pytest.approx(46.40, abs=1e-9)
     assert d["death_outgo"].max_abs == 0.0
     assert d["reserve_0"].policy_id == "P05"
+
+
+def test_explain_reads_no_scenario_month_outside_its_file(tmp_path: Path) -> None:
+    """A scenario input read at a month its file does not hold is an error of that input alone,
+    as a variable read outside 0..H is: explain listed the file's last row for a month before
+    its first (a negative row index) and failed whole for a month past its last. Such a month is
+    read only at a boundary month, where the formula's value is not used."""
+    res = run(
+        build(Indexed),
+        model_points=simple_model_points(rem_m=6),
+        scenarios={
+            "df": scenario_file("df", 0, 6, 1, lambda s, u: 0.99**u),
+            "cpi": scenario_file("cpi", -2, 6, 1, lambda s, u: 100.0 + u),  # all the loader asks
+        },
+        settings=RunSettings(valuation_date=VAL),
+        run_dir=tmp_path / "indexed",
+    )
+    pid = res.ids[0]
+    before = dict(explain(res, pid, "esc", 0).inputs)  # esc is a month quantity, from t = 1
+    assert before["scen.cpi(t-3)"] == "<scen.cpi read at month -3, outside -2..6>"
+    assert before["scen.cpi.at(0)"] == 100.0
+    inside = dict(explain(res, pid, "esc", 3).inputs)
+    assert inside["scen.cpi(t-3)"] == 100.0
+    assert recompute(res, pid, "esc", 3) == res.lane("esc", pid)[3]

@@ -55,11 +55,22 @@ input, the generated backend source, the outputs keyed on `policy_id`, and the i
 read. The [tutorial](tutorial/index.md) continues from here: reading a run, writing a model,
 loading your own data and running scenarios.
 
+The same can be done in the browser. `python -m halley.gui` opens [the GUI](gui.md), which
+builds a model, runs it, explains any value and compares two runs, with nothing to install
+beyond Halley.
+
 ```{toctree}
 :maxdepth: 2
 :caption: Tutorial
 
 tutorial/index
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: The GUI
+
+gui
 ```
 
 ```{toctree}

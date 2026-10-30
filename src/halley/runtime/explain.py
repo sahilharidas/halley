@@ -84,6 +84,14 @@ class Lane:
         si = self.s if values.shape[2] > 1 else 0
         return values[u, self.p, si].item()
 
+    def scenario_at(self, name: str, u: int) -> float:
+        """A scenario input at month ``u`` for this lane's scenario. A month outside the file's
+        is an error, as a variable's is: a negative row would read the file's last rows."""
+        sc = self.inputs.scenarios[name]
+        if not sc.u0 <= u <= sc.u_max:
+            raise HalleyError(f"scen.{name} read at month {u}, outside {sc.u0}..{sc.u_max}")
+        return sc.values[u - sc.u0, 0, self.s].item()
+
     def eval(self, node: ir.Node, t: int | None, step: bool = False) -> Any:
         """The value of ``node`` for this lane at month ``t``. ``step`` says whether the reader
         is a member of a recursive component, which decides the path a power takes in the
@@ -133,11 +141,9 @@ class Lane:
         if isinstance(node, ir.ScenRead):
             if t is None:
                 raise HalleyError(f"scen.{node.name}(t) read without a month")
-            sc = self.inputs.scenarios[node.name]
-            return sc.values[t + node.offset - sc.u0, 0, self.s].item()
+            return self.scenario_at(node.name, t + node.offset)
         if isinstance(node, ir.ScenAt):
-            sc = self.inputs.scenarios[node.name]
-            return sc.values[int(self.eval(node.index, t, step)) - sc.u0, 0, self.s].item()
+            return self.scenario_at(node.name, int(self.eval(node.index, t, step)))
         if isinstance(node, ir.SeriesRead):
             if node.offset is None:  # a series without a time dimension: its one row
                 return self.series_at(node.name, 0)

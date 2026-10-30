@@ -655,6 +655,144 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   are functions, which do not pickle, and nothing read it): `CompiledModel.schema` is the
   schema. `ReadFile.without_data()` is a file without its table and bytes.
 
+### The GUI
+
+`python -m halley.gui`, or the new `halley-gui` command, starts a web server on the loopback
+interface and opens the GUI in the browser (`halley.gui`, `docs/gui.md`). It adds no dependency: the
+server is the standard library's, and the pages are plain HTML, CSS and JavaScript inside the
+package, which load nothing from elsewhere. Builds and runs are jobs that run one at a time, the one
+running shown in a tray in the page's bottom corner; one that ends when its page no longer shows it,
+or under an open dialog (beneath which the page is not drawn again), says so there, with a chip that
+keeps what went wrong, opens it in a dialog, and stays until the tray is cleared or two minutes
+after it was last opened, never going while the pointer or the focus is in the tray, and in its card
+while the card is shown, with a link to what it would have shown. A chip that comes while the
+pointer or the focus is in the tray leaves the chips there where they are, **Clear** lies outside
+the chips' scroll and, pressed from the keyboard, gives the focus back to the control it came to the
+tray from, and the page keeps room at its end for the tray. The engine is unchanged but for
+`explain`'s reads of scenario inputs and the tracer's check of the inputs a model declares, below.
+
+- The Models page lists the reference products and the IFRS 17 stages, and imports a model file of
+  the user's as the module named after the file, with its folder on `sys.path` so that a run's
+  worker processes import it too. Importing runs the file's top-level code. A file named like a
+  module that is already importable (`json.py`) is refused, and a file that fails to import keeps
+  its previous models. A file's helpers are the modules of the user's own it uses: those its import
+  statements (relative ones too) and namespace name, those its import brought in, and those a build
+  of its models imports, each noted on the thread that imported it, so a load during another model's
+  build keeps its own; an edit to one, or to a loaded file, marks the files changed. A helper that
+  puts an object, a module object or another module in its own place in `sys.modules`
+  (`sys.modules[__name__] = _Basis()`) is followed by the file its import ran, the object's own
+  attributes never read, and one that runs another file as itself (importlib's recipe) by both
+  files; a module built into Python is never taken for a file of the user's named like it. **Reload
+  the files** runs every loaded file again, in the order they were loaded, after taking out of
+  `sys.modules` every module of the user's own the catalogue has seen them use or import, with its
+  submodules (and the attribute a namespace package holds for one), so they import them afresh, one
+  copy of each, as a new Python process would; every model is then a new class, and a file an
+  earlier one's import ran that put something else in its own place is refused, as a load of it then
+  is, never run twice. On an exception every module, file and model is as it was. A loaded file that
+  is gone is let go at a reload, with its models. Builds, checks, runs and reruns hold the engine
+  while they work, and a reload is refused while one does; a check's and a run's imports are noted
+  as a build's are. A model file imported before the GUI loaded it, by an import no watch saw, shows
+  as changed until a reload, since nothing records which version of it that import ran; so does a
+  file saved while it ran (its modification time before and after its run differ, so a file dated
+  ahead of the clock is not taken as saved). A load or a reload that ends once the user has gone to
+  another page leaves that page as it is but for the side lists, and says so in the tray. A failed
+  first load or reload takes out what its own import brought in of the user's (modules and folders
+  imported as namespace packages alike); a failed first load that a build, check or run on another
+  thread ran beside leaves what it imported, which that work may hold (`import h`, a package's `from
+  . import h`, `from h import RATE`), and records it, so an edit to it shows and a reload takes it
+  out. Its traceback is written out before the clean-up, since Python's suggestion of a near name
+  imports the module again; an error whose writing trips (a `__getattr__` or a `__str__` of the
+  user's that raises anything, `SystemExit` too, or a `name` that cannot be set) is still written,
+  at the file's line, and the clean-up runs whatever happens. A build takes the backend and the
+  build-time parameters the class declares (found as the tracer finds them), each in a field of its
+  type: a check box, a number, a text, a choice of an enum's members, a date, or JSON for a tuple, a
+  list or any other type, in which an enum's member is its name (or as Python writes it, never a
+  label of its class's own `__str__` or `__repr__`) and a date its ISO text (a list's items read by
+  its item type, as a tuple's are); a flag's members are typed joined by `|`; a dict's keys are read
+  by its key type too (an enum's member by its name, a date in ISO form, a tuple as a list, a
+  sequence as the tuple a key holds), and from a manifest as it records them (`str()` of each key,
+  tuples of enum members and dates included, inside a sequence too); a `NewType` is read as its
+  supertype, a `type` alias as its value (a generic one with its arguments in their places) and
+  `Annotated[T, ...]` as `T`, while an alias whose value cannot be had (one that names what its
+  module does not define) is taken as JSON gives it, as is a class `isinstance` cannot check (a
+  `TypedDict`, a `Protocol` that is not runtime-checkable); a list a union's option that the GUI
+  does not read (an `Iterable`) holds goes to it before one that reads only part of it. A setting a
+  run's manifest cannot record exactly is warned of at the build, since the run cannot be rerun from
+  its directory: a dict that is not the class's own default and whose keys are not in the order a
+  manifest writes them (sorted as text by `str()`, which the warning gives), a NumPy number, an
+  object recorded as its repr; and an enum's member its class's own `__repr__` writes as it writes
+  another, unless the member makes no difference to the model. A rerun tries each dict recorded as
+  its default is both ways, all at their defaults and all sorted first, up to 64 mixes, tracing each
+  for its IR hash; a build that gives a mix beyond those warns of it, and its warnings name every
+  setting that keeps its run from a rerun, beside one whose record does not read back at all. A
+  manifest's date and time with a time zone of the `datetime` module's (an offset, as the form reads
+  one) reads back, but for a date and time that is itself a dict's key, which a manifest records as
+  its `str()`, without its zone's name or its `fold`, so the build warns of one that has either; a
+  float that is not finite reads back at any depth of a tuple key. The server writes each value as
+  Python does (`1` and `1.0` apart), and the form sends only the fields changed from what it holds,
+  the class's defaults or the shown build's own settings, so an untouched form builds what
+  `build(cls)` builds (a check box for a parameter without a default builds False) and an untouched
+  **Build again** builds the shown build again, with the same IR hash. Build again from a build of
+  the files as they were carries its settings to the class as it is now: an enum's member by its
+  name, a setting at its old default as the default now. A build records its `BuildWarning`s and
+  lists every variable with its unit, role, timing, recursion direction, formula, source, reads and
+  readers.
+- A run takes a reference product's example inputs (the term assurance's reference case 1 and
+  the annuity spec's worked example, built in memory, and lifelib's inputs for `BasicTerm` in a
+  checkout) or files, Parquet or CSV (read with `pyarrow.csv`), one per declared input, with the
+  `RunSettings` fields; outputs a build does not compute are refused before the run, and an
+  empty choice of outputs is sent as `None`, which stores the same variables under the same run
+  id. A run of the reference example has the run id of `run()` on the same inputs. **Check the
+  inputs** calls `load_inputs` as `run()` does, without projecting.
+- A run's page shows its manifest, a variable's lanes and portfolio total over the months, the
+  policies' values at a month beside their model point fields, the invariant results, every
+  input copy (read back through `read_copy`, so its hash is checked) and the run's files.
+  **Explain** gives `halley.explain`'s value, formula and inputs, each input with a target that
+  opens it (a variable at a month, a table, a scenario input), notes a month that takes an
+  `init` or `terminal` value, and recomputes the value with `recompute`, comparing the two bit
+  for bit in the stored value's type (within 1e-9 relative for a Numba run).
+- A run read back from its directory is explained after a rerun from its own directory: the model
+  its manifest names is built with the recorded build-time settings, read back by their declared
+  types as the manifest records them (an enum's member from its repr, or its value for an int or
+  str enum, a date from its repr, through tuples and unions; a value that does not fit its type,
+  which `build()` took, as recorded; a setting declared an enum, a date or another class whose
+  record does not read back is refused before the build; a dict recorded in another order than it
+  was given is tried as recorded too), and the recorded backend (a model whose IR hash does not
+  come out as the run's is refused, saying the model or a setting the manifest cannot record
+  exactly is why, and so is one a script defined in `__main__`) and run on the directory's copies
+  of its inputs, a stage's group series included, with `RunSettings.from_dict` of its recorded
+  settings, into `<runs>/reruns`; the rerun is compared with the run by run id and bit for bit,
+  variable by variable. An aggregation run made by `run_aggregation` is replayed with
+  `replay_aggregation` the same way.
+- Comparing two runs lists every entry their run ids cover (for a projection the IR hash, each
+  input's hash, the settings in the identity, the backend and its versions and the horizon; for
+  a run of `run_aggregation` also its groups file, membership, previous run and disclosures)
+  with whether it differs, and `halley.diff`'s largest difference in every variable both hold.
+- Every API request must carry the session's token, a random string the server prints in the
+  address it opens (`#token=...`, a fragment no browser sends to a server), and name the
+  server's own address in its `Host` header (for a server listening on every interface, any IP
+  address with its port); a cross-origin preflight is not answered. The
+  requests a page's address alone can trigger read only the run directories under the runs
+  folder, those the session made and those the user opened, so an address another site sends
+  the GUI's tab to cannot make the server open a path of its choosing. The pages are served
+  under a content security policy that loads nothing from another origin, and set every value
+  as text.
+
+### explain and scenario inputs
+
+- `explain` (and `recompute`) read a scenario input at a month outside its file's months as an
+  error of that input alone, `<scen.<name> read at month <u>, outside <first>..<last>>`, as they
+  read a variable outside 0..H. Before, a month before the file's first was read from the file's
+  last rows, so a boundary month's explanation could list another month's value without a word,
+  and a month past the file's last failed the whole explanation with an `IndexError`. Only a
+  boundary month (``t = 0`` or the horizon) can read such a month; a run's values are unchanged.
+
+### The tracer and the inputs a model declares
+
+- A model whose `assumption_tables` or `scenario_inputs` is one contract written without its
+  trailing comma (`assumption_tables = (MORT)`) fails its build with a BuildError at the class,
+  as `invariants` and `input_rules` already did, rather than with a TypeError that names no line.
+
 ### Known limitations
 
 - `recompute` and `explain` evaluate a power with a non-literal array exponent (a model point
@@ -777,6 +915,15 @@ manifests (an output keyed on `policy_id` when `outputs.id_field` is absent).
   batch's time.
 - `recompute` and `explain` interpret the NumPy backend's semantics; for a Numba run they agree
   with the stored values within 1e-9 relative, not bit for bit.
+- The GUI cannot stop a build or a run that has started (the engine has no way to stop a run
+  part way); it runs them one at a time and cancels only one still waiting, and Ctrl+C waits for
+  a started one to finish. It does not run an aggregation stage, which runs on projection run
+  directories through `run_aggregation`; it reads, replays and explains a stage's runs. A run's
+  page reads the whole run into memory, as `load_run` does, so a very large run is slow to open,
+  and the session holds the runs it has used most recently, up to eight it made, six it read
+  back and about 1.5 GB in all; a run it made and let go of is rerun to be explained again. A
+  model file is imported as a top-level module, so a file inside a package that imports its
+  siblings relatively does not load.
 
 ### Notes on determinism
 
