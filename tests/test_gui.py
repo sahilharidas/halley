@@ -17,6 +17,7 @@ import builtins
 import datetime as dt
 import http.client
 import importlib.resources
+import importlib.util
 import json
 import math
 import os
@@ -5437,3 +5438,74 @@ def test_a_union_s_unchecked_option_holds_a_value_and_an_alias_s_union_reads_its
         od=[{m.Sex.M: 1.0, "X": 2.0}],
     )
     assert ir_of(app, made) == want.ir_hash
+
+
+def test_a_reload_runs_a_helper_saved_again_within_its_cached_second(
+    app: App, tmp_path: Path
+) -> None:
+    """A helper saved again at the same size within the second its cached bytecode records,
+    which Python's cache cannot tell from the file it was compiled from: the edit shows as a
+    change, and a reload builds what the file says now. Python writes the caches here, whatever
+    the environment says."""
+    stem = _stem(tmp_path, "samesecond")
+    helper = tmp_path / f"{stem}_basis.py"
+    helper.write_text("LOADING = 1.0\n", encoding="utf-8")
+    second = (time.time_ns() // 1_000_000_000 - 10) * 1_000_000_000  # a whole second, past
+    os.utime(helper, ns=(second, second + 100_000_000))
+    path = loading_model(tmp_path, f"{stem}_m", f"{stem}_basis")
+    writes = sys.dont_write_bytecode
+    sys.dont_write_bytecode = False
+    try:
+        model_id = call(app, "POST", "/api/models/load", path=str(path))["file"]["models"][0]
+        assert death_outgo(app, model_id).endswith("* 1.0)")
+        assert Path(importlib.util.cache_from_source(str(helper))).is_file()
+        helper.write_text("LOADING = 1.5\n", encoding="utf-8")
+        os.utime(helper, ns=(second, second + 200_000_000))
+        assert call(app, "GET", "/api/models")["changed"] is True
+        call(app, "POST", "/api/models/reload")
+        assert death_outgo(app, model_id).endswith("* 1.5)")
+    finally:
+        sys.dont_write_bytecode = writes
+
+
+@pytest.mark.parametrize("raised", ["model", "helper", "reload"])
+def test_a_failed_import_leaves_no_cache_of_a_file_whose_code_raised(
+    app: App, tmp_path: Path, raised: str
+) -> None:
+    """A model file, a helper at a first load, or a new helper at a reload, whose code raises:
+    fixed at the same size within the second its cached bytecode records, the next load or
+    reload runs it as it is then. Python writes the caches here, whatever the environment
+    says."""
+    stem = _stem(tmp_path, f"failcache_{raised}")
+    second = (time.time_ns() // 1_000_000_000 - 10) * 1_000_000_000  # a whole second, past
+    helper = tmp_path / f"{stem}_basis.py"
+    helper.write_text("RATE = 0\nLOADING = 1.0 / RATE\n", encoding="utf-8")
+    if raised == "model":
+        broken = write_model(tmp_path, f"{stem}_m", head="RATE = 0\nSCALE = 1 / RATE\n")
+    else:
+        broken = helper
+        if raised == "helper":
+            path = loading_model(tmp_path, f"{stem}_m", f"{stem}_basis")
+        else:
+            path = write_model(tmp_path, f"{stem}_m")
+    os.utime(broken, ns=(second, second + 100_000_000))
+    writes = sys.dont_write_bytecode
+    sys.dont_write_bytecode = False
+    try:
+        if raised == "reload":
+            call(app, "POST", "/api/models/load", path=str(path))
+            edit(path, '"""A model file of the GUI\'s tests."""\n', f"import {stem}_basis\n")
+            assert refused(app, "POST", "/api/models/reload").status == 422
+        else:
+            target = broken if raised == "model" else path
+            assert refused(app, "POST", "/api/models/load", path=str(target)).status == 422
+        broken.write_text(broken.read_text(encoding="utf-8").replace("RATE = 0", "RATE = 1"))
+        os.utime(broken, ns=(second, second + 200_000_000))
+        if raised == "reload":
+            call(app, "POST", "/api/models/reload")
+            assert call(app, "GET", "/api/models")["changed"] is False
+        else:
+            target = broken if raised == "model" else path
+            assert call(app, "POST", "/api/models/load", path=str(target))["file"]["models"]
+    finally:
+        sys.dont_write_bytecode = writes

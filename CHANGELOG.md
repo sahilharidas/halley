@@ -686,57 +686,58 @@ tray from, and the page keeps room at its end for the tray. The engine is unchan
   the files** runs every loaded file again, in the order they were loaded, after taking out of
   `sys.modules` every module of the user's own the catalogue has seen them use or import, with its
   submodules (and the attribute a namespace package holds for one), so they import them afresh, one
-  copy of each, as a new Python process would; every model is then a new class, and a file an
-  earlier one's import ran that put something else in its own place is refused, as a load of it then
-  is, never run twice. On an exception every module, file and model is as it was. A loaded file that
-  is gone is let go at a reload, with its models. Builds, checks, runs and reruns hold the engine
-  while they work, and a reload is refused while one does; a check's and a run's imports are noted
-  as a build's are. A model file imported before the GUI loaded it, by an import no watch saw, shows
-  as changed until a reload, since nothing records which version of it that import ran; so does a
-  file saved while it ran (its modification time before and after its run differ, so a file dated
-  ahead of the clock is not taken as saved). A load or a reload that ends once the user has gone to
-  another page leaves that page as it is but for the side lists, and says so in the tray. A failed
-  first load or reload takes out what its own import brought in of the user's (modules and folders
-  imported as namespace packages alike); a failed first load that a build, check or run on another
-  thread ran beside leaves what it imported, which that work may hold (`import h`, a package's `from
-  . import h`, `from h import RATE`), and records it, so an edit to it shows and a reload takes it
-  out. Its traceback is written out before the clean-up, since Python's suggestion of a near name
-  imports the module again; an error whose writing trips (a `__getattr__` or a `__str__` of the
-  user's that raises anything, `SystemExit` too, or a `name` that cannot be set) is still written,
-  at the file's line, and the clean-up runs whatever happens. A build takes the backend and the
-  build-time parameters the class declares (found as the tracer finds them), each in a field of its
-  type: a check box, a number, a text, a choice of an enum's members, a date, or JSON for a tuple, a
-  list or any other type, in which an enum's member is its name (or as Python writes it, never a
-  label of its class's own `__str__` or `__repr__`) and a date its ISO text (a list's items read by
-  its item type, as a tuple's are); a flag's members are typed joined by `|`; a dict's keys are read
-  by its key type too (an enum's member by its name, a date in ISO form, a tuple as a list, a
-  sequence as the tuple a key holds), and from a manifest as it records them (`str()` of each key,
-  tuples of enum members and dates included, inside a sequence too); a `NewType` is read as its
-  supertype, a `type` alias as its value (a generic one with its arguments in their places) and
-  `Annotated[T, ...]` as `T`, while an alias whose value cannot be had (one that names what its
-  module does not define) is taken as JSON gives it, as is a class `isinstance` cannot check (a
-  `TypedDict`, a `Protocol` that is not runtime-checkable); a list a union's option that the GUI
-  does not read (an `Iterable`) holds goes to it before one that reads only part of it. A setting a
-  run's manifest cannot record exactly is warned of at the build, since the run cannot be rerun from
-  its directory: a dict that is not the class's own default and whose keys are not in the order a
-  manifest writes them (sorted as text by `str()`, which the warning gives), a NumPy number, an
-  object recorded as its repr; and an enum's member its class's own `__repr__` writes as it writes
-  another, unless the member makes no difference to the model. A rerun tries each dict recorded as
-  its default is both ways, all at their defaults and all sorted first, up to 64 mixes, tracing each
-  for its IR hash; a build that gives a mix beyond those warns of it, and its warnings name every
-  setting that keeps its run from a rerun, beside one whose record does not read back at all. A
-  manifest's date and time with a time zone of the `datetime` module's (an offset, as the form reads
-  one) reads back, but for a date and time that is itself a dict's key, which a manifest records as
-  its `str()`, without its zone's name or its `fold`, so the build warns of one that has either; a
-  float that is not finite reads back at any depth of a tuple key. The server writes each value as
-  Python does (`1` and `1.0` apart), and the form sends only the fields changed from what it holds,
-  the class's defaults or the shown build's own settings, so an untouched form builds what
-  `build(cls)` builds (a check box for a parameter without a default builds False) and an untouched
-  **Build again** builds the shown build again, with the same IR hash. Build again from a build of
-  the files as they were carries its settings to the class as it is now: an enum's member by its
-  name, a setting at its old default as the default now. A build records its `BuildWarning`s and
-  lists every variable with its unit, role, timing, recursion direction, formula, source, reads and
-  readers.
+  copy of each, as a new Python process would, a changed file's cached bytecode taken out where
+  Python would take it for the file as it is now (saved again within the second it records, at the
+  same size); every model is then a new class, and a file an earlier one's import ran that put
+  something else in its own place is refused, as a load of it then is, never run twice. On an
+  exception every module, file and model is as it was. A loaded file that is gone is let go at a
+  reload, with its models. Builds, checks, runs and reruns hold the engine while they work, and a
+  reload is refused while one does; a check's and a run's imports are noted as a build's are. A
+  model file imported before the GUI loaded it, by an import no watch saw, shows as changed until a
+  reload, since nothing records which version of it that import ran; so does a file saved while it
+  ran (its modification time before and after its run differ, so a file dated ahead of the clock is
+  not taken as saved). A load or a reload that ends once the user has gone to another page leaves
+  that page as it is but for the side lists, and says so in the tray. A failed first load or reload
+  takes out what its own import brought in of the user's (modules and folders imported as namespace
+  packages alike); a failed first load that a build, check or run on another thread ran beside
+  leaves what it imported, which that work may hold (`import h`, a package's `from . import h`,
+  `from h import RATE`), and records it, so an edit to it shows and a reload takes it out. Its
+  traceback is written out before the clean-up, since Python's suggestion of a near name imports the
+  module again; an error whose writing trips (a `__getattr__` or a `__str__` of the user's that
+  raises anything, `SystemExit` too, or a `name` that cannot be set) is still written, at the file's
+  line, and the clean-up runs whatever happens. A build takes the backend and the build-time
+  parameters the class declares (found as the tracer finds them), each in a field of its type: a
+  check box, a number, a text, a choice of an enum's members, a date, or JSON for a tuple, a list or
+  any other type, in which an enum's member is its name (or as Python writes it, never a label of
+  its class's own `__str__` or `__repr__`) and a date its ISO text (a list's items read by its item
+  type, as a tuple's are); a flag's members are typed joined by `|`; a dict's keys are read by its
+  key type too (an enum's member by its name, a date in ISO form, a tuple as a list, a sequence as
+  the tuple a key holds), and from a manifest as it records them (`str()` of each key, tuples of
+  enum members and dates included, inside a sequence too); a `NewType` is read as its supertype, a
+  `type` alias as its value (a generic one with its arguments in their places) and `Annotated[T,
+  ...]` as `T`, while an alias whose value cannot be had (one that names what its module does not
+  define) is taken as JSON gives it, as is a class `isinstance` cannot check (a `TypedDict`, a
+  `Protocol` that is not runtime-checkable); a list a union's option that the GUI does not read (an
+  `Iterable`) holds goes to it before one that reads only part of it. A setting a run's manifest
+  cannot record exactly is warned of at the build, since the run cannot be rerun from its directory:
+  a dict that is not the class's own default and whose keys are not in the order a manifest writes
+  them (sorted as text by `str()`, which the warning gives), a NumPy number, an object recorded as
+  its repr; and an enum's member its class's own `__repr__` writes as it writes another, unless the
+  member makes no difference to the model. A rerun tries each dict recorded as its default is both
+  ways, all at their defaults and all sorted first, up to 64 mixes, tracing each for its IR hash; a
+  build that gives a mix beyond those warns of it, and its warnings name every setting that keeps
+  its run from a rerun, beside one whose record does not read back at all. A manifest's date and
+  time with a time zone of the `datetime` module's (an offset, as the form reads one) reads back,
+  but for a date and time that is itself a dict's key, which a manifest records as its `str()`,
+  without its zone's name or its `fold`, so the build warns of one that has either; a float that is
+  not finite reads back at any depth of a tuple key. The server writes each value as Python does
+  (`1` and `1.0` apart), and the form sends only the fields changed from what it holds, the class's
+  defaults or the shown build's own settings, so an untouched form builds what `build(cls)` builds
+  (a check box for a parameter without a default builds False) and an untouched **Build again**
+  builds the shown build again, with the same IR hash. Build again from a build of the files as they
+  were carries its settings to the class as it is now: an enum's member by its name, a setting at
+  its old default as the default now. A build records its `BuildWarning`s and lists every variable
+  with its unit, role, timing, recursion direction, formula, source, reads and readers.
 - A run takes a reference product's example inputs (the term assurance's reference case 1 and
   the annuity spec's worked example, built in memory, and lifelib's inputs for `BasicTerm` in a
   checkout) or files, Parquet or CSV (read with `pyarrow.csv`), one per declared input, with the

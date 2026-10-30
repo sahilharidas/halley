@@ -34,26 +34,28 @@ open it again from there.
 
 ## Models
 
-The Models page lists the reference products that ship with Halley and the IFRS 17 stages. A
-model of your own lives in a Python file: give its path in the field under the list, and the GUI
-imports it as the module named after the file (`term.py` as `term`), with its folder on the
-import path. Importing a file runs its top-level code, as `import term` would, so a file that
-also runs its models keeps those runs under `if __name__ == "__main__":`. After you edit a model
-file, or a module of your own one imports (one a formula imports included), the page says the
-files have changed; reload them and build again. **Reload the files** runs every loaded file
-again, in the order you loaded them, with every module of your own they import, each once, as a
-new Python process importing them would; every earlier build is then a build of the files as
-they were. A loaded file that is no longer where you loaded it from (renamed, moved or deleted)
-is let go, with its models, and the page says so. A reload is refused while a build, check or
-run is running; reload when it has finished. A load or a reload that ends once you have gone to
-another page leaves that page as it is, and says so in the tray (below). A file that fails to
-load takes out what its import brought in of yours, so the next load runs it afresh, unless a
-build, check or run was going meanwhile, which may use it: then it stays, and an edit to it shows
-as a change, which a reload settles. A file that was imported before you loaded it, by an
-import the GUI did not see (by a program that started the GUI, say), shows as changed until a
-reload, since nothing tells which version of it that import ran; so does a file saved while it
-ran. A file whose name another module already has (`json.py`, say) is refused, since a run with
-worker processes would import the other one.
+The Models page lists the reference products that ship with Halley and the IFRS 17 stages. A model
+of your own lives in a Python file: give its path in the field under the list, and the GUI imports
+it as the module named after the file (`term.py` as `term`), with its folder on the import path.
+Importing a file runs its top-level code, as `import term` would, so a file that also runs its
+models keeps those runs under `if __name__ == "__main__":`. After you edit a model file, or a module
+of your own one imports (one a formula imports included), the page says the files have changed;
+reload them and build again. **Reload the files** runs every loaded file again, in the order you
+loaded them, with every module of your own they import, each once, as a new Python process importing
+them would; every earlier build is then a build of the files as they were. A file saved again within
+the second its cached bytecode records, at the same size, which Python's cache cannot tell from the
+file it was made from, has that cache taken out first, so the reload runs the file as it is now. A
+loaded file that is no longer where you loaded it from (renamed, moved or deleted) is let go, with
+its models, and the page says so. A reload is refused while a build, check or run is running; reload
+when it has finished. A load or a reload that ends once you have gone to another page leaves that
+page as it is, and says so in the tray (below). A file that fails to load takes out what its import
+brought in of yours, so the next load runs it afresh, unless a build, check or run was going
+meanwhile, which may use it: then it stays, and an edit to it shows as a change, which a reload
+settles. A file that was imported before you loaded it, by an import the GUI did not see (by a
+program that started the GUI, say), shows as changed until a reload, since nothing tells which
+version of it that import ran; so does a file saved while it ran. A file whose name another module
+already has (`json.py`, say) is refused, since a run with worker processes would import the other
+one.
 
 A model is built first. The build traces its formulas, checks their units, time references and
 order, and generates the code that runs them, as `halley.build` does. Choose the backend, NumPy (the

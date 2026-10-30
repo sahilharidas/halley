@@ -38,7 +38,7 @@ import traceback
 import types
 import typing
 import zipimport
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -485,6 +485,45 @@ def _found(fullname: str, path: Sequence[str] | None) -> tuple[str, int] | None:
         return None
 
 
+def _drop_stale_bytecode(file: str, mtime: int | None = None) -> None:
+    """Take out a source file's cached bytecode (its ``__pycache__`` file) that Python would take
+    for the file as it is now, though the file changed since its import (``mtime``, its time
+    then): saved again within the second the cache records, at the same size, which a cache that
+    records whole seconds cannot tell from the file it was made from, so the next import would
+    run the code as it was. That import writes the cache again, as any import does. With no
+    ``mtime`` (a module a failed import brought in, which no record keeps), the cache goes
+    whatever the file's time, so that next import runs the file as it is then."""
+    try:
+        now = os.stat(file)
+        if now.st_mtime_ns == mtime:
+            return  # as it was imported: the cache is of this file
+        cached = importlib.util.cache_from_source(file)
+        with open(cached, "rb") as f:
+            head = f.read(16)
+    except (OSError, ValueError, NotImplementedError):
+        return  # no cache, or one Python does not keep for it
+    if len(head) < 16 or int.from_bytes(head[4:8], "little") != 0:
+        return  # a cache Python checks by the source's hash, which tells any edit
+    seconds = int.from_bytes(head[8:12], "little")
+    size = int.from_bytes(head[12:16], "little")
+    if seconds == int(now.st_mtime) & 0xFFFFFFFF and size == now.st_size & 0xFFFFFFFF:
+        with contextlib.suppress(OSError):
+            os.remove(cached)
+
+
+def _drop_failed_caches(names: Iterable[str], file: Path | None) -> None:
+    """After a failed load or reload: the cached bytecode of each file of the user's whose import
+    it began and that is not imported now (its code raised, and its import took it out), and of
+    the model file it was running, which no record keeps; so the next import runs each file as
+    it is then (see :func:`_drop_stale_bytecode`)."""
+    if file is not None:
+        _drop_stale_bytecode(str(file))
+    for name in sorted(set(names)):
+        found = _FOUND_AT.get(name)
+        if name not in sys.modules and found is not None:
+            _drop_stale_bytecode(found[0])
+
+
 def _saved_since_import(name: str, file: str, mtime: int) -> bool:
     """Whether a module's file (as :meth:`Catalog._user_file` gives it) was modified after its
     noted import began: its time then and ``mtime`` differ. For a file the import watch could
@@ -659,8 +698,9 @@ class Catalog:
                 except BaseException:
                     # what the import brought in of the user's own goes, so the next import runs
                     # it again from its files, unless a build or a run on another thread may use
-                    # it (see _drop_new)
+                    # it (see _drop_new); and so do the caches of the files whose code raised
                     self._drop_new(before, set(), beside=_watch().beside(mark))
+                    _drop_failed_caches(noted, file)
                     raise
             added = self._register(noted, {name})
             # a module the watch did not see imported (a finder of the file's own put ahead of
@@ -698,6 +738,18 @@ class Catalog:
                     self._entries.pop(model_id, None)
         files = list(self._files.values())
         gone = self._held()
+        # a file saved again since its import, within the second its cached bytecode records and
+        # at the same size, would run as it was: its cache goes first (see _drop_stale_bytecode)
+        recorded: list[tuple[str, int]] = [(str(f.path), f.mtime_ns) for f in files]
+        for name in gone:
+            version = self._versions.get(name)
+            if version is not None:
+                recorded.append((version[1], version[2]))
+            placed = self._placed.get(name)
+            if placed is not None:
+                recorded.append(placed)
+        for file, mtime in recorded:
+            _drop_stale_bytecode(file, mtime)
         for name in gone:
             sys.modules.pop(name, None)
         detached: list[tuple[ModuleType, str, object]] = []
@@ -714,8 +766,11 @@ class Catalog:
         start = set(sys.modules)
         done: dict[str, tuple[ModuleType, list[str], int | None]] = {}
         imported: set[str] = set()  # what the files run so far imported
+        noted: list[str] = []
+        running: Path | None = None
         try:
             for loaded in files:
+                running = loaded.path
                 with _watch().noting() as noted:
                     module = sys.modules.get(loaded.module)
                     ran = None
@@ -760,6 +815,7 @@ class Catalog:
                 for holder, child, module in detached:
                     setattr(holder, child, module)
                 self._drop_new(start, set(gone))
+                _drop_failed_caches([*imported, *noted], running)
             if failure is exc:
                 raise
             raise failure from exc
@@ -793,6 +849,11 @@ class Catalog:
                 break
             dropped |= more
         for name in sorted(dropped, key=len, reverse=True):  # submodules before their packages
+            file = self._user_file(name, sys.modules.get(name))
+            found = _FOUND_AT.get(name)
+            # its next import runs the file as it is then, and the file whose import put it there
+            for place in {file, None if found is None else found[0]} - {None}:
+                _drop_stale_bytecode(typing.cast(str, place))
             _drop(name)
 
     def _held(self) -> dict[str, object]:
